@@ -2,17 +2,12 @@ mod inbox_panel_settings;
 
 use std::sync::Arc;
 
-use anyhow::Context as _;
-use db::kvp::KeyValueStore;
 use fs::Fs;
 use gpui::{
     Action, App, AppContext as _, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, IntoElement, ParentElement, Pixels, Render, Styled, Task, WeakEntity, Window,
-    actions,
+    Focusable, IntoElement, ParentElement, Pixels, Render, Styled, WeakEntity, Window, actions,
 };
-use serde::{Deserialize, Serialize};
 use ui::prelude::*;
-use util::{ResultExt, TryFutureExt};
 use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
@@ -31,16 +26,8 @@ actions!(
 const INBOX_PANEL_KEY: &str = "InboxPanel";
 
 pub struct InboxPanel {
-    workspace: WeakEntity<Workspace>,
     fs: Arc<dyn Fs>,
     focus_handle: FocusHandle,
-    width: Option<Pixels>,
-    pending_serialization: Task<Option<()>>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct SerializedInboxPanel {
-    width: Option<Pixels>,
 }
 
 pub fn init(cx: &mut App) {
@@ -57,28 +44,8 @@ impl InboxPanel {
         workspace: WeakEntity<Workspace>,
         mut cx: AsyncWindowContext,
     ) -> anyhow::Result<Entity<Self>> {
-        let serialized_panel = match workspace
-            .read_with(&cx, |workspace, _| Self::serialization_key(workspace))
-            .ok()
-            .flatten()
-        {
-            Some(serialization_key) => {
-                let kvp = cx.update(|_, cx| KeyValueStore::global(cx))?;
-                cx.background_spawn(async move { kvp.read_kvp(&serialization_key) })
-                    .await
-                    .context("loading inbox panel")
-                    .log_err()
-                    .flatten()
-                    .map(|panel| serde_json::from_str::<SerializedInboxPanel>(&panel))
-                    .transpose()
-                    .log_err()
-                    .flatten()
-            }
-            None => None,
-        };
-
         workspace.update_in(&mut cx, |workspace, window, cx| {
-            let panel = Self::new(workspace, serialized_panel.as_ref(), window, cx);
+            let panel = Self::new(workspace, window, cx);
             panel.update(cx, |_, cx| cx.notify());
             panel
         })
@@ -86,52 +53,15 @@ impl InboxPanel {
 
     fn new(
         workspace: &mut Workspace,
-        serialized: Option<&SerializedInboxPanel>,
         _window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Entity<Self> {
         let fs = workspace.app_state().fs.clone();
-        let workspace_handle = cx.entity().downgrade();
 
         cx.new(|cx| Self {
-            workspace: workspace_handle,
             fs,
             focus_handle: cx.focus_handle(),
-            width: serialized.and_then(|serialized| serialized.width),
-            pending_serialization: Task::ready(None),
         })
-    }
-
-    fn serialization_key(workspace: &Workspace) -> Option<String> {
-        workspace
-            .database_id()
-            .map(|id| i64::from(id).to_string())
-            .or(workspace.session_id())
-            .map(|id| format!("{}-{:?}", INBOX_PANEL_KEY, id))
-    }
-
-    fn serialize(&mut self, cx: &mut Context<Self>) {
-        let Some(serialization_key) = self
-            .workspace
-            .read_with(cx, |workspace, _| Self::serialization_key(workspace))
-            .ok()
-            .flatten()
-        else {
-            return;
-        };
-        let width = self.width;
-        let kvp = KeyValueStore::global(cx);
-        self.pending_serialization = cx.background_spawn(
-            async move {
-                kvp.write_kvp(
-                    serialization_key,
-                    serde_json::to_string(&SerializedInboxPanel { width })?,
-                )
-                .await?;
-                anyhow::Ok(())
-            }
-            .log_err(),
-        );
     }
 }
 
@@ -181,10 +111,6 @@ impl Panel for InboxPanel {
 
     fn toggle_action(&self) -> Box<dyn Action> {
         Box::new(ToggleFocus)
-    }
-
-    fn set_active(&mut self, _active: bool, _window: &mut Window, cx: &mut Context<Self>) {
-        self.serialize(cx);
     }
 
     fn activation_priority(&self) -> u32 {
