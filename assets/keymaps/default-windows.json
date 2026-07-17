@@ -1045,6 +1045,13 @@
     },
   },
   {
+    "context": "InboxPanel > Editor",
+    "use_key_equivalents": true,
+    "bindings": {
+      "enter": "inbox_panel::Capture",
+    },
+  },
+  {
     "context": "GitPanel",
     "use_key_equivalents": true,
     "bindings": {

@@ -1160,6 +1160,13 @@
     },
   },
   {
+    "context": "InboxPanel > Editor",
+    "use_key_equivalents": true,
+    "bindings": {
+      "enter": "inbox_panel::Capture",
+    },
+  },
+  {
     // While a debug session is live, debugger controls take over their F-keys.
     // `f6` becomes Pause (region navigation stays on `cmd-f6` / `shift-f6`),
     // and step/stop/rerun are scoped here so they're inert when not debugging.

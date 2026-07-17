@@ -1051,6 +1051,12 @@
     },
   },
   {
+    "context": "InboxPanel > Editor",
+    "bindings": {
+      "enter": "inbox_panel::Capture",
+    },
+  },
+  {
     "context": "GitPanel",
     "bindings": {
       "ctrl-g ctrl-g": "git::Fetch",
