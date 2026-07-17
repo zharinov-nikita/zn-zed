@@ -3,7 +3,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use fs::Fs;
 use gpui::{App, Context, Entity, EventEmitter, Subscription, Task};
 use project::{Project, WorktreeId};
-use util::{ResultExt as _, rel_path::RelPath};
+use util::rel_path::RelPath;
 
 use crate::inbox_model::{
     InboxFile, InboxItem, InboxType, ItemId, TYPE_COLOR_TOKENS, default_types, default_types_ref,
@@ -38,6 +38,10 @@ pub struct InboxStore {
     /// by our own writes.
     last_saved_content: Option<String>,
     load_error: Option<String>,
+    /// Set when the most recent debounced save failed to write to disk. The
+    /// mutation stays `dirty` in that case so it keeps being retried on the
+    /// next mutation instead of being silently lost.
+    save_error: Option<String>,
     /// Whether the in-memory state has mutations that are not on disk yet.
     dirty: bool,
     pending_save: Task<()>,
@@ -61,6 +65,7 @@ impl InboxStore {
             worktree_id,
             last_saved_content: None,
             load_error: None,
+            save_error: None,
             dirty: false,
             pending_save: Task::ready(()),
             _subscriptions: vec![subscription],
@@ -117,10 +122,16 @@ impl InboxStore {
 
     fn reload(&mut self, cx: &mut Context<Self>) {
         let Some(abs_path) = self.inbox_abs_path(cx) else {
+            if self.dirty {
+                // Unsaved local mutations win over whatever is on disk right
+                // now; the pending save will persist them shortly.
+                return;
+            }
             if self.state != InboxFile::default() {
                 self.state = InboxFile::default();
                 self.last_saved_content = None;
                 self.load_error = None;
+                self.save_error = None;
                 cx.emit(InboxStoreEvent::Reloaded);
             }
             return;
@@ -218,15 +229,40 @@ impl InboxStore {
             else {
                 return;
             };
-            this.update(cx, |this, _| {
+            let Ok(previous_last_saved_content) = this.update(cx, |this, _| {
+                let previous = this.last_saved_content.take();
                 this.dirty = false;
                 this.last_saved_content = Some(content.clone());
+                previous
+            }) else {
+                return;
+            };
+
+            let write_result = async {
+                if let Some(dir) = abs_path.parent() {
+                    fs.create_dir(dir).await?;
+                }
+                fs.atomic_write(abs_path, content).await
+            }
+            .await;
+
+            this.update(cx, |this, cx| match write_result {
+                Ok(()) => {
+                    this.save_error = None;
+                }
+                Err(error) => {
+                    // The write failed: restore `dirty` and the previous
+                    // `last_saved_content` so the mutation is retried on the
+                    // next edit instead of being silently lost, and so a
+                    // later file-change event for the (still stale) on-disk
+                    // content isn't mistaken for an echo of our own write.
+                    this.dirty = true;
+                    this.last_saved_content = previous_last_saved_content;
+                    this.save_error = Some(format!("{error:#}"));
+                    cx.emit(InboxStoreEvent::Changed);
+                }
             })
             .ok();
-            if let Some(dir) = abs_path.parent() {
-                fs.create_dir(dir).await.log_err();
-            }
-            fs.atomic_write(abs_path, content).await.log_err();
         });
     }
 
@@ -270,6 +306,12 @@ impl InboxStore {
 
     pub fn load_error(&self) -> Option<&str> {
         self.load_error.as_deref()
+    }
+
+    /// Set when the most recent debounced save failed to write to disk. The
+    /// mutation remains dirty and will be retried on the next save attempt.
+    pub fn save_error(&self) -> Option<&str> {
+        self.save_error.as_deref()
     }
 
     pub fn has_worktree(&self) -> bool {
@@ -866,5 +908,93 @@ mod tests {
             assert_eq!(store.types()[1].key, key);
             assert_eq!(store.types()[1].label, "новый тип");
         });
+    }
+
+    #[gpui::test]
+    async fn test_save_failure_keeps_mutation_dirty(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        // `inbox.json` already exists as a directory, so the debounced save's
+        // `atomic_write` will genuinely fail (writing a file over a
+        // directory is not allowed) without needing any error-injection
+        // hook.
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".zed": {
+                    "inbox.json": {}
+                }
+            }),
+        )
+        .await;
+        let (_project, store) = build_store(fs.clone(), cx).await;
+        let events = track_events(&store, cx);
+
+        store.update(cx, |store, cx| {
+            store.capture("keep me".to_string(), None, None, cx);
+        });
+        flush_saves(cx);
+
+        store.read_with(cx, |store, _| {
+            assert!(
+                store.dirty,
+                "a failed write must not be reported as saved, or the \
+                 mutation would never be retried and could be lost"
+            );
+            assert!(
+                store.save_error().is_some(),
+                "the failure must be surfaced to the UI"
+            );
+            assert!(
+                store.last_saved_content.is_none(),
+                "last_saved_content must be rolled back to its pre-write \
+                 value on failure, otherwise a later echo of the (still \
+                 stale) on-disk content could be mistaken for our own write"
+            );
+            assert_eq!(store.items().len(), 1);
+            assert_eq!(store.items()[0].text, "keep me");
+        });
+        assert!(events.borrow().contains(&InboxStoreEvent::Changed));
+
+        // A later reload (e.g. triggered by a worktree event for the
+        // still-broken path) must not clobber the unsaved mutation.
+        store.update(cx, |store, cx| store.reload(cx));
+        cx.run_until_parked();
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.items().len(), 1);
+            assert_eq!(store.items()[0].text, "keep me");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_reload_without_worktree_preserves_dirty_state(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({})).await;
+        let (_project, store) = build_store(fs.clone(), cx).await;
+        let events = track_events(&store, cx);
+
+        store.update(cx, |store, cx| {
+            store.capture("unsaved".to_string(), None, None, cx);
+            // Simulate the worktree becoming momentarily unresolvable (e.g. a
+            // race between a `WorktreeRemoved` event and a stale file-change
+            // event) while a mutation hasn't been saved yet.
+            store.worktree_id = None;
+            store.reload(cx);
+        });
+
+        store.read_with(cx, |store, _| {
+            assert!(
+                store.dirty,
+                "an unsaved mutation must not be discarded just because the \
+                 worktree momentarily could not be resolved"
+            );
+            assert_eq!(store.items().len(), 1);
+            assert_eq!(store.items()[0].text, "unsaved");
+        });
+        assert!(
+            !events.borrow().contains(&InboxStoreEvent::Reloaded),
+            "no reload should be reported while a mutation is unsaved"
+        );
     }
 }
