@@ -9026,9 +9026,10 @@ name = "inbox_panel"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "db",
  "fs",
  "gpui",
+ "pretty_assertions",
+ "project",
  "serde",
  "serde_json",
  "settings",

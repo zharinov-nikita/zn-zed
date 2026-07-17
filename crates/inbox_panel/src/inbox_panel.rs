@@ -1,4 +1,8 @@
+pub mod inbox_model;
 mod inbox_panel_settings;
+pub mod inbox_store;
+
+pub use inbox_store::{InboxStore, InboxStoreEvent};
 
 use std::sync::Arc;
 
