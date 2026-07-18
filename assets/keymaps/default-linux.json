@@ -1052,7 +1052,7 @@
     },
   },
   {
-    "context": "InboxPanel > Editor",
+    "context": "InboxCapture > Editor",
     "bindings": {
       "enter": "inbox_panel::Capture",
     },

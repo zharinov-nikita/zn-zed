@@ -693,6 +693,14 @@ impl InboxPanel {
 
         div().flex_none().p_2().child(
             v_flex()
+                // Scopes the `enter -> inbox_panel::Capture` binding (bound
+                // as "InboxCapture > Editor" in the default keymaps) to the
+                // capture editor only. Binding it as "InboxPanel > Editor"
+                // would also match the detail view's title/block editors,
+                // because a `>` (descendant) context predicate matches the
+                // parent at any ancestor depth and the whole panel renders
+                // under `key_context("InboxPanel")`.
+                .key_context("InboxCapture")
                 .on_action(cx.listener(Self::capture))
                 .bg(cx.theme().colors().editor_background)
                 .rounded_md()

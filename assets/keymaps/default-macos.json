@@ -1161,7 +1161,7 @@
     },
   },
   {
-    "context": "InboxPanel > Editor",
+    "context": "InboxCapture > Editor",
     "use_key_equivalents": true,
     "bindings": {
       "enter": "inbox_panel::Capture",

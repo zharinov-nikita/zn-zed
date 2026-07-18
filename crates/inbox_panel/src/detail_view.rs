@@ -1571,6 +1571,85 @@ mod tests {
         (store, item_id, view, cx)
     }
 
+    /// Wraps an [`InboxDetailView`] in a node carrying
+    /// `key_context("InboxPanel")` and a `Capture` handler, mirroring how the
+    /// production panel renders the detail overlay inside its root element
+    /// (which has both). Used to test keymap-context interactions between
+    /// the panel and the detail view's editors.
+    struct PanelContextWrapper {
+        detail: Entity<InboxDetailView>,
+        captures: Rc<Cell<usize>>,
+    }
+
+    impl Render for PanelContextWrapper {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let captures = self.captures.clone();
+            div()
+                .key_context("InboxPanel")
+                .on_action(move |_: &crate::Capture, _, _| captures.set(captures.get() + 1))
+                .size_full()
+                .child(self.detail.clone())
+        }
+    }
+
+    /// Like [`build_detail_view`], but mounts the detail view under a parent
+    /// carrying `key_context("InboxPanel")` (as the real panel does) and
+    /// additionally binds `enter -> inbox_panel::Capture` in
+    /// `capture_context` after the default bindings, matching how the
+    /// default keymaps define the capture binding after the global
+    /// `enter -> menu::Confirm`. Returns a counter of how many times the
+    /// wrapper handled `Capture`.
+    async fn build_detail_view_under_panel<'a>(
+        body: Option<&str>,
+        capture_context: &str,
+        cx: &'a mut TestAppContext,
+    ) -> (
+        Entity<InboxDetailView>,
+        Rc<Cell<usize>>,
+        &'a mut VisualTestContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({})).await;
+        let project = Project::test(fs.clone(), [path!("/root").as_ref() as &Path], cx).await;
+        let store = cx.new(|cx| InboxStore::new(project, fs, cx));
+        cx.run_until_parked();
+        let item_id = store.update(cx, |store, cx| {
+            let id = store.capture("Запись".to_string(), None, None, cx);
+            store.set_body(&id, body.map(str::to_string), cx);
+            id
+        });
+        cx.update(bind_default_keys);
+        cx.update(|cx| {
+            cx.bind_keys([KeyBinding::new(
+                "enter",
+                crate::Capture,
+                Some(capture_context),
+            )]);
+        });
+        let captures = Rc::new(Cell::new(0));
+        let window = cx.add_window({
+            let captures = captures.clone();
+            move |window, cx| {
+                let detail = cx.new(|cx| {
+                    InboxDetailView::new(
+                        store.clone(),
+                        item_id.clone(),
+                        WeakEntity::new_invalid(),
+                        window,
+                        cx,
+                    )
+                });
+                PanelContextWrapper { detail, captures }
+            }
+        });
+        let wrapper = window.root(cx).unwrap();
+        let detail = wrapper.read_with(cx, |wrapper, _| wrapper.detail.clone());
+        let cx = VisualTestContext::from_window(*window, cx).into_mut();
+        cx.run_until_parked();
+        (detail, captures, cx)
+    }
+
     /// Starts editing the `block_index`-th block through the view's own
     /// entry point (the same path a click on the block takes) and lets the
     /// window redraw so the live editor is in the dispatch tree.
@@ -1800,6 +1879,61 @@ mod tests {
         assert_eq!(
             body_in_store(&store, &item_id, cx),
             Some("при\nвет мир".to_string())
+        );
+    }
+
+    /// Regression test: the production `enter -> inbox_panel::Capture`
+    /// binding is scoped as `"InboxCapture > Editor"`, so it must NOT match
+    /// the detail view's block editors even though they render under an
+    /// ancestor with `key_context("InboxPanel")` (a `>` context predicate
+    /// matches the parent at any ancestor depth). Enter in a block editor
+    /// must fall through to the global `menu::Confirm` and split the block,
+    /// not trigger a capture.
+    #[gpui::test]
+    async fn test_capture_binding_does_not_hijack_enter_in_detail_blocks(cx: &mut TestAppContext) {
+        let (view, captures, cx) =
+            build_detail_view_under_panel(Some("abcdef"), "InboxCapture > Editor", cx).await;
+        begin_editing(&view, cx, 0, CaretPos::Offset(3));
+
+        cx.simulate_keystrokes("enter");
+
+        assert_eq!(
+            blocks(&view, cx),
+            vec![
+                (BlockType::Paragraph, "abc".to_string()),
+                (BlockType::Paragraph, "def".to_string()),
+            ],
+            "enter in a block editor must split the block (menu::Confirm)"
+        );
+        assert_eq!(
+            captures.get(),
+            0,
+            "enter in a block editor must not trigger inbox_panel::Capture"
+        );
+    }
+
+    /// Pins why the capture binding must not use `"InboxPanel > Editor"`:
+    /// bound that way it also matches the detail view's block editors
+    /// (stack: … InboxPanel … InboxDetail … Editor), wins over the global
+    /// `enter -> menu::Confirm`, and hijacks Enter into a spurious capture
+    /// instead of a block split.
+    #[gpui::test]
+    async fn test_panel_scoped_capture_binding_would_hijack_enter(cx: &mut TestAppContext) {
+        let (view, captures, cx) =
+            build_detail_view_under_panel(Some("abcdef"), "InboxPanel > Editor", cx).await;
+        begin_editing(&view, cx, 0, CaretPos::Offset(3));
+
+        cx.simulate_keystrokes("enter");
+
+        assert_eq!(
+            blocks(&view, cx),
+            vec![(BlockType::Paragraph, "abcdef".to_string())],
+            "the hijacked enter must not have split the block"
+        );
+        assert_eq!(
+            captures.get(),
+            1,
+            "an InboxPanel-scoped binding hijacks enter into Capture"
         );
     }
 }
