@@ -84,7 +84,7 @@ impl InboxDetailView {
 
         let title_editor = cx.new(|cx| {
             let mut editor = Editor::auto_height(1, 6, window, cx);
-            editor.set_placeholder_text("Заголовок записи", window, cx);
+            editor.set_placeholder_text("Item title", window, cx);
             editor.set_text(text, window, cx);
             editor
         });
@@ -248,9 +248,9 @@ impl InboxDetailView {
             };
             editor.set_placeholder_text(
                 if is_last {
-                    "Печатай, или «/» для блока"
+                    "Type, or «/» for a block"
                 } else {
-                    "Пустая строка"
+                    "Empty line"
                 },
                 window,
                 cx,
@@ -681,7 +681,7 @@ impl InboxDetailView {
         let view = cx.weak_entity();
         let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
             menu.item(
-                ContextMenuEntry::new("Добавить ниже")
+                ContextMenuEntry::new("Add below")
                     .icon(IconName::Plus)
                     .icon_color(Color::Muted)
                     .handler({
@@ -697,7 +697,7 @@ impl InboxDetailView {
                     }),
             )
             .item(
-                ContextMenuEntry::new("Дублировать")
+                ContextMenuEntry::new("Duplicate")
                     .icon(IconName::Copy)
                     .icon_color(Color::Muted)
                     .handler({
@@ -714,7 +714,7 @@ impl InboxDetailView {
                     }),
             )
             .item(
-                ContextMenuEntry::new("Переместить вверх")
+                ContextMenuEntry::new("Move up")
                     .icon(IconName::ArrowUp)
                     .icon_color(Color::Muted)
                     .handler({
@@ -731,7 +731,7 @@ impl InboxDetailView {
                     }),
             )
             .item(
-                ContextMenuEntry::new("Переместить вниз")
+                ContextMenuEntry::new("Move down")
                     .icon(IconName::ArrowDown)
                     .icon_color(Color::Muted)
                     .handler({
@@ -749,7 +749,7 @@ impl InboxDetailView {
             )
             .separator()
             .item(
-                ContextMenuEntry::new("Удалить блок")
+                ContextMenuEntry::new("Delete block")
                     .icon(IconName::Trash)
                     .icon_color(Color::Error)
                     .handler({
@@ -934,19 +934,9 @@ impl InboxDetailView {
 
     fn render_header(&self, cleared: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let (toggle_icon, toggle_label, toggle_color, toggle_tooltip) = if cleared {
-            (
-                IconName::Check,
-                "Готово",
-                Color::Created,
-                "Вернуть в инбокс",
-            )
+            (IconName::Check, "Done", Color::Created, "Return to inbox")
         } else {
-            (
-                IconName::Circle,
-                "Разобрать",
-                Color::Muted,
-                "Отметить разобранным",
-            )
+            (IconName::Circle, "Clear", Color::Muted, "Mark as cleared")
         };
 
         h_flex()
@@ -957,7 +947,7 @@ impl InboxDetailView {
             .border_b_1()
             .border_color(cx.theme().colors().border_variant)
             .child(
-                Button::new("inbox-detail-back", "Инбокс")
+                Button::new("inbox-detail-back", "Inbox")
                     .style(ButtonStyle::Subtle)
                     .label_size(LabelSize::Small)
                     .color(Color::Muted)
@@ -966,7 +956,7 @@ impl InboxDetailView {
                             .size(IconSize::Small)
                             .color(Color::Muted),
                     )
-                    .tooltip(Tooltip::text("Назад к инбоксу"))
+                    .tooltip(Tooltip::text("Back to inbox"))
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(InboxDetailEvent::Closed))),
             )
             .child(div().flex_1())
@@ -991,7 +981,7 @@ impl InboxDetailView {
                 IconButton::new("inbox-detail-delete", IconName::Trash)
                     .icon_size(IconSize::Small)
                     .icon_color(Color::Muted)
-                    .tooltip(Tooltip::text("Удалить запись"))
+                    .tooltip(Tooltip::text("Delete item"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         let item_id = this.item_id.clone();
                         // The store emits `ItemDeleted`, which closes this
@@ -1027,9 +1017,9 @@ impl InboxDetailView {
         if let Some(created) = item.created {
             let age = format_age(created, now_unix());
             let captured = if age == "now" {
-                "захвачено только что".to_string()
+                "captured just now".to_string()
             } else {
-                format!("захвачено {age} назад")
+                format!("captured {age} ago")
             };
             meta = meta.child("·").child(captured);
         }
@@ -1056,9 +1046,9 @@ impl InboxDetailView {
         }
         let (done, total) = self.document.subtask_counts();
         let subtasks = if total > 0 {
-            format!("{done}/{total} подзадач")
+            format!("{done}/{total} subtasks")
         } else {
-            "нет подзадач".to_string()
+            "no subtasks".to_string()
         };
         meta = meta.child("·").child(subtasks);
 
@@ -1220,9 +1210,9 @@ impl InboxDetailView {
                     .into_any_element(),
                 BlockType::Code => self.render_code_block(block, cx),
                 _ if block.text.is_empty() => Label::new(if is_last {
-                    "Печатай, или «/» для блока"
+                    "Type, or «/» for a block"
                 } else {
-                    "Пустая строка"
+                    "Empty line"
                 })
                 .color(Color::Placeholder)
                 .into_any_element(),
@@ -1274,7 +1264,7 @@ impl InboxDetailView {
                         .icon_size(IconSize::XSmall)
                         .icon_color(Color::Muted)
                         .visible_on_hover("detail-block")
-                        .tooltip(Tooltip::text("Действия с блоком"))
+                        .tooltip(Tooltip::text("Block actions"))
                         .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                             this.deploy_grip_menu(block_id, event.position(), window, cx);
                         })),
@@ -1329,7 +1319,7 @@ impl InboxDetailView {
                     this.start_editing(target.block, target.caret, window, cx);
                 }))
                 .child(
-                    Label::new("Кликни, чтобы продолжить — печатай или «/» для блока")
+                    Label::new("Click to continue — type or «/» for a block")
                         .size(LabelSize::Small)
                         .color(Color::Placeholder),
                 ),
@@ -1380,7 +1370,7 @@ impl InboxDetailView {
             }))
             .child(
                 div().px_2().py_0p5().child(
-                    Label::new("ТИП БЛОКА")
+                    Label::new("BLOCK TYPE")
                         .size(LabelSize::XSmall)
                         .weight(FontWeight::BOLD)
                         .color(Color::Placeholder),
@@ -1828,13 +1818,13 @@ mod tests {
             assert_eq!(state.selected, 0);
         });
 
-        // "заг" narrows the list down to the two headings.
-        cx.simulate_input("заг");
+        // "head" narrows the list down to the two headings.
+        cx.simulate_input("head");
         view.read_with(cx, |view, _| {
             let state = view.slash_menu.as_ref().expect("menu should stay open");
             let block = view.document.block(state.block_id).unwrap();
-            assert_eq!(block.text, "/заг");
-            let entries = slash_menu::filtered("заг");
+            assert_eq!(block.text, "/head");
+            let entries = slash_menu::filtered("head");
             assert_eq!(entries.len(), 2);
             assert_eq!(entries[0].block_type, BlockType::H1);
             assert_eq!(entries[1].block_type, BlockType::H2);
@@ -1847,7 +1837,7 @@ mod tests {
         });
 
         // Enter applies it: the block becomes an empty H2, the menu closes
-        // and the "/заг" query never reaches the body.
+        // and the "/head" query never reaches the body.
         cx.simulate_keystrokes("enter");
         assert_eq!(blocks(&view, cx), vec![(BlockType::H2, String::new())]);
         view.read_with(cx, |view, _| {

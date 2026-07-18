@@ -17,50 +17,50 @@ pub struct SlashEntry {
 pub const SLASH_ENTRIES: &[SlashEntry] = &[
     SlashEntry {
         glyph: "H1",
-        label: "Заголовок 1",
-        hint: "крупный",
+        label: "Heading 1",
+        hint: "large",
         block_type: BlockType::H1,
     },
     SlashEntry {
         glyph: "H2",
-        label: "Заголовок 2",
-        hint: "средний",
+        label: "Heading 2",
+        hint: "medium",
         block_type: BlockType::H2,
     },
     SlashEntry {
         glyph: "☑",
-        label: "Подзадача",
-        hint: "чек-лист",
+        label: "To-do",
+        hint: "checklist",
         block_type: BlockType::Todo,
     },
     SlashEntry {
         glyph: "•",
-        label: "Список",
-        hint: "маркеры",
+        label: "List",
+        hint: "bullets",
         block_type: BlockType::Bullet,
     },
     SlashEntry {
         glyph: "❝",
-        label: "Цитата",
-        hint: "блок",
+        label: "Quote",
+        hint: "block",
         block_type: BlockType::Quote,
     },
     SlashEntry {
         glyph: "{}",
-        label: "Код",
-        hint: "моноширинный",
+        label: "Code",
+        hint: "monospaced",
         block_type: BlockType::Code,
     },
     SlashEntry {
         glyph: "—",
-        label: "Разделитель",
-        hint: "линия",
+        label: "Divider",
+        hint: "line",
         block_type: BlockType::Divider,
     },
     SlashEntry {
         glyph: "¶",
-        label: "Текст",
-        hint: "обычный абзац",
+        label: "Text",
+        hint: "plain paragraph",
         block_type: BlockType::Paragraph,
     },
 ];
@@ -72,9 +72,10 @@ pub struct SlashMenuState {
     pub selected: usize,
 }
 
-/// The latin name an entry also matches by, so both "код" and "code" find
-/// the Code entry. `Paragraph` goes by "text" (its label in the design);
-/// this also keeps a bare "h" matching only the headings.
+/// A short type name an entry also matches by, in addition to its label —
+/// e.g. both "list" and "bullet" find the List entry. `Paragraph` goes by
+/// "text" (its label in the design); this also keeps a bare "h" matching
+/// only the headings.
 fn type_name(block_type: BlockType) -> &'static str {
     match block_type {
         BlockType::H1 => "h1",
@@ -120,8 +121,8 @@ mod tests {
     }
 
     #[test]
-    fn test_filtered_matches_russian_label_and_latin_type_name() {
-        for query in ["код", "code", "Код", "CODE"] {
+    fn test_filtered_matches_label_and_type_name() {
+        for query in ["code", "Code", "CODE"] {
             let entries = filtered(query);
             assert_eq!(entries.len(), 1, "query {query:?}");
             assert_eq!(entries[0].block_type, BlockType::Code);
@@ -130,7 +131,7 @@ mod tests {
 
     #[test]
     fn test_filtered_label_substring() {
-        let entries = filtered("заг");
+        let entries = filtered("head");
         let types: Vec<BlockType> = entries.iter().map(|entry| entry.block_type).collect();
         assert_eq!(types, vec![BlockType::H1, BlockType::H2]);
     }
