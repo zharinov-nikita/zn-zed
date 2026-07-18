@@ -442,8 +442,8 @@ impl InboxStore {
         self.on_mutated(cx);
     }
 
-    /// Deletes a type; items of that type become notes. The last remaining
-    /// type cannot be deleted.
+    /// Deletes a type; items of that type become unassigned. The last
+    /// remaining type cannot be deleted.
     pub fn delete_type(&mut self, key: &str, cx: &mut Context<Self>) {
         if self.state.types.len() <= 1 {
             return;
@@ -464,7 +464,7 @@ impl InboxStore {
             .chain(self.state.archived.iter_mut())
         {
             if item.kind.as_deref() == Some(key) {
-                item.kind = Some("note".to_string());
+                item.kind = None;
             }
         }
         self.on_mutated(cx);
@@ -858,12 +858,12 @@ mod tests {
             store.cycle_type_color(&key_a, cx);
             assert_eq!(store.types()[0].color, "created");
 
-            // Deleting a type reassigns its items to "note".
+            // Deleting a type unassigns its items (kind cleared to None).
             store.delete_type(&key_b, cx);
             assert!(store.types().iter().all(|t| t.key != key_b));
         });
         store.read_with(cx, |store, _| {
-            assert_eq!(store.item(&item_id).unwrap().kind.as_deref(), Some("note"));
+            assert_eq!(store.item(&item_id).unwrap().kind, None);
         });
 
         store.update(cx, |store, cx| {
