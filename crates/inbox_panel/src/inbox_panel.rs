@@ -23,7 +23,8 @@ use gpui::{
 use theme_settings::ThemeSettings;
 use ui::{
     ButtonLike, Checkbox, ContextMenu, ContextMenuEntry, ContextMenuItem, Disclosure, PopoverMenu,
-    Tab, TintColor, ToggleButtonGroup, ToggleButtonSimple, ToggleState, Tooltip, prelude::*,
+    ScrollAxes, Scrollbars, Tab, TintColor, ToggleButtonGroup, ToggleButtonSimple, ToggleState,
+    Tooltip, WithScrollbar, prelude::*,
 };
 use workspace::{
     Workspace,
@@ -48,15 +49,15 @@ actions!(
 
 const INBOX_PANEL_KEY: &str = "InboxPanel";
 
-/// How often the item age labels ("2м"/"15ч") are refreshed.
+/// How often the item age labels ("2m"/"15h") are refreshed.
 const AGE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Whether the open items are shown as a flat list or grouped by type.
 #[derive(Clone, Copy, PartialEq)]
 enum ViewMode {
-    /// A flat list of all open items ("Все").
+    /// A flat list of all open items ("All").
     All,
-    /// Open items grouped by their resolved type ("По спискам").
+    /// Open items grouped by their resolved type ("By list").
     Grouped,
 }
 
@@ -211,7 +212,7 @@ impl InboxPanel {
             let capture_editor = cx.new(|cx| {
                 let mut editor = Editor::auto_height(1, 5, window, cx);
                 editor.set_placeholder_text(
-                    "Выгрузи из головы — что угодно про проект…",
+                    "Dump whatever's on your mind about the project…",
                     window,
                     cx,
                 );
@@ -245,7 +246,7 @@ impl InboxPanel {
                 store,
                 capture_editor,
                 capture_kind: None,
-                view_mode: ViewMode::Grouped,
+                view_mode: ViewMode::All,
                 collapsed_groups: HashSet::default(),
                 show_archive: false,
                 type_editor: None,
@@ -297,7 +298,7 @@ impl InboxPanel {
 
     /// Drops the preselected capture type when its key no longer exists in
     /// the store's types (e.g. the type was deleted or the file was edited
-    /// externally), falling back to "Авто".
+    /// externally), falling back to "No list".
     fn reconcile_capture_kind(&mut self, cx: &Context<Self>) {
         if let Some(kind) = &self.capture_kind
             && !self
@@ -411,7 +412,7 @@ impl InboxPanel {
                         .icon_size(IconSize::Small)
                         .icon_color(Color::Muted)
                         .toggle_state(self.show_archive)
-                        .tooltip(Tooltip::text("Показать/скрыть разобранные"))
+                        .tooltip(Tooltip::text("Show/hide cleared"))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.show_archive = !this.show_archive;
                             cx.notify();
@@ -421,7 +422,7 @@ impl InboxPanel {
                         IconButton::new("inbox-type-settings", IconName::Settings)
                             .icon_size(IconSize::Small)
                             .icon_color(Color::Muted)
-                            .tooltip(Tooltip::text("Настроить списки"))
+                            .tooltip(Tooltip::text("Configure lists"))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.open_type_editor(window, cx);
                             })),
@@ -432,9 +433,9 @@ impl InboxPanel {
     fn render_error_banner(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let store = self.store.read(cx);
         let message = if store.load_error().is_some() {
-            "inbox.json повреждён — исправьте файл"
+            "inbox.json is corrupted — fix the file"
         } else if store.save_error().is_some() {
-            "не удалось сохранить inbox.json"
+            "Failed to save inbox.json"
         } else {
             return None;
         };
@@ -542,8 +543,8 @@ impl InboxPanel {
                             )
                         })
                         .collect();
-                    menu = menu.header("Добавить в список").item(Self::type_menu_item(
-                        SharedString::from("Авто — по смыслу"),
+                    menu = menu.header("Add to list").item(Self::type_menu_item(
+                        SharedString::from("No list"),
                         Color::Muted.color(cx),
                         capture_kind.is_none(),
                         {
@@ -576,7 +577,16 @@ impl InboxPanel {
                             },
                         ));
                     }
-                    menu
+                    menu.separator().item(
+                        ContextMenuEntry::new("Configure lists…")
+                            .icon(IconName::Settings)
+                            .icon_color(Color::Muted)
+                            .handler(move |window, cx| {
+                                panel
+                                    .update(cx, |this, cx| this.open_type_editor(window, cx))
+                                    .ok();
+                            }),
+                    )
                 }))
             })
     }
@@ -640,7 +650,7 @@ impl InboxPanel {
                     ));
                 }
                 menu.separator().item(
-                    ContextMenuEntry::new("Настроить типы…")
+                    ContextMenuEntry::new("Configure lists…")
                         .icon(IconName::Settings)
                         .icon_color(Color::Muted)
                         .handler(move |window, cx| {
@@ -664,6 +674,7 @@ impl InboxPanel {
             cx.theme().colors().border_variant
         };
 
+        let has_types = !self.store.read(cx).types().is_empty();
         let (chip_label, chip_color) = {
             let store = self.store.read(cx);
             match self.capture_kind.as_deref().and_then(|key| {
@@ -676,7 +687,7 @@ impl InboxPanel {
                     SharedString::from(inbox_type.label.clone()),
                     type_color(&inbox_type.color, cx),
                 ),
-                None => (SharedString::from("Авто"), Color::Muted.color(cx)),
+                None => (SharedString::from("No list"), Color::Muted.color(cx)),
             }
         };
 
@@ -700,10 +711,13 @@ impl InboxPanel {
                     h_flex()
                         .px_2()
                         .py_1()
-                        .justify_between()
-                        .child(self.render_capture_type_menu(chip_label, chip_color, cx))
+                        .when(has_types, |this| this.justify_between())
+                        .when(!has_types, |this| this.justify_end())
+                        .when(has_types, |this| {
+                            this.child(self.render_capture_type_menu(chip_label, chip_color, cx))
+                        })
                         .child(
-                            Label::new("↵ добавить")
+                            Label::new("↵ add")
                                 .size(LabelSize::XSmall)
                                 .color(Color::Placeholder),
                         ),
@@ -724,14 +738,14 @@ impl InboxPanel {
                     .color(Color::Muted),
             )
             .child(
-                Label::new("Инбокс пуст")
+                Label::new("Inbox is empty")
                     .color(Color::Muted)
                     .weight(FontWeight::MEDIUM),
             )
             .child(
                 div().text_center().max_w(px(240.)).child(
                     Label::new(
-                        "Всё разобрано. Появится мысль — бросай сюда, не отвлекаясь от кода.",
+                        "All clear. When a thought strikes, drop it here without leaving your code.",
                     )
                     .size(LabelSize::Small)
                     .color(Color::Placeholder),
@@ -749,7 +763,7 @@ impl InboxPanel {
                 div()
                     .text_center()
                     .max_w(px(240.))
-                    .child(Label::new("Откройте проект, чтобы вести инбокс").color(Color::Muted)),
+                    .child(Label::new("Open a project to use the inbox").color(Color::Muted)),
             )
     }
 
@@ -762,15 +776,16 @@ impl InboxPanel {
     ) -> AnyElement {
         let id = item.id.clone();
         let is_archive_row = row != ItemRow::Open;
-        let (type_label, type_chip_color) = {
+        // The type chip is hidden entirely for unassigned items (no kind, or
+        // an unknown/deleted kind) rather than shown with a blank label.
+        let type_chip = {
             let store = self.store.read(cx);
-            match store.resolve_kind(item) {
-                Some(inbox_type) => (
+            store.resolve_kind(item).map(|inbox_type| {
+                (
                     SharedString::from(inbox_type.label.clone()),
                     type_color(&inbox_type.color, cx),
-                ),
-                None => (SharedString::from(""), Color::Muted.color(cx)),
-            }
+                )
+            })
         };
 
         let checkbox_id = SharedString::from(format!("inbox-checkbox-{}", item.id));
@@ -801,11 +816,15 @@ impl InboxPanel {
             Label::new(item.text.clone())
         };
 
-        let mut meta = h_flex()
-            .flex_wrap()
-            .items_center()
-            .gap_2()
-            .child(self.render_item_type_menu(item.id.clone(), type_label, type_chip_color, cx));
+        let mut meta = h_flex().flex_wrap().items_center().gap_2();
+        if let Some((type_label, type_chip_color)) = type_chip {
+            meta = meta.child(self.render_item_type_menu(
+                item.id.clone(),
+                type_label,
+                type_chip_color,
+                cx,
+            ));
+        }
         if let Some(created) = item.created {
             meta = meta.child(
                 div()
@@ -861,7 +880,7 @@ impl InboxPanel {
             .icon_size(IconSize::XSmall)
             .icon_color(Color::Muted)
             .visible_on_hover("inbox-item")
-            .tooltip(Tooltip::text("Удалить"))
+            .tooltip(Tooltip::text("Delete"))
             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                 this.confirming_delete = Some((id.clone(), event.position()));
                 cx.notify();
@@ -931,7 +950,7 @@ impl InboxPanel {
                 self.show_archive,
             ))
             .child(
-                Label::new("АРХИВ")
+                Label::new("ARCHIVE")
                     .size(LabelSize::XSmall)
                     .weight(FontWeight::BOLD)
                     .color(Color::Muted),
@@ -949,7 +968,7 @@ impl InboxPanel {
             )
     }
 
-    /// The "Все" / "По спискам" segmented switch above the item list.
+    /// The "All" / "By list" segmented switch above the item list.
     fn render_view_mode_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .flex_none()
@@ -964,14 +983,14 @@ impl InboxPanel {
                     "inbox-view-mode",
                     [
                         ToggleButtonSimple::new(
-                            "Все",
+                            "All",
                             cx.listener(|this, _, _, cx| {
                                 this.view_mode = ViewMode::All;
                                 cx.notify();
                             }),
                         ),
                         ToggleButtonSimple::new(
-                            "По спискам",
+                            "By list",
                             cx.listener(|this, _, _, cx| {
                                 this.view_mode = ViewMode::Grouped;
                                 cx.notify();
@@ -1029,8 +1048,18 @@ impl InboxPanel {
             )
     }
 
-    /// Renders the open items grouped by type, in `store.types()` order.
-    /// Each group is a drop target that moves the dragged item into it.
+    /// The `collapsed_groups` entry for the synthetic "Unassigned" group
+    /// (items with no kind, or an unknown/deleted kind). Real type keys are
+    /// generated as `k{id}` by [`InboxStore::add_type`](crate::inbox_store::InboxStore::add_type),
+    /// so this cannot collide with one produced by the UI; a hand-edited
+    /// `inbox.json` could in principle define a type with this exact key,
+    /// but that's an accepted, self-inflicted edge case.
+    const UNASSIGNED_GROUP_KEY: &'static str = "__unassigned__";
+
+    /// Renders the open items grouped by type, in `store.types()` order,
+    /// followed by an "Unassigned" group for items with no resolved kind.
+    /// Every group is rendered, even an empty one, so it stays a valid drop
+    /// target; this is what lets an item be dragged into an empty list.
     fn render_grouped_items(
         &self,
         open: &[InboxItem],
@@ -1052,7 +1081,7 @@ impl InboxPanel {
                 .collect()
         };
         // Group by the resolved kind. Items with no kind, or an unknown/deleted
-        // kind, resolve to `None` and currently land in no group.
+        // kind, resolve to `None` and land in the "Unassigned" group below.
         let item_keys: Vec<Option<String>> = {
             let store = self.store.read(cx);
             open.iter()
@@ -1068,9 +1097,6 @@ impl InboxPanel {
                 .filter(|(_, item_key)| item_key.as_deref() == Some(key.as_str()))
                 .map(|(item, _)| item)
                 .collect();
-            if items.is_empty() {
-                continue;
-            }
             let collapsed = self.collapsed_groups.contains(&key);
             let mut group = v_flex()
                 .id(SharedString::from(format!("inbox-group-{key}")))
@@ -1107,10 +1133,51 @@ impl InboxPanel {
             }
             elements.push(group.into_any_element());
         }
+
+        let unassigned: Vec<&InboxItem> = open
+            .iter()
+            .zip(&item_keys)
+            .filter(|(_, item_key)| item_key.is_none())
+            .map(|(item, _)| item)
+            .collect();
+        if !unassigned.is_empty() {
+            let collapsed = self.collapsed_groups.contains(Self::UNASSIGNED_GROUP_KEY);
+            let mut group = v_flex()
+                .id("inbox-group-unassigned")
+                .rounded_md()
+                .drag_over::<DraggedInboxItem>(|style, _, _, cx| {
+                    style.bg(cx.theme().colors().drop_target_background)
+                })
+                .on_drop(cx.listener(|this, drag: &DraggedInboxItem, _, cx| {
+                    this.store.update(cx, |store, cx| {
+                        let already_unassigned = store
+                            .item(&drag.id)
+                            .is_some_and(|item| store.resolve_kind(item).is_none());
+                        if !already_unassigned {
+                            store.set_kind(&drag.id, None, cx);
+                        }
+                    });
+                }))
+                .child(self.render_group_header(
+                    Self::UNASSIGNED_GROUP_KEY.to_string(),
+                    SharedString::from("Unassigned"),
+                    cx.theme().colors().border_variant,
+                    unassigned.len(),
+                    collapsed,
+                    cx,
+                ));
+            if !collapsed {
+                for item in unassigned {
+                    group = group.child(self.render_item(item, ItemRow::Open, now, cx));
+                }
+            }
+            elements.push(group.into_any_element());
+        }
+
         elements
     }
 
-    fn render_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_list(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (open, cleared, archived) = {
             let store = self.store.read(cx);
             let (cleared, open): (Vec<_>, Vec<_>) = store
@@ -1146,8 +1213,6 @@ impl InboxPanel {
             .id("inbox-list")
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
-            .track_scroll(&self.scroll_handle)
             .p_1()
             .when(!open.is_empty(), |this| {
                 this.child(self.render_view_mode_toggle(cx))
@@ -1160,6 +1225,15 @@ impl InboxPanel {
                 this.child(self.render_archive_header(archive_count, cx))
                     .children(archive_rows)
             })
+            // Visible, auto-hiding vertical scrollbar matching Zed's other
+            // dock panels (see e.g. project_panel/outline_panel). This also
+            // takes over the scroll tracking/overflow that used to be set
+            // manually via `.overflow_y_scroll().track_scroll(...)`.
+            .custom_scrollbars(
+                Scrollbars::new(ScrollAxes::Vertical).tracked_scroll_handle(&self.scroll_handle),
+                window,
+                cx,
+            )
     }
 
     /// The full-panel detail view overlay, or `None` while it is closed.
@@ -1193,13 +1267,13 @@ impl InboxPanel {
                                 this.confirming_delete = None;
                                 cx.notify();
                             }))
-                            .child(Label::new("Удалить запись?"))
+                            .child(Label::new("Delete item?"))
                             .child(
                                 h_flex()
                                     .gap_1()
                                     .justify_end()
                                     .child(
-                                        Button::new("inbox-delete-cancel", "Отмена")
+                                        Button::new("inbox-delete-cancel", "Cancel")
                                             .style(ButtonStyle::Subtle)
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.confirming_delete = None;
@@ -1207,7 +1281,7 @@ impl InboxPanel {
                                             })),
                                     )
                                     .child(
-                                        Button::new("inbox-delete-confirm", "Удалить")
+                                        Button::new("inbox-delete-confirm", "Delete")
                                             .style(ButtonStyle::Tinted(TintColor::Error))
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 this.confirming_delete = None;
@@ -1307,7 +1381,7 @@ impl Render for InboxPanel {
             .map(|this| {
                 if has_worktree {
                     this.child(self.render_capture_box(window, cx))
-                        .child(self.render_list(cx))
+                        .child(self.render_list(window, cx))
                 } else {
                     this.child(self.render_no_worktree(cx))
                 }
