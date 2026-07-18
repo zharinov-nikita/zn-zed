@@ -319,6 +319,51 @@ impl BlockDocument {
         }
     }
 
+    /// Applies the live editor text of block `id` back into the document.
+    ///
+    /// Text blocks must stay single-line — the markdown codec's round trip
+    /// depends on it — but an auto-height editor can still come to hold
+    /// newlines (multi-line paste, shift-enter). When that happens for a
+    /// non-`Code` block, the first line stays in the block and the rest is
+    /// parsed through the markdown codec into new blocks inserted right
+    /// after it, so no text is lost and pasted markdown keeps its
+    /// structure. Returns the block/caret the UI should move editing to
+    /// when such a restructure happened, `None` when the text was applied
+    /// in place.
+    ///
+    /// `Code` blocks keep newlines verbatim; `Divider` blocks are never
+    /// edited and are left untouched.
+    pub fn apply_text(&mut self, id: BlockId, text: &str) -> Option<EditTarget> {
+        let index = self.index_of(id)?;
+        let block_type = self.blocks[index].block_type;
+
+        if block_type == BlockType::Divider {
+            return None;
+        }
+        if block_type == BlockType::Code {
+            self.blocks[index].text = text.to_string();
+            return None;
+        }
+        let Some((first, rest)) = text.split_once('\n') else {
+            self.blocks[index].text = text.to_string();
+            return None;
+        };
+
+        self.blocks[index].text = first.to_string();
+        // `parse_blocks` never returns an empty list: whitespace-only tails
+        // (e.g. a trailing newline) become a single empty paragraph, which
+        // matches what pressing Enter at the end of the block would do.
+        let new_blocks = parse_blocks(rest, &mut self.next_id);
+        let target = new_blocks.last().map(|block| EditTarget {
+            block: block.id,
+            caret: CaretPos::End,
+        });
+        for (offset, block) in new_blocks.into_iter().enumerate() {
+            self.blocks.insert(index + 1 + offset, block);
+        }
+        target
+    }
+
     /// Toggles `checked` on a `Todo` block (no-op on other types).
     pub fn toggle_checked(&mut self, id: BlockId) {
         if let Some(block) = self.blocks.iter_mut().find(|block| block.id == id)
@@ -862,6 +907,105 @@ mod tests {
         assert_eq!(doc.blocks()[1].block_type, BlockType::Todo);
         assert_eq!(doc.blocks()[1].text, "task");
         assert!(doc.blocks()[1].checked);
+    }
+
+    // --- apply_text ---
+
+    #[test]
+    fn test_apply_text_single_line_sets_text_in_place() {
+        let mut doc = doc_from(vec![(BlockType::Paragraph, "old", false)]);
+        let id = doc.blocks()[0].id;
+        assert_eq!(doc.apply_text(id, "new text"), None);
+        assert_eq!(doc.len(), 1);
+        assert_eq!(doc.blocks()[0].text, "new text");
+    }
+
+    #[test]
+    fn test_apply_text_code_keeps_newlines_verbatim() {
+        let mut doc = doc_from(vec![(BlockType::Code, "old", false)]);
+        let id = doc.blocks()[0].id;
+        assert_eq!(doc.apply_text(id, "let x = 1;\nlet y = 2;"), None);
+        assert_eq!(doc.len(), 1);
+        assert_eq!(doc.blocks()[0].text, "let x = 1;\nlet y = 2;");
+    }
+
+    #[test]
+    fn test_apply_text_divider_is_untouched() {
+        let mut doc = doc_from(vec![(BlockType::Divider, "", false)]);
+        let id = doc.blocks()[0].id;
+        assert_eq!(doc.apply_text(id, "stray\ntext"), None);
+        assert_eq!(doc.blocks()[0].text, "");
+    }
+
+    #[test]
+    fn test_apply_text_multiline_splits_into_new_blocks() {
+        let mut doc = doc_from(vec![
+            (BlockType::Paragraph, "old", false),
+            (BlockType::Paragraph, "tail", false),
+        ]);
+        let id = doc.blocks()[0].id;
+        let target = doc.apply_text(id, "first\nsecond\nthird").unwrap();
+        assert_eq!(doc.len(), 4);
+        assert_eq!(doc.blocks()[0].text, "first");
+        assert_eq!(doc.blocks()[1].text, "second");
+        assert_eq!(doc.blocks()[2].text, "third");
+        assert_eq!(doc.blocks()[3].text, "tail");
+        assert_eq!(doc.blocks()[1].block_type, BlockType::Paragraph);
+        assert_eq!(doc.blocks()[2].block_type, BlockType::Paragraph);
+        // The caret moves to the end of the last inserted block.
+        assert_eq!(target.block, doc.blocks()[2].id);
+        assert_eq!(target.caret, CaretPos::End);
+    }
+
+    #[test]
+    fn test_apply_text_multiline_parses_markdown_in_tail() {
+        let mut doc = doc_from(vec![(BlockType::Bullet, "old", false)]);
+        let id = doc.blocks()[0].id;
+        let target = doc.apply_text(id, "first\n- [x] done\n---").unwrap();
+        assert_eq!(doc.len(), 3);
+        assert_eq!(doc.blocks()[0].block_type, BlockType::Bullet);
+        assert_eq!(doc.blocks()[0].text, "first");
+        assert_eq!(doc.blocks()[1].block_type, BlockType::Todo);
+        assert_eq!(doc.blocks()[1].text, "done");
+        assert!(doc.blocks()[1].checked);
+        assert_eq!(doc.blocks()[2].block_type, BlockType::Divider);
+        assert_eq!(target.block, doc.blocks()[2].id);
+    }
+
+    #[test]
+    fn test_apply_text_trailing_newline_appends_empty_paragraph() {
+        let mut doc = doc_from(vec![(BlockType::Paragraph, "abc", false)]);
+        let id = doc.blocks()[0].id;
+        let target = doc.apply_text(id, "abc\n").unwrap();
+        assert_eq!(doc.len(), 2);
+        assert_eq!(doc.blocks()[0].text, "abc");
+        assert_eq!(doc.blocks()[1].block_type, BlockType::Paragraph);
+        assert_eq!(doc.blocks()[1].text, "");
+        assert_eq!(target.block, doc.blocks()[1].id);
+    }
+
+    #[test]
+    fn test_apply_text_multiline_round_trips_through_codec() {
+        let mut doc = doc_from(vec![(BlockType::Paragraph, "old", false)]);
+        let id = doc.blocks()[0].id;
+        doc.apply_text(id, "first\nsecond\n\nthird").unwrap();
+        // No text block may hold a newline (the codec invariant), so
+        // serialize ∘ parse must be an identity.
+        assert!(doc.blocks().iter().all(|block| !block.text.contains('\n')));
+        let serialized = doc.to_markdown();
+        let round_tripped = BlockDocument::from_markdown(&serialized);
+        assert_eq!(round_tripped.to_markdown(), serialized);
+    }
+
+    #[test]
+    fn test_apply_text_new_block_ids_are_fresh() {
+        let mut doc = doc_from(vec![(BlockType::Paragraph, "old", false)]);
+        let id = doc.blocks()[0].id;
+        doc.apply_text(id, "a\nb\nc").unwrap();
+        let mut ids: Vec<u64> = doc.blocks().iter().map(|block| block.id.0).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), doc.len(), "ids must be unique");
     }
 
     // --- subtask_counts ---
