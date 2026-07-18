@@ -4,6 +4,7 @@ pub mod inbox_model;
 mod inbox_panel_settings;
 pub mod inbox_store;
 pub mod markdown_codec;
+pub mod slash_menu;
 mod type_editor;
 
 pub use detail_view::{InboxDetailEvent, InboxDetailView};
@@ -277,14 +278,34 @@ impl InboxPanel {
                 // `Closed` when its item is deleted; nothing to do here.
                 cx.notify();
             }
-            InboxStoreEvent::Changed => cx.notify(),
+            InboxStoreEvent::Changed => {
+                self.reconcile_capture_kind(cx);
+                cx.notify();
+            }
             InboxStoreEvent::Reloaded => {
                 // The file changed externally: the types (and their keys) may
                 // be entirely different now, so drop the rename editors
                 // rather than trying to reconcile them.
                 self.type_editor = None;
+                self.reconcile_capture_kind(cx);
                 cx.notify();
             }
+        }
+    }
+
+    /// Drops the preselected capture type when its key no longer exists in
+    /// the store's types (e.g. the type was deleted or the file was edited
+    /// externally), falling back to "Авто".
+    fn reconcile_capture_kind(&mut self, cx: &Context<Self>) {
+        if let Some(kind) = &self.capture_kind
+            && !self
+                .store
+                .read(cx)
+                .types()
+                .iter()
+                .any(|inbox_type| &inbox_type.key == kind)
+        {
+            self.capture_kind = None;
         }
     }
 
@@ -300,6 +321,7 @@ impl InboxPanel {
     /// type editor if it was open.
     fn open_detail(&mut self, id: ItemId, window: &mut Window, cx: &mut Context<Self>) {
         self.type_editor = None;
+        self.confirming_delete = None;
         let detail = cx.new(|cx| {
             InboxDetailView::new(self.store.clone(), id, self.workspace.clone(), window, cx)
         });

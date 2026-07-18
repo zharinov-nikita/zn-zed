@@ -1,27 +1,32 @@
 //! The detail view of a single inbox item: a title editor, a meta line and
 //! the item's markdown body as editable [`Block`]s. Rendered by the panel as
 //! a full-panel overlay. Clicking a block opens the single live editor on
-//! it; Enter splits, Backspace at the start merges, Escape commits. The
-//! slash/grip menus arrive in Task 9.
+//! it; Enter splits, Backspace at the start merges, Escape commits. Typing
+//! "/" in an empty block opens the slash menu; the grip button on each row
+//! opens the block actions menu.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use editor::{Editor, EditorElement, EditorEvent, EditorStyle, MultiBufferOffset};
 use gpui::{
-    AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontStyle, FontWeight,
-    IntoElement, ParentElement, Render, ScrollHandle, StrikethroughStyle, Styled, Subscription,
-    TextStyle, TextStyleRefinement, UnderlineStyle, WeakEntity, Window,
+    AnyElement, App, Bounds, ClickEvent, Context, DismissEvent, Entity, EventEmitter, FocusHandle,
+    Focusable, FontStyle, FontWeight, IntoElement, MouseButton, ParentElement, Pixels, Point,
+    Render, ScrollHandle, StrikethroughStyle, Styled, Subscription, TextStyle, TextStyleRefinement,
+    UnderlineStyle, WeakEntity, Window, anchored, canvas, deferred, point,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownStyle};
 use settings::Settings as _;
 use theme_settings::ThemeSettings;
-use ui::{Checkbox, Divider, Tab, ToggleState, Tooltip, prelude::*};
+use ui::{Checkbox, ContextMenu, ContextMenuEntry, Divider, Tab, ToggleState, Tooltip, prelude::*};
 use workspace::Workspace;
 
 use crate::block::{Block, BlockDocument, BlockId, BlockType, CaretPos, EditTarget};
 use crate::inbox_model::{InboxItem, ItemId, format_age, now_unix, type_color};
 use crate::inbox_store::{InboxStore, InboxStoreEvent};
 use crate::open_capture_context;
+use crate::slash_menu::{self, SlashEntry, SlashMenuState};
 
 pub enum InboxDetailEvent {
     /// The view wants to be closed (back button, Escape, or its item is gone).
@@ -50,6 +55,14 @@ pub struct InboxDetailView {
     read_markdown: HashMap<BlockId, Entity<Markdown>>,
     /// The block currently being edited, if any.
     editing: Option<EditingState>,
+    /// The open slash menu, if any. Invariant: only ever open for the block
+    /// currently being edited; closed whenever editing moves or stops.
+    slash_menu: Option<SlashMenuState>,
+    /// Window bounds of the rendered block rows, written during paint and
+    /// read one frame later to anchor the slash menu popup.
+    block_bounds: Rc<RefCell<HashMap<BlockId, Bounds<Pixels>>>>,
+    /// The open grip (block actions) context menu.
+    grip_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     scroll_handle: ScrollHandle,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
@@ -89,6 +102,9 @@ impl InboxDetailView {
             document: BlockDocument::from_markdown(body.as_deref().unwrap_or_default()),
             read_markdown: HashMap::default(),
             editing: None,
+            slash_menu: None,
+            block_bounds: Rc::default(),
+            grip_menu: None,
             scroll_handle: ScrollHandle::new(),
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
@@ -192,6 +208,16 @@ impl InboxDetailView {
         let block_type = block.block_type;
         let text = block.text.clone();
 
+        // The slash menu follows the edited block; moving to another block
+        // closes it.
+        if self
+            .slash_menu
+            .as_ref()
+            .is_some_and(|state| state.block_id != id)
+        {
+            self.slash_menu = None;
+        }
+
         if let Some(state) = &self.editing
             && state.block_id == id
         {
@@ -207,13 +233,28 @@ impl InboxDetailView {
         }
         self.commit_editing(cx);
 
+        // Parity with the read-mode placeholders: only the last block
+        // advertises the slash menu.
+        let is_last = self
+            .document
+            .blocks()
+            .last()
+            .is_some_and(|last| last.id == id);
         let editor = cx.new(|cx| {
             let mut editor = if block_type == BlockType::Code {
                 Editor::auto_height(3, 128, window, cx)
             } else {
                 Editor::auto_height(1, 128, window, cx)
             };
-            editor.set_placeholder_text("Печатай, или «/» для блока", window, cx);
+            editor.set_placeholder_text(
+                if is_last {
+                    "Печатай, или «/» для блока"
+                } else {
+                    "Пустая строка"
+                },
+                window,
+                cx,
+            );
             editor.set_text(text, window, cx);
             editor
         });
@@ -235,6 +276,13 @@ impl InboxDetailView {
         let Some(state) = self.editing.take() else {
             return;
         };
+        if self
+            .slash_menu
+            .as_ref()
+            .is_some_and(|menu| menu.block_id == state.block_id)
+        {
+            self.slash_menu = None;
+        }
         let text = state.editor.read(cx).text(cx);
         if self
             .document
@@ -283,8 +331,16 @@ impl InboxDetailView {
         match event {
             EditorEvent::BufferEdited => {
                 let text = editor.read(cx).text(cx);
-                // TODO(Task 9): detect a typed "/" here and open the slash
-                // menu for the block.
+                // A freshly-created editor reports its initial `set_text`
+                // too (as does clearing an already-empty editor); skip no-op
+                // syncs so they don't dirty the store.
+                if self
+                    .document
+                    .block(block_id)
+                    .is_some_and(|block| block.text == text)
+                {
+                    return;
+                }
                 let target = self.document.apply_text(block_id, &text);
                 self.save_body(cx);
                 if let Some(target) = target {
@@ -292,16 +348,172 @@ impl InboxDetailView {
                     // new blocks. The editor still holds the multiline text,
                     // so drop it without the commit-time resync and continue
                     // editing at the end of the inserted blocks.
+                    self.slash_menu = None;
                     self.editing = None;
                     self.start_editing(target.block, target.caret, window, cx);
+                } else {
+                    self.update_slash_menu(block_id, &text);
                 }
                 cx.notify();
             }
             EditorEvent::Blurred => {
+                // A mousedown inside the slash menu can momentarily steal
+                // focus; committing here would tear down the editor under
+                // the menu interaction. The menu's apply/close paths finish
+                // (or resume) the edit instead.
+                if self
+                    .slash_menu
+                    .as_ref()
+                    .is_some_and(|menu| menu.block_id == block_id)
+                {
+                    return;
+                }
                 self.commit_editing(cx);
             }
             _ => {}
         }
+    }
+
+    /// Opens, retargets or closes the slash menu from the freshly-synced
+    /// text of the edited block: the menu is open exactly while the whole
+    /// text matches `/\S*` (a "/" followed by no whitespace) and at least
+    /// one entry matches the query after the "/".
+    fn update_slash_menu(&mut self, block_id: BlockId, text: &str) {
+        let len = text
+            .strip_prefix('/')
+            .filter(|rest| !rest.contains(char::is_whitespace))
+            .map_or(0, |query| slash_menu::filtered(query).len());
+        if len == 0 {
+            self.slash_menu = None;
+            return;
+        }
+        match &mut self.slash_menu {
+            Some(state) if state.block_id == block_id => {
+                // The list may have shrunk; keep the selection valid.
+                state.selected = state.selected.min(len - 1);
+            }
+            _ => {
+                self.slash_menu = Some(SlashMenuState {
+                    block_id,
+                    selected: 0,
+                });
+            }
+        }
+    }
+
+    /// The currently selected entry of the open slash menu, if the menu is
+    /// open for the block being edited and has any matches.
+    fn selected_slash_entry(&self) -> Option<&'static SlashEntry> {
+        let state = self.slash_menu.as_ref()?;
+        if self.editing.as_ref().map(|editing| editing.block_id) != Some(state.block_id) {
+            return None;
+        }
+        let block = self.document.block(state.block_id)?;
+        let query = block.text.strip_prefix('/').unwrap_or("");
+        let entries = slash_menu::filtered(query);
+        let last = entries.len().checked_sub(1)?;
+        entries.get(state.selected.min(last)).copied()
+    }
+
+    /// Moves the slash menu selection by `delta`, clamped to the filtered
+    /// list. Returns `false` (untouched) when the menu is not open.
+    fn step_slash_selection(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
+        let Some(state) = self.slash_menu.as_ref() else {
+            return false;
+        };
+        let Some(block) = self.document.block(state.block_id) else {
+            return false;
+        };
+        let query = block.text.strip_prefix('/').unwrap_or("");
+        let len = slash_menu::filtered(query).len();
+        if len == 0 {
+            return false;
+        }
+        if let Some(state) = self.slash_menu.as_mut() {
+            let current = state.selected.min(len - 1) as isize;
+            state.selected = (current + delta).clamp(0, len as isize - 1) as usize;
+        }
+        cx.notify();
+        true
+    }
+
+    /// Up/Down in the active block editor move the slash menu selection
+    /// while the menu is open, and are the editor's ordinary cursor motion
+    /// otherwise.
+    fn handle_block_move_up(
+        &mut self,
+        _: &zed_actions::editor::MoveUp,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.step_slash_selection(-1, cx) {
+            cx.propagate();
+        }
+    }
+
+    fn handle_block_move_down(
+        &mut self,
+        _: &zed_actions::editor::MoveDown,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.step_slash_selection(1, cx) {
+            cx.propagate();
+        }
+    }
+
+    /// Applies a slash menu entry: converts the block to the entry's type
+    /// and clears the "/query" text.
+    fn apply_slash(
+        &mut self,
+        entry: &'static SlashEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self.slash_menu.take() else {
+            return;
+        };
+        let block_id = state.block_id;
+        cx.notify();
+        if self.editing.as_ref().map(|editing| editing.block_id) != Some(block_id) {
+            return;
+        }
+
+        if entry.block_type == BlockType::Divider {
+            // `convert` restructures the document (clears the block, inserts
+            // a paragraph after it), so drop the editor — which still holds
+            // the "/query" text — without the commit-time resync, then start
+            // editing the inserted paragraph.
+            self.editing = None;
+            let target = self.document.convert(block_id, BlockType::Divider);
+            self.save_body(cx);
+            if let Some(target) = target {
+                self.start_editing(target.block, target.caret, window, cx);
+            }
+            return;
+        }
+
+        // Update the document first, then the editor: clearing the editor
+        // fires `BufferEdited`, which must see editor text == block text
+        // ("" == "") so it doesn't write the stale "/query" back.
+        self.document.set_text(block_id, String::new());
+        self.document.convert(block_id, entry.block_type);
+
+        if entry.block_type == BlockType::Code {
+            // A `Code` editor differs (min_lines, style), so recreate it.
+            // Drop the old editor without resync — it still holds "/query".
+            self.editing = None;
+            self.save_body(cx);
+            self.start_editing(block_id, CaretPos::Start, window, cx);
+            return;
+        }
+
+        if let Some(state) = &self.editing {
+            let editor = state.editor.clone();
+            editor.update(cx, |editor, cx| editor.set_text("", window, cx));
+            window.focus(&editor.focus_handle(cx), cx);
+        }
+        self.save_body(cx);
     }
 
     /// Enter in the active block: a newline inside `Code` blocks, a block
@@ -316,10 +528,14 @@ impl InboxDetailView {
             cx.propagate();
             return;
         };
-        // TODO(Task 9): when the slash menu is open, Enter applies the
-        // selected entry instead.
         let block_id = state.block_id;
         let editor = state.editor.clone();
+        if let Some(entry) = self.selected_slash_entry() {
+            // Enter with the slash menu open applies the selected entry
+            // instead of splitting the block.
+            self.apply_slash(entry, window, cx);
+            return;
+        }
         let Some(block) = self.document.block(block_id) else {
             return;
         };
@@ -389,6 +605,24 @@ impl InboxDetailView {
             cx.propagate();
             return;
         }
+        // Sync the editor text into the document before mutating it (as in
+        // confirm), so the merge below doesn't depend on `BufferEdited`
+        // delivery order.
+        let text = editor.read(cx).text(cx);
+        if self
+            .document
+            .block(block_id)
+            .is_some_and(|block| block.text != text)
+            && let Some(target) = self.document.apply_text(block_id, &text)
+        {
+            // Multiline text slipped in: restructure instead of merging.
+            self.slash_menu = None;
+            self.editing = None;
+            self.save_body(cx);
+            self.start_editing(target.block, target.caret, window, cx);
+            cx.stop_propagation();
+            return;
+        }
         match self.document.backspace_at_start(block_id) {
             Some(target) => {
                 if target.block != block_id {
@@ -417,10 +651,147 @@ impl InboxDetailView {
             cx.propagate();
             return;
         }
-        // TODO(Task 9): Escape first closes the slash menu when it is open.
+        if self.slash_menu.take().is_some() {
+            // Escape only closes the slash menu; the "/query" text stays in
+            // the block and editing continues.
+            if let Some(state) = &self.editing {
+                window.focus(&state.editor.focus_handle(cx), cx);
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         self.commit_editing(cx);
         window.focus(&self.focus_handle, cx);
         cx.stop_propagation();
+    }
+
+    /// Opens the grip (block actions) context menu for block `id` at
+    /// `position`.
+    fn deploy_grip_menu(
+        &mut self,
+        id: BlockId,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Close the slash menu first: it would otherwise keep suppressing
+        // the editor's blur commit while the grip menu holds focus.
+        self.slash_menu = None;
+        let view = cx.weak_entity();
+        let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
+            menu.item(
+                ContextMenuEntry::new("Добавить ниже")
+                    .icon(IconName::Plus)
+                    .icon_color(Color::Muted)
+                    .handler({
+                        let view = view.clone();
+                        move |window, cx| {
+                            view.update(cx, |this, cx| {
+                                let target = this.document.insert_after(id);
+                                this.save_body(cx);
+                                this.start_editing(target.block, target.caret, window, cx);
+                            })
+                            .ok();
+                        }
+                    }),
+            )
+            .item(
+                ContextMenuEntry::new("Дублировать")
+                    .icon(IconName::Copy)
+                    .icon_color(Color::Muted)
+                    .handler({
+                        let view = view.clone();
+                        move |_, cx| {
+                            view.update(cx, |this, cx| {
+                                if this.document.duplicate(id).is_some() {
+                                    this.save_body(cx);
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
+                        }
+                    }),
+            )
+            .item(
+                ContextMenuEntry::new("Переместить вверх")
+                    .icon(IconName::ArrowUp)
+                    .icon_color(Color::Muted)
+                    .handler({
+                        let view = view.clone();
+                        move |_, cx| {
+                            view.update(cx, |this, cx| {
+                                if this.document.move_block(id, -1) {
+                                    this.save_body(cx);
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
+                        }
+                    }),
+            )
+            .item(
+                ContextMenuEntry::new("Переместить вниз")
+                    .icon(IconName::ArrowDown)
+                    .icon_color(Color::Muted)
+                    .handler({
+                        let view = view.clone();
+                        move |_, cx| {
+                            view.update(cx, |this, cx| {
+                                if this.document.move_block(id, 1) {
+                                    this.save_body(cx);
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
+                        }
+                    }),
+            )
+            .separator()
+            .item(
+                ContextMenuEntry::new("Удалить блок")
+                    .icon(IconName::Trash)
+                    .icon_color(Color::Error)
+                    .handler({
+                        let view = view.clone();
+                        move |_, cx| {
+                            view.update(cx, |this, cx| {
+                                if this
+                                    .editing
+                                    .as_ref()
+                                    .is_some_and(|state| state.block_id == id)
+                                {
+                                    // The edited block is going away: drop
+                                    // the editor without the commit-time
+                                    // resync. The remove target is only a
+                                    // focus hint — don't start editing it.
+                                    this.editing = None;
+                                }
+                                if this
+                                    .slash_menu
+                                    .as_ref()
+                                    .is_some_and(|menu| menu.block_id == id)
+                                {
+                                    this.slash_menu = None;
+                                }
+                                if this.document.remove(id).is_some() {
+                                    this.save_body(cx);
+                                }
+                                cx.notify();
+                            })
+                            .ok();
+                        }
+                    }),
+            )
+        });
+
+        window.focus(&context_menu.focus_handle(cx), cx);
+        let subscription = cx.subscribe(&context_menu, |this, _, _: &DismissEvent, cx| {
+            this.grip_menu.take();
+            cx.notify();
+        });
+        self.grip_menu = Some((context_menu, position, subscription));
+        cx.notify();
     }
 
     /// Enter in the title editor moves editing into the first editable
@@ -562,10 +933,20 @@ impl InboxDetailView {
     }
 
     fn render_header(&self, cleared: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let (toggle_icon, toggle_label, toggle_color) = if cleared {
-            (IconName::Check, "Готово", Color::Created)
+        let (toggle_icon, toggle_label, toggle_color, toggle_tooltip) = if cleared {
+            (
+                IconName::Check,
+                "Готово",
+                Color::Created,
+                "Вернуть в инбокс",
+            )
         } else {
-            (IconName::Circle, "Разобрать", Color::Muted)
+            (
+                IconName::Circle,
+                "Разобрать",
+                Color::Muted,
+                "Отметить разобранным",
+            )
         };
 
         h_flex()
@@ -599,7 +980,7 @@ impl InboxDetailView {
                             .size(IconSize::Small)
                             .color(toggle_color),
                     )
-                    .tooltip(Tooltip::text("Отметить разобранным"))
+                    .tooltip(Tooltip::text(toggle_tooltip))
                     .on_click(cx.listener(|this, _, _, cx| {
                         let item_id = this.item_id.clone();
                         this.store
@@ -745,7 +1126,24 @@ impl InboxDetailView {
             .px_1()
             .py_0p5()
             .rounded_sm()
-            .hover(|style| style.bg(cx.theme().colors().element_hover));
+            .hover(|style| style.bg(cx.theme().colors().element_hover))
+            // Records the row's window bounds during paint; the slash menu
+            // popup is anchored to them a frame later.
+            .child(
+                canvas(
+                    {
+                        let block_bounds = self.block_bounds.clone();
+                        move |bounds, _, _| {
+                            block_bounds.borrow_mut().insert(block_id, bounds);
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .size_full()
+                .absolute()
+                .top_0()
+                .left_0(),
+            );
 
         // Leading adornment.
         row = match block.block_type {
@@ -841,11 +1239,14 @@ impl InboxDetailView {
                 .flex_1()
                 .min_w_0()
                 // Plain Enter is unbound in auto-height editors and falls
-                // through as `menu::Confirm`; Backspace and Escape are
-                // intercepted in the capture phase before the editor.
+                // through as `menu::Confirm`; Backspace, Escape and (for the
+                // slash menu) Up/Down are intercepted in the capture phase
+                // before the editor.
                 .on_action(cx.listener(Self::handle_block_confirm))
                 .capture_action(cx.listener(Self::handle_block_backspace))
                 .capture_action(cx.listener(Self::handle_block_cancel))
+                .capture_action(cx.listener(Self::handle_block_move_up))
+                .capture_action(cx.listener(Self::handle_block_move_down))
                 .child(content)
                 .into_any_element()
         } else if block.block_type == BlockType::Divider {
@@ -866,11 +1267,14 @@ impl InboxDetailView {
         row.child(content_zone)
             .child(
                 div().flex_none().child(
-                    // TODO(Task 9): the block actions (grip) menu.
                     IconButton::new(("inbox-detail-grip", block_id.0), IconName::Ellipsis)
                         .icon_size(IconSize::XSmall)
                         .icon_color(Color::Muted)
-                        .visible_on_hover("detail-block"),
+                        .visible_on_hover("detail-block")
+                        .tooltip(Tooltip::text("Действия с блоком"))
+                        .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                            this.deploy_grip_menu(block_id, event.position(), window, cx);
+                        })),
                 ),
             )
             .into_any_element()
@@ -928,6 +1332,122 @@ impl InboxDetailView {
                 ),
         )
     }
+
+    /// The slash menu popup, anchored to the bottom-left of the edited
+    /// block's row. `None` while the menu is closed (or the block's bounds
+    /// have not been recorded yet).
+    fn render_slash_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let state = self.slash_menu.as_ref()?;
+        let block_id = state.block_id;
+        let query = self
+            .document
+            .block(block_id)?
+            .text
+            .strip_prefix('/')
+            .unwrap_or("")
+            .to_string();
+        let entries = slash_menu::filtered(&query);
+        if entries.is_empty() {
+            return None;
+        }
+        let selected = state.selected.min(entries.len() - 1);
+        let bounds = *self.block_bounds.borrow().get(&block_id)?;
+        let position = bounds.origin + point(px(24.), bounds.size.height);
+
+        let selected_bg = cx.theme().colors().element_selected;
+        let badge_bg = cx.theme().colors().editor_background;
+        let mut list = v_flex()
+            .id("inbox-slash-menu")
+            .occlude()
+            .elevation_2(cx)
+            .min_w(px(230.))
+            .max_h(px(290.))
+            .overflow_y_scroll()
+            .py_1()
+            .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                this.slash_menu = None;
+                // If the click also moved focus away, the skipped-while-open
+                // Blurred already went by: finish the edit here.
+                if let Some(state) = &this.editing
+                    && !state.editor.focus_handle(cx).is_focused(window)
+                {
+                    this.commit_editing(cx);
+                }
+                cx.notify();
+            }))
+            .child(
+                div().px_2().py_0p5().child(
+                    Label::new("ТИП БЛОКА")
+                        .size(LabelSize::XSmall)
+                        .weight(FontWeight::BOLD)
+                        .color(Color::Placeholder),
+                ),
+            );
+        for (index, entry) in entries.into_iter().enumerate() {
+            list = list.child(
+                h_flex()
+                    .id(("inbox-slash-entry", index))
+                    .mx_1()
+                    .px_1p5()
+                    .py_1()
+                    .gap_2()
+                    .rounded_sm()
+                    .when(index == selected, |this| this.bg(selected_bg))
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        if *hovered
+                            && let Some(state) = &mut this.slash_menu
+                            && state.selected != index
+                        {
+                            state.selected = index;
+                            cx.notify();
+                        }
+                    }))
+                    // Mousedown, not click: it must win over the editor's
+                    // blur (see the `Blurred` guard).
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            window.prevent_default();
+                            this.apply_slash(entry, window, cx);
+                        }),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .size(px(26.))
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
+                            .bg(badge_bg)
+                            .font_buffer(cx)
+                            .text_xs()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(Color::Muted.color(cx))
+                            .child(entry.glyph),
+                    )
+                    .child(
+                        v_flex()
+                            .child(Label::new(entry.label).size(LabelSize::Small))
+                            .child(
+                                Label::new(entry.hint)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Placeholder),
+                            ),
+                    ),
+            );
+        }
+
+        Some(
+            deferred(
+                anchored()
+                    .position(position)
+                    .anchor(gpui::Anchor::TopLeft)
+                    .child(list),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
+    }
 }
 
 impl Focusable for InboxDetailView {
@@ -955,5 +1475,15 @@ impl Render for InboxDetailView {
                     .child(self.render_title(&item, cx))
                     .child(self.render_body(window, cx))
             })
+            .children(self.render_slash_menu(cx))
+            .children(self.grip_menu.as_ref().map(|(menu, position, _)| {
+                deferred(
+                    anchored()
+                        .position(*position)
+                        .anchor(gpui::Anchor::TopLeft)
+                        .child(menu.clone()),
+                )
+                .with_priority(1)
+            }))
     }
 }
