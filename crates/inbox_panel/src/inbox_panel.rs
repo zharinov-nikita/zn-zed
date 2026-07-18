@@ -285,8 +285,11 @@ impl InboxPanel {
             InboxStoreEvent::Reloaded => {
                 // The file changed externally: the types (and their keys) may
                 // be entirely different now, so drop the rename editors
-                // rather than trying to reconcile them.
+                // rather than trying to reconcile them. The item pending
+                // delete confirmation may be gone too, so drop the stale
+                // confirmation as well.
                 self.type_editor = None;
+                self.confirming_delete = None;
                 self.reconcile_capture_kind(cx);
                 cx.notify();
             }

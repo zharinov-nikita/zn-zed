@@ -346,7 +346,8 @@ impl InboxStore {
     }
 
     /// Applies `f` to the item with the given id, searching both the inbox and
-    /// the archive.
+    /// the archive. When `f` leaves the item unchanged, nothing is marked
+    /// dirty, no event is emitted and no save is scheduled.
     pub fn update_item(
         &mut self,
         id: &ItemId,
@@ -362,7 +363,11 @@ impl InboxStore {
         else {
             return;
         };
+        let before = item.clone();
         f(item);
+        if *item == before {
+            return;
+        }
         self.on_mutated(cx);
     }
 
@@ -908,6 +913,40 @@ mod tests {
             assert_eq!(store.types()[1].key, key);
             assert_eq!(store.types()[1].label, "новый тип");
         });
+    }
+
+    #[gpui::test]
+    async fn test_noop_update_item_does_not_dirty_or_save(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({})).await;
+        let (_project, store) = build_store(fs.clone(), cx).await;
+
+        let id = store.update(cx, |store, cx| {
+            store.capture("x".to_string(), Some("task".to_string()), None, cx)
+        });
+        flush_saves(cx);
+        let events = track_events(&store, cx);
+
+        // Re-applying the current values must not dirty the store, emit an
+        // event or schedule another save.
+        store.update(cx, |store, cx| {
+            store.set_kind(&id, Some("task".to_string()), cx);
+            store.set_text(&id, "x".to_string(), cx);
+            store.set_body(&id, None, cx);
+        });
+        store.read_with(cx, |store, _| {
+            assert!(!store.dirty, "a no-op update must not mark the store dirty");
+        });
+        assert!(
+            events.borrow().is_empty(),
+            "a no-op update must not emit events, got {:?}",
+            events.borrow()
+        );
+
+        // A real change still goes through.
+        store.update(cx, |store, cx| store.set_text(&id, "y".to_string(), cx));
+        assert_eq!(events.borrow().as_slice(), &[InboxStoreEvent::Changed]);
     }
 
     #[gpui::test]

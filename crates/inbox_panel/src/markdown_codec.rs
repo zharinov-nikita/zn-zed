@@ -3,6 +3,13 @@
 //! The mapping is intentionally simple (line-oriented, no inline markdown
 //! parsing) — it only needs to round-trip the block types the editor
 //! understands.
+//!
+//! Known v1 limitation: the codec does no escaping, because the item body is
+//! stored as plain markdown by design. A paragraph whose text itself starts
+//! with block syntax (`# `, `- `, `> `, ` ``` `, `---`, …) is therefore
+//! serialized verbatim and reinterpreted as that block type by
+//! [`parse_blocks`] the next time the item is opened. See
+//! [`serialize_blocks`] for details.
 
 use crate::block::{Block, BlockId, BlockType};
 
@@ -128,6 +135,16 @@ pub fn parse_blocks(src: &str, next_id: &mut u64) -> Vec<Block> {
 }
 
 /// Serializes `blocks` back into markdown text.
+///
+/// Known v1 limitation: block texts are emitted verbatim, with no escaping —
+/// the body is plain markdown by design, so there is no escape syntax to
+/// round-trip through. As a consequence the serialize → [`parse_blocks`]
+/// round trip is not lossless for texts that themselves begin with markdown
+/// block syntax: a `Paragraph` whose text starts with `# `, `- `, `> `,
+/// ` ``` `, `---`, etc. is reinterpreted as a heading/bullet/quote/code/
+/// divider block on the next open (and similarly a `Bullet` whose text
+/// starts with `[ ] ` comes back as a `Todo`). The text itself is preserved;
+/// only the block type silently changes.
 pub fn serialize_blocks(blocks: &[Block]) -> String {
     blocks
         .iter()
