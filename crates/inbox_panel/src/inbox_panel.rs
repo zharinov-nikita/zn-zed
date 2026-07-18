@@ -1,23 +1,24 @@
 pub mod inbox_model;
 mod inbox_panel_settings;
 pub mod inbox_store;
+mod type_editor;
 
 pub use inbox_store::{InboxStore, InboxStoreEvent};
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{collections::HashSet, path::Path, sync::Arc, time::Duration};
 
 use editor::Editor;
 use fs::Fs;
 use gpui::{
-    Action, AnyElement, App, AppContext as _, AsyncWindowContext, ClickEvent, Context, Entity,
-    EventEmitter, FocusHandle, Focusable, FontWeight, IntoElement, ParentElement, Pixels, Point,
-    Render, ScrollHandle, Styled, Subscription, Task, WeakEntity, Window, actions, anchored,
+    Action, AnyElement, App, AppContext as _, AsyncWindowContext, ClickEvent, Context, ElementId,
+    Entity, EventEmitter, FocusHandle, Focusable, FontWeight, IntoElement, ParentElement, Pixels,
+    Point, Render, ScrollHandle, Styled, Subscription, Task, WeakEntity, Window, actions, anchored,
     deferred,
 };
 use theme_settings::ThemeSettings;
 use ui::{
-    Checkbox, Disclosure, Tab, TintColor, ToggleButtonGroup, ToggleButtonSimple, ToggleState,
-    Tooltip, prelude::*,
+    ButtonLike, Checkbox, ContextMenu, ContextMenuEntry, ContextMenuItem, Disclosure, PopoverMenu,
+    Tab, TintColor, ToggleButtonGroup, ToggleButtonSimple, ToggleState, Tooltip, prelude::*,
 };
 use workspace::{
     Workspace,
@@ -25,9 +26,10 @@ use workspace::{
 };
 
 use crate::inbox_model::{
-    InboxItem, ItemId, classify, format_age, now_unix, subtask_counts, type_color,
+    InboxItem, ItemId, classify, format_age, now_unix, parse_context, subtask_counts, type_color,
 };
 use crate::inbox_panel_settings::{DockSide, InboxPanelSettings, Settings};
+use crate::type_editor::TypeEditorState;
 
 actions!(
     inbox_panel,
@@ -111,6 +113,8 @@ pub struct InboxPanel {
     /// Type keys of the groups collapsed in the grouped view.
     collapsed_groups: HashSet<String>,
     show_archive: bool,
+    /// State of the type editor overlay; `Some` while it is open.
+    type_editor: Option<TypeEditorState>,
     confirming_delete: Option<(ItemId, Point<Pixels>)>,
     scroll_handle: ScrollHandle,
     _age_refresh: Task<()>,
@@ -189,6 +193,7 @@ impl InboxPanel {
                 view_mode: ViewMode::Grouped,
                 collapsed_groups: HashSet::default(),
                 show_archive: false,
+                type_editor: None,
                 confirming_delete: None,
                 scroll_handle: ScrollHandle::new(),
                 _age_refresh: age_refresh,
@@ -215,7 +220,14 @@ impl InboxPanel {
                 // TODO(Task 7): close the detail view when its item is deleted.
                 cx.notify();
             }
-            InboxStoreEvent::Changed | InboxStoreEvent::Reloaded => cx.notify(),
+            InboxStoreEvent::Changed => cx.notify(),
+            InboxStoreEvent::Reloaded => {
+                // The file changed externally: the types (and their keys) may
+                // be entirely different now, so drop the rename editors
+                // rather than trying to reconcile them.
+                self.type_editor = None;
+                cx.notify();
+            }
         }
     }
 
@@ -265,6 +277,47 @@ impl InboxPanel {
         })
     }
 
+    /// Opens the `"path:row"` capture context of an item in the workspace,
+    /// putting the cursor on the captured line.
+    fn open_context(&mut self, from: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((path, row)) = parse_context(from) else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let Some(project_path) = workspace
+            .read(cx)
+            .project()
+            .read(cx)
+            .find_project_path(Path::new(&path), cx)
+        else {
+            log::warn!("inbox panel: capture context not found in project: {path}");
+            return;
+        };
+        let open_task = workspace.update(cx, |workspace, cx| {
+            workspace.open_path(project_path, None, true, window, cx)
+        });
+        cx.spawn_in(window, async move |_, cx| {
+            let item = open_task.await?;
+            if let Some(editor) = item.downcast::<Editor>()
+                && let Some(row) = row
+            {
+                editor
+                    .update_in(cx, |editor, window, cx| {
+                        editor.go_to_singleton_buffer_point(
+                            text::Point::new(row.saturating_sub(1), 0),
+                            window,
+                            cx,
+                        );
+                    })
+                    .ok();
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .flex_none()
@@ -312,8 +365,16 @@ impl InboxPanel {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.store.update(cx, |store, cx| store.archive_cleared(cx));
                             })),
+                    )
+                    .child(
+                        IconButton::new("inbox-type-settings", IconName::Settings)
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text("Настроить списки"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_type_editor(window, cx);
+                            })),
                     ),
-                // TODO(Task 5): add the type settings button here.
             )
     }
 
@@ -347,21 +408,197 @@ impl InboxPanel {
         )
     }
 
-    /// A colored square + label chip describing an inbox type.
-    fn render_type_chip(
-        &self,
+    /// A clickable colored square + label chip describing an inbox type,
+    /// suitable as a [`PopoverMenu`] trigger.
+    fn type_chip_button(
+        id: impl Into<ElementId>,
         label: SharedString,
         color: gpui::Hsla,
-        _cx: &mut Context<Self>,
+    ) -> ButtonLike {
+        ButtonLike::new(id).size(ButtonSize::None).child(
+            h_flex()
+                .px_0p5()
+                .gap_1()
+                .child(div().flex_none().size(px(7.)).rounded_xs().bg(color))
+                .child(
+                    Label::new(label)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
+        )
+    }
+
+    /// A context menu item with a colored type square, a label, and a check
+    /// mark on the currently selected entry.
+    fn type_menu_item(
+        label: SharedString,
+        color: gpui::Hsla,
+        selected: bool,
+        handler: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> ContextMenuItem {
+        ContextMenuItem::custom_entry(
+            move |_, _| {
+                h_flex()
+                    .w_full()
+                    .gap_1p5()
+                    .child(div().flex_none().size(px(7.)).rounded_xs().bg(color))
+                    .child(div().flex_1().child(Label::new(label.clone())))
+                    .when(selected, |this| {
+                        this.child(
+                            Icon::new(IconName::Check)
+                                .size(IconSize::Small)
+                                .color(Color::Accent),
+                        )
+                    })
+                    .into_any_element()
+            },
+            handler,
+            None,
+        )
+    }
+
+    /// The capture box chip: picks the type preselected for the next capture.
+    fn render_capture_type_menu(
+        &self,
+        chip_label: SharedString,
+        chip_color: gpui::Hsla,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        h_flex()
-            .gap_1()
-            .child(div().flex_none().size(px(7.)).rounded_xs().bg(color))
-            .child(
-                Label::new(label)
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            )
+        let store = self.store.clone();
+        let panel = cx.entity().downgrade();
+        PopoverMenu::new("inbox-capture-type-menu")
+            .trigger(Self::type_chip_button(
+                "inbox-capture-type-chip",
+                chip_label,
+                chip_color,
+            ))
+            .menu(move |window, cx| {
+                let store = store.clone();
+                let panel = panel.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, cx| {
+                    let capture_kind = panel
+                        .upgrade()
+                        .and_then(|panel| panel.read(cx).capture_kind.clone());
+                    let types: Vec<(String, SharedString, gpui::Hsla)> = store
+                        .read(cx)
+                        .types()
+                        .iter()
+                        .map(|inbox_type| {
+                            (
+                                inbox_type.key.clone(),
+                                SharedString::from(inbox_type.label.clone()),
+                                type_color(&inbox_type.color, cx),
+                            )
+                        })
+                        .collect();
+                    menu = menu.header("Добавить в список").item(Self::type_menu_item(
+                        SharedString::from("Авто — по смыслу"),
+                        Color::Muted.color(cx),
+                        capture_kind.is_none(),
+                        {
+                            let panel = panel.clone();
+                            move |_, cx| {
+                                panel
+                                    .update(cx, |this, cx| {
+                                        this.capture_kind = None;
+                                        cx.notify();
+                                    })
+                                    .ok();
+                            }
+                        },
+                    ));
+                    for (key, label, color) in types {
+                        let selected = capture_kind.as_deref() == Some(key.as_str());
+                        let panel = panel.clone();
+                        menu = menu.item(Self::type_menu_item(
+                            label,
+                            color,
+                            selected,
+                            move |_, cx| {
+                                let key = key.clone();
+                                panel
+                                    .update(cx, |this, cx| {
+                                        this.capture_kind = Some(key);
+                                        cx.notify();
+                                    })
+                                    .ok();
+                            },
+                        ));
+                    }
+                    menu
+                }))
+            })
+    }
+
+    /// The item row chip: moves the item into another list or opens the type
+    /// editor.
+    fn render_item_type_menu(
+        &self,
+        item_id: ItemId,
+        chip_label: SharedString,
+        chip_color: gpui::Hsla,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let store = self.store.clone();
+        let panel = cx.entity().downgrade();
+        PopoverMenu::new(SharedString::from(format!(
+            "inbox-item-type-menu-{item_id}"
+        )))
+        .trigger(Self::type_chip_button(
+            SharedString::from(format!("inbox-item-type-chip-{item_id}")),
+            chip_label,
+            chip_color,
+        ))
+        .menu(move |window, cx| {
+            let store = store.clone();
+            let panel = panel.clone();
+            let item_id = item_id.clone();
+            Some(ContextMenu::build(window, cx, move |mut menu, _, cx| {
+                let (current_key, types) = {
+                    let store_ref = store.read(cx);
+                    let current_key = store_ref
+                        .item(&item_id)
+                        .map(|item| store_ref.resolve_kind(item).key.clone());
+                    let types: Vec<(String, SharedString, gpui::Hsla)> = store_ref
+                        .types()
+                        .iter()
+                        .map(|inbox_type| {
+                            (
+                                inbox_type.key.clone(),
+                                SharedString::from(inbox_type.label.clone()),
+                                type_color(&inbox_type.color, cx),
+                            )
+                        })
+                        .collect();
+                    (current_key, types)
+                };
+                for (key, label, color) in types {
+                    let selected = current_key.as_deref() == Some(key.as_str());
+                    let store = store.clone();
+                    let item_id = item_id.clone();
+                    menu = menu.item(Self::type_menu_item(
+                        label,
+                        color,
+                        selected,
+                        move |_, cx| {
+                            store.update(cx, |store, cx| {
+                                store.set_kind(&item_id, Some(key.clone()), cx);
+                            });
+                        },
+                    ));
+                }
+                menu.separator().item(
+                    ContextMenuEntry::new("Настроить типы…")
+                        .icon(IconName::Settings)
+                        .icon_color(Color::Muted)
+                        .handler(move |window, cx| {
+                            panel
+                                .update(cx, |this, cx| this.open_type_editor(window, cx))
+                                .ok();
+                        }),
+                )
+            }))
+        })
     }
 
     fn render_capture_box(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -404,9 +641,7 @@ impl InboxPanel {
                         .px_2()
                         .py_1()
                         .justify_between()
-                        // TODO(Task 5): replace the static chip with a
-                        // PopoverMenu type picker.
-                        .child(self.render_type_chip(chip_label, chip_color, cx))
+                        .child(self.render_capture_type_menu(chip_label, chip_color, cx))
                         .child(
                             Label::new("↵ добавить")
                                 .size(LabelSize::XSmall)
@@ -504,10 +739,11 @@ impl InboxPanel {
             Label::new(item.text.clone())
         };
 
-        let mut meta = h_flex().flex_wrap().items_center().gap_2().child(
-            // TODO(Task 5): open a type picker menu from this chip.
-            self.render_type_chip(type_label, type_chip_color, cx),
-        );
+        let mut meta = h_flex()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .child(self.render_item_type_menu(item.id.clone(), type_label, type_chip_color, cx));
         if let Some(created) = item.created {
             meta = meta.child(
                 div()
@@ -535,14 +771,20 @@ impl InboxPanel {
         }
         if let Some(from) = item.from.clone() {
             meta = meta.child(
-                // TODO(Task 5): open the file at the captured location on click.
                 h_flex()
+                    .id(SharedString::from(format!("inbox-item-from-{}", item.id)))
                     .gap_1()
                     .cursor_pointer()
                     .text_xs()
                     .font_buffer(cx)
                     .text_color(cx.theme().colors().text_placeholder)
                     .hover(|style| style.text_color(cx.theme().colors().text_accent))
+                    .on_click(cx.listener({
+                        let from = from.clone();
+                        move |this, _, window, cx| {
+                            this.open_context(&from, window, cx);
+                        }
+                    }))
                     .child(
                         Icon::new(IconName::File)
                             .size(IconSize::XSmall)
@@ -983,6 +1225,7 @@ impl Render for InboxPanel {
                     this.child(self.render_no_worktree(cx))
                 }
             })
+            .children(self.render_type_editor(cx))
             .children(self.render_delete_confirmation(cx))
     }
 }

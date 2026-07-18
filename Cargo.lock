@@ -9029,6 +9029,7 @@ dependencies = [
  "editor",
  "fs",
  "gpui",
+ "log",
  "pretty_assertions",
  "project",
  "serde",
