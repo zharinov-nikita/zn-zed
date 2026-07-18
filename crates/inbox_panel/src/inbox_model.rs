@@ -20,6 +20,12 @@ pub fn new_item_id() -> ItemId {
 }
 
 /// Returns the current unix timestamp in seconds (UTC).
+pub fn now_unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as u64)
+}
+
 pub fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -160,6 +166,16 @@ pub struct InboxFile {
     /// default; unknown keys are preserved so forward-compat is safe.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hidden_fields: Vec<String>,
+}
+
+impl InboxFile {
+    /// Whether this state holds user data worth backing up: any open item,
+    /// archived item, or custom list. Bare settings (sort, hidden fields) do
+    /// not count, so a backup is never overwritten with an effectively empty
+    /// snapshot.
+    pub fn has_content(&self) -> bool {
+        !self.inbox.is_empty() || !self.archived.is_empty() || !self.types.is_empty()
+    }
 }
 
 /// A single captured inbox entry.

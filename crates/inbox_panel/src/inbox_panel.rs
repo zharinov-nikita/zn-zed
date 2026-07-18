@@ -588,8 +588,13 @@ impl InboxPanel {
             })
     }
 
-    fn render_error_banner(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    fn render_error_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let store = self.store.read(cx);
+        // The recovery offer takes priority: it means the file is gone or
+        // corrupt but a backup can bring the data back.
+        if store.can_restore() {
+            return Some(self.render_restore_banner(cx));
+        }
         let message = if store.load_error().is_some() {
             "inbox.json is corrupted — fix the file"
         } else if store.save_error().is_some() {
@@ -597,25 +602,53 @@ impl InboxPanel {
         } else {
             return None;
         };
-        Some(
-            h_flex()
-                .flex_none()
-                .px_2()
-                .py_1()
-                .gap_1p5()
-                .border_b_1()
-                .border_color(cx.theme().colors().border_variant)
-                .child(
-                    Icon::new(IconName::Warning)
-                        .size(IconSize::XSmall)
-                        .color(Color::Warning),
-                )
-                .child(
-                    Label::new(message)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Warning),
-                ),
-        )
+        Some(Self::warning_banner(cx, message).into_any_element())
+    }
+
+    /// The shared warning-banner scaffold: a bottom-bordered row with a warning
+    /// icon and message. Callers append their own trailing controls.
+    fn warning_banner(cx: &App, message: impl Into<SharedString>) -> Div {
+        h_flex()
+            .flex_none()
+            .px_2()
+            .py_1()
+            .gap_1p5()
+            .border_b_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(
+                Icon::new(IconName::Warning)
+                    .size(IconSize::XSmall)
+                    .color(Color::Warning),
+            )
+            .child(
+                Label::new(message.into())
+                    .size(LabelSize::XSmall)
+                    .color(Color::Warning),
+            )
+    }
+
+    /// Banner shown when `.zed/inbox.json` is missing or corrupt but a backup
+    /// holds recoverable data. Offers to restore it or accept the empty state.
+    fn render_restore_banner(&self, cx: &mut Context<Self>) -> AnyElement {
+        Self::warning_banner(cx, "inbox.json is missing — restore from backup?")
+            .child(div().flex_1())
+            .child(
+                Button::new("inbox-restore", "Restore")
+                    .label_size(LabelSize::XSmall)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.store
+                            .update(cx, |store, cx| store.restore_from_backup(cx));
+                    })),
+            )
+            .child(
+                Button::new("inbox-restore-dismiss", "Keep empty")
+                    .label_size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.store.update(cx, |store, cx| store.dismiss_restore(cx));
+                    })),
+            )
+            .into_any_element()
     }
 
     /// A clickable colored square + label chip describing an inbox type,
