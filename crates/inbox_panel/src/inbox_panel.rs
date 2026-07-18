@@ -1,10 +1,12 @@
 pub mod block;
+pub mod detail_view;
 pub mod inbox_model;
 mod inbox_panel_settings;
 pub mod inbox_store;
 pub mod markdown_codec;
 mod type_editor;
 
+pub use detail_view::{InboxDetailEvent, InboxDetailView};
 pub use inbox_store::{InboxStore, InboxStoreEvent};
 
 use std::{collections::HashSet, path::Path, sync::Arc, time::Duration};
@@ -115,12 +117,63 @@ pub struct InboxPanel {
     /// Type keys of the groups collapsed in the grouped view.
     collapsed_groups: HashSet<String>,
     show_archive: bool,
-    /// State of the type editor overlay; `Some` while it is open.
+    /// State of the type editor overlay; `Some` while it is open. Mutually
+    /// exclusive with `detail`: opening one closes the other.
     type_editor: Option<TypeEditorState>,
+    /// The detail view overlay of a single item; `Some` while it is open.
+    detail: Option<(Entity<InboxDetailView>, Subscription)>,
     confirming_delete: Option<(ItemId, Point<Pixels>)>,
     scroll_handle: ScrollHandle,
     _age_refresh: Task<()>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// Opens the `"path:row"` capture context of an item in the workspace,
+/// putting the cursor on the captured line. Shared by the panel's item rows
+/// and the detail view's meta line.
+pub(crate) fn open_capture_context(
+    workspace: &WeakEntity<Workspace>,
+    from: &str,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some((path, row)) = parse_context(from) else {
+        return;
+    };
+    let Some(workspace) = workspace.upgrade() else {
+        return;
+    };
+    let Some(project_path) = workspace
+        .read(cx)
+        .project()
+        .read(cx)
+        .find_project_path(Path::new(&path), cx)
+    else {
+        log::warn!("inbox panel: capture context not found in project: {path}");
+        return;
+    };
+    let open_task = workspace.update(cx, |workspace, cx| {
+        workspace.open_path(project_path, None, true, window, cx)
+    });
+    window
+        .spawn(cx, async move |cx| {
+            let item = open_task.await?;
+            if let Some(editor) = item.downcast::<Editor>()
+                && let Some(row) = row
+            {
+                editor
+                    .update_in(cx, |editor, window, cx| {
+                        editor.go_to_singleton_buffer_point(
+                            text::Point::new(row.saturating_sub(1), 0),
+                            window,
+                            cx,
+                        );
+                    })
+                    .ok();
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
 }
 
 pub fn init(cx: &mut App) {
@@ -196,6 +249,7 @@ impl InboxPanel {
                 collapsed_groups: HashSet::default(),
                 show_archive: false,
                 type_editor: None,
+                detail: None,
                 confirming_delete: None,
                 scroll_handle: ScrollHandle::new(),
                 _age_refresh: age_refresh,
@@ -219,7 +273,8 @@ impl InboxPanel {
                 {
                     self.confirming_delete = None;
                 }
-                // TODO(Task 7): close the detail view when its item is deleted.
+                // The detail view subscribes to the store itself and emits
+                // `Closed` when its item is deleted; nothing to do here.
                 cx.notify();
             }
             InboxStoreEvent::Changed => cx.notify(),
@@ -234,9 +289,34 @@ impl InboxPanel {
     }
 
     fn focus_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.store.read(cx).has_worktree() {
+        if let Some((detail, _)) = &self.detail {
+            detail.focus_handle(cx).focus(window, cx);
+        } else if self.store.read(cx).has_worktree() {
             self.capture_editor.focus_handle(cx).focus(window, cx);
         }
+    }
+
+    /// Opens the detail view of an item as a full-panel overlay, closing the
+    /// type editor if it was open.
+    fn open_detail(&mut self, id: ItemId, window: &mut Window, cx: &mut Context<Self>) {
+        self.type_editor = None;
+        let detail = cx.new(|cx| {
+            InboxDetailView::new(self.store.clone(), id, self.workspace.clone(), window, cx)
+        });
+        let subscription = cx.subscribe_in(
+            &detail,
+            window,
+            |this, _, event: &InboxDetailEvent, window, cx| match event {
+                InboxDetailEvent::Closed => {
+                    this.detail = None;
+                    this.focus_handle.focus(window, cx);
+                    cx.notify();
+                }
+            },
+        );
+        detail.focus_handle(cx).focus(window, cx);
+        self.detail = Some((detail, subscription));
+        cx.notify();
     }
 
     fn capture(&mut self, _: &Capture, window: &mut Window, cx: &mut Context<Self>) {
@@ -277,47 +357,6 @@ impl InboxPanel {
                 .row;
             Some(format!("{path}:{}", row + 1))
         })
-    }
-
-    /// Opens the `"path:row"` capture context of an item in the workspace,
-    /// putting the cursor on the captured line.
-    fn open_context(&mut self, from: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((path, row)) = parse_context(from) else {
-            return;
-        };
-        let Some(workspace) = self.workspace.upgrade() else {
-            return;
-        };
-        let Some(project_path) = workspace
-            .read(cx)
-            .project()
-            .read(cx)
-            .find_project_path(Path::new(&path), cx)
-        else {
-            log::warn!("inbox panel: capture context not found in project: {path}");
-            return;
-        };
-        let open_task = workspace.update(cx, |workspace, cx| {
-            workspace.open_path(project_path, None, true, window, cx)
-        });
-        cx.spawn_in(window, async move |_, cx| {
-            let item = open_task.await?;
-            if let Some(editor) = item.downcast::<Editor>()
-                && let Some(row) = row
-            {
-                editor
-                    .update_in(cx, |editor, window, cx| {
-                        editor.go_to_singleton_buffer_point(
-                            text::Point::new(row.saturating_sub(1), 0),
-                            window,
-                            cx,
-                        );
-                    })
-                    .ok();
-            }
-            anyhow::Ok(())
-        })
-        .detach_and_log_err(cx);
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -784,7 +823,7 @@ impl InboxPanel {
                     .on_click(cx.listener({
                         let from = from.clone();
                         move |this, _, window, cx| {
-                            this.open_context(&from, window, cx);
+                            open_capture_context(&this.workspace, &from, window, cx);
                         }
                     }))
                     .child(
@@ -837,8 +876,18 @@ impl InboxPanel {
                     .flex_1()
                     .min_w_0()
                     .gap_0p5()
-                    // TODO(Task 7): open the detail view when the text is clicked.
-                    .child(text_label)
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("inbox-item-text-{}", item.id)))
+                            .cursor_pointer()
+                            .on_click(cx.listener({
+                                let id = item.id.clone();
+                                move |this, _, window, cx| {
+                                    this.open_detail(id.clone(), window, cx);
+                                }
+                            }))
+                            .child(text_label),
+                    )
                     .child(meta),
             )
             .child(div().flex_none().child(delete_button))
@@ -1091,6 +1140,20 @@ impl InboxPanel {
             })
     }
 
+    /// The full-panel detail view overlay, or `None` while it is closed.
+    fn render_detail_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (detail, _) = self.detail.as_ref()?;
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .occlude()
+                .bg(cx.theme().colors().panel_background)
+                .child(detail.clone())
+                .into_any_element(),
+        )
+    }
+
     fn render_delete_confirmation(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let (id, position) = self.confirming_delete.clone()?;
         Some(
@@ -1228,6 +1291,7 @@ impl Render for InboxPanel {
                 }
             })
             .children(self.render_type_editor(cx))
+            .children(self.render_detail_overlay(cx))
             .children(self.render_delete_confirmation(cx))
     }
 }

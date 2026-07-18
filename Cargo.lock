@@ -9030,6 +9030,8 @@ dependencies = [
  "fs",
  "gpui",
  "log",
+ "markdown",
+ "menu",
  "pretty_assertions",
  "project",
  "serde",
