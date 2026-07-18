@@ -1487,3 +1487,319 @@ impl Render for InboxDetailView {
             }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::path::Path;
+    use std::rc::Rc;
+
+    use fs::FakeFs;
+    use gpui::{AppContext as _, KeyBinding, TestAppContext, VisualTestContext};
+    use pretty_assertions::assert_eq;
+    use project::Project;
+    use serde_json::json;
+    use settings::SettingsStore;
+    use util::path;
+
+    use super::*;
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            editor::init(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+    }
+
+    /// The subset of the default keymaps (`assets/keymaps/default-*.json`)
+    /// the block editor's keyboard handling relies on, bound with the same
+    /// contexts: Enter and Escape resolve to the *global*
+    /// `menu::Confirm`/`menu::Cancel` (plain Enter is deliberately unbound
+    /// in `Editor && mode == auto_height`, so it falls through to the
+    /// global binding), while Backspace/Escape/Up/Down are the
+    /// `Editor`-context bindings the view intercepts in the capture phase.
+    fn bind_default_keys(cx: &mut App) {
+        cx.bind_keys([
+            KeyBinding::new("enter", menu::Confirm, None),
+            KeyBinding::new("escape", menu::Cancel, None),
+            KeyBinding::new("backspace", editor::actions::Backspace, Some("Editor")),
+            KeyBinding::new("escape", editor::actions::Cancel, Some("Editor")),
+            KeyBinding::new("up", zed_actions::editor::MoveUp, Some("Editor")),
+            KeyBinding::new("down", zed_actions::editor::MoveDown, Some("Editor")),
+        ]);
+    }
+
+    /// Builds an `InboxStore` on a `FakeFs` project with a single item
+    /// whose body is `body`, opens an `InboxDetailView` on it as the root
+    /// of a test window and returns the pieces plus the window's
+    /// `VisualTestContext` for keystroke simulation.
+    async fn build_detail_view<'a>(
+        body: Option<&str>,
+        cx: &'a mut TestAppContext,
+    ) -> (
+        Entity<InboxStore>,
+        ItemId,
+        Entity<InboxDetailView>,
+        &'a mut VisualTestContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({})).await;
+        let project = Project::test(fs.clone(), [path!("/root").as_ref() as &Path], cx).await;
+        let store = cx.new(|cx| InboxStore::new(project, fs, cx));
+        cx.run_until_parked();
+        let item_id = store.update(cx, |store, cx| {
+            let id = store.capture("Запись".to_string(), None, None, cx);
+            store.set_body(&id, body.map(str::to_string), cx);
+            id
+        });
+        cx.update(bind_default_keys);
+        let window = cx.add_window(|window, cx| {
+            InboxDetailView::new(
+                store.clone(),
+                item_id.clone(),
+                WeakEntity::new_invalid(),
+                window,
+                cx,
+            )
+        });
+        let view = window.root(cx).unwrap();
+        let cx = VisualTestContext::from_window(*window, cx).into_mut();
+        cx.run_until_parked();
+        (store, item_id, view, cx)
+    }
+
+    /// Starts editing the `block_index`-th block through the view's own
+    /// entry point (the same path a click on the block takes) and lets the
+    /// window redraw so the live editor is in the dispatch tree.
+    fn begin_editing(
+        view: &Entity<InboxDetailView>,
+        cx: &mut VisualTestContext,
+        block_index: usize,
+        caret: CaretPos,
+    ) {
+        view.update_in(cx, |view, window, cx| {
+            let id = view.document.blocks()[block_index].id;
+            view.start_editing(id, caret, window, cx);
+        });
+        cx.run_until_parked();
+    }
+
+    fn blocks(
+        view: &Entity<InboxDetailView>,
+        cx: &mut VisualTestContext,
+    ) -> Vec<(BlockType, String)> {
+        view.read_with(cx, |view, _| {
+            view.document
+                .blocks()
+                .iter()
+                .map(|block| (block.block_type, block.text.clone()))
+                .collect()
+        })
+    }
+
+    fn body_in_store(
+        store: &Entity<InboxStore>,
+        item_id: &ItemId,
+        cx: &mut VisualTestContext,
+    ) -> Option<String> {
+        store.read_with(cx, |store, _| store.item(item_id).unwrap().body.clone())
+    }
+
+    /// The currently edited block and the caret's byte offset in its live
+    /// editor.
+    fn editing_caret(
+        view: &Entity<InboxDetailView>,
+        cx: &mut VisualTestContext,
+    ) -> (BlockId, usize) {
+        let (block_id, editor) = view.read_with(cx, |view, _| {
+            let state = view.editing.as_ref().expect("a block should be edited");
+            (state.block_id, state.editor.clone())
+        });
+        let offset = editor.update(cx, |editor, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            editor
+                .selections
+                .newest::<MultiBufferOffset>(&snapshot)
+                .head()
+                .0
+        });
+        (block_id, offset)
+    }
+
+    #[gpui::test]
+    async fn test_enter_splits_paragraph_at_caret(cx: &mut TestAppContext) {
+        let (store, item_id, view, cx) = build_detail_view(Some("abcdef"), cx).await;
+        begin_editing(&view, cx, 0, CaretPos::Offset(3));
+
+        cx.simulate_keystrokes("enter");
+
+        assert_eq!(
+            blocks(&view, cx),
+            vec![
+                (BlockType::Paragraph, "abc".to_string()),
+                (BlockType::Paragraph, "def".to_string()),
+            ]
+        );
+        // Editing moved into the new block, caret at its start.
+        let second_id = view.read_with(cx, |view, _| view.document.blocks()[1].id);
+        assert_eq!(editing_caret(&view, cx), (second_id, 0));
+        assert_eq!(
+            body_in_store(&store, &item_id, cx),
+            Some("abc\ndef".to_string())
+        );
+    }
+
+    #[gpui::test]
+    async fn test_enter_continues_todo_and_exits_on_empty(cx: &mut TestAppContext) {
+        let (store, item_id, view, cx) = build_detail_view(Some("- [ ] task"), cx).await;
+        begin_editing(&view, cx, 0, CaretPos::End);
+
+        // Enter at the end of a todo continues the list with a new todo.
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            blocks(&view, cx),
+            vec![
+                (BlockType::Todo, "task".to_string()),
+                (BlockType::Todo, String::new()),
+            ]
+        );
+        let second_id = view.read_with(cx, |view, _| view.document.blocks()[1].id);
+        assert_eq!(editing_caret(&view, cx), (second_id, 0));
+
+        // Enter on the empty continuation exits the list: the same block
+        // converts to a paragraph in place.
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            blocks(&view, cx),
+            vec![
+                (BlockType::Todo, "task".to_string()),
+                (BlockType::Paragraph, String::new()),
+            ]
+        );
+        assert_eq!(editing_caret(&view, cx), (second_id, 0));
+        assert_eq!(
+            body_in_store(&store, &item_id, cx),
+            Some("- [ ] task\n".to_string())
+        );
+    }
+
+    #[gpui::test]
+    async fn test_backspace_at_start_merges_into_previous(cx: &mut TestAppContext) {
+        let (store, item_id, view, cx) = build_detail_view(Some("hello\nworld"), cx).await;
+        begin_editing(&view, cx, 1, CaretPos::Start);
+
+        cx.simulate_keystrokes("backspace");
+
+        assert_eq!(
+            blocks(&view, cx),
+            vec![(BlockType::Paragraph, "helloworld".to_string())]
+        );
+        // Editing moved into the merged block, caret at the former boundary.
+        let first_id = view.read_with(cx, |view, _| view.document.blocks()[0].id);
+        assert_eq!(editing_caret(&view, cx), (first_id, "hello".len()));
+        assert_eq!(
+            body_in_store(&store, &item_id, cx),
+            Some("helloworld".to_string())
+        );
+    }
+
+    #[gpui::test]
+    async fn test_escape_commits_edit_then_closes_view(cx: &mut TestAppContext) {
+        let (_store, _item_id, view, cx) = build_detail_view(Some("abcdef"), cx).await;
+        let closed = Rc::new(Cell::new(0));
+        cx.update(|_, cx| {
+            cx.subscribe(&view, {
+                let closed = closed.clone();
+                move |_, event, _| match event {
+                    InboxDetailEvent::Closed => closed.set(closed.get() + 1),
+                }
+            })
+            .detach();
+        });
+        begin_editing(&view, cx, 0, CaretPos::End);
+        view.read_with(cx, |view, _| assert!(view.editing.is_some()));
+
+        // The first Escape commits the edit and focuses the view.
+        cx.simulate_keystrokes("escape");
+        view.read_with(cx, |view, _| assert!(view.editing.is_none()));
+        let focus_handle = view.read_with(cx, |view, _| view.focus_handle.clone());
+        assert!(cx.update(|window, _| focus_handle.is_focused(window)));
+        assert_eq!(closed.get(), 0);
+
+        // The second Escape closes the detail view.
+        cx.simulate_keystrokes("escape");
+        assert_eq!(closed.get(), 1);
+    }
+
+    #[gpui::test]
+    async fn test_slash_menu_filters_and_applies_heading(cx: &mut TestAppContext) {
+        let (store, item_id, view, cx) = build_detail_view(None, cx).await;
+        begin_editing(&view, cx, 0, CaretPos::Start);
+
+        // Typing "/" into the empty paragraph opens the slash menu.
+        cx.simulate_keystrokes("/");
+        view.read_with(cx, |view, _| {
+            let state = view.slash_menu.as_ref().expect("slash menu should open");
+            assert_eq!(state.selected, 0);
+        });
+
+        // "заг" narrows the list down to the two headings.
+        cx.simulate_input("заг");
+        view.read_with(cx, |view, _| {
+            let state = view.slash_menu.as_ref().expect("menu should stay open");
+            let block = view.document.block(state.block_id).unwrap();
+            assert_eq!(block.text, "/заг");
+            let entries = slash_menu::filtered("заг");
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].block_type, BlockType::H1);
+            assert_eq!(entries[1].block_type, BlockType::H2);
+        });
+
+        // Down moves the selection to the second filtered entry (H2).
+        cx.simulate_keystrokes("down");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.slash_menu.as_ref().unwrap().selected, 1);
+        });
+
+        // Enter applies it: the block becomes an empty H2, the menu closes
+        // and the "/заг" query never reaches the body.
+        cx.simulate_keystrokes("enter");
+        assert_eq!(blocks(&view, cx), vec![(BlockType::H2, String::new())]);
+        view.read_with(cx, |view, _| {
+            assert!(view.slash_menu.is_none());
+            assert!(view.editing.is_some(), "editing continues in the block");
+        });
+        let body = body_in_store(&store, &item_id, cx).expect("body should exist");
+        assert!(!body.contains('/'), "query leaked into the body: {body:?}");
+        assert_eq!(body, "## ");
+    }
+
+    #[gpui::test]
+    async fn test_enter_splits_cyrillic_text_on_char_boundary(cx: &mut TestAppContext) {
+        let (store, item_id, view, cx) = build_detail_view(Some("привет мир"), cx).await;
+        // Byte offset 6 is after "при" (Cyrillic characters are two bytes
+        // each in UTF-8). The editor only ever produces char-boundary
+        // offsets; mid-character offsets are covered by the block model's
+        // own clamping tests.
+        begin_editing(&view, cx, 0, CaretPos::Offset(6));
+
+        cx.simulate_keystrokes("enter");
+
+        assert_eq!(
+            blocks(&view, cx),
+            vec![
+                (BlockType::Paragraph, "при".to_string()),
+                (BlockType::Paragraph, "вет мир".to_string()),
+            ]
+        );
+        let second_id = view.read_with(cx, |view, _| view.document.blocks()[1].id);
+        assert_eq!(editing_caret(&view, cx), (second_id, 0));
+        assert_eq!(
+            body_in_store(&store, &item_id, cx),
+            Some("при\nвет мир".to_string())
+        );
+    }
+}

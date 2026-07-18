@@ -9038,6 +9038,7 @@ dependencies = [
  "serde_json",
  "settings",
  "text",
+ "theme",
  "theme_settings",
  "ui",
  "util",
