@@ -1,6 +1,8 @@
+pub mod block;
 pub mod inbox_model;
 mod inbox_panel_settings;
 pub mod inbox_store;
+pub mod markdown_codec;
 mod type_editor;
 
 pub use inbox_store::{InboxStore, InboxStoreEvent};
