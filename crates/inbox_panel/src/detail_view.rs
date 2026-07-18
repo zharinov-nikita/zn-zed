@@ -1544,7 +1544,7 @@ mod tests {
         let store = cx.new(|cx| InboxStore::new(project, fs, cx));
         cx.run_until_parked();
         let item_id = store.update(cx, |store, cx| {
-            let id = store.capture("Запись".to_string(), None, None, cx);
+            let id = store.capture("Entry".to_string(), None, None, cx);
             store.set_body(&id, body.map(str::to_string), cx);
             id
         });
@@ -1608,7 +1608,7 @@ mod tests {
         let store = cx.new(|cx| InboxStore::new(project, fs, cx));
         cx.run_until_parked();
         let item_id = store.update(cx, |store, cx| {
-            let id = store.capture("Запись".to_string(), None, None, cx);
+            let id = store.capture("Entry".to_string(), None, None, cx);
             store.set_body(&id, body.map(str::to_string), cx);
             id
         });
