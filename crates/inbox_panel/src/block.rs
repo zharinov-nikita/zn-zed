@@ -212,8 +212,10 @@ impl BlockDocument {
 
     /// Handles pressing Backspace at the start of block `id`'s text.
     ///
-    /// - A non-`Paragraph` text block becomes a `Paragraph` in place
-    ///   (losing `checked` if it was a `Todo`).
+    /// - A non-`Paragraph` *text* block becomes a `Paragraph` in place
+    ///   (losing `checked` if it was a `Todo`). `Code`/`Divider` blocks are
+    ///   not text blocks, so backspace at their start is a no-op (`None`);
+    ///   there's nothing sensible to convert them into in place.
     /// - A `Paragraph` at index 0 is a no-op (`None`).
     /// - If the previous block is `Divider` or `Code`, it is removed and
     ///   the current block stays put.
@@ -223,6 +225,10 @@ impl BlockDocument {
     pub fn backspace_at_start(&mut self, id: BlockId) -> Option<EditTarget> {
         let index = self.index_of(id)?;
         let block_type = self.blocks[index].block_type;
+
+        if !block_type.is_text() {
+            return None;
+        }
 
         if block_type != BlockType::Paragraph {
             self.blocks[index].block_type = BlockType::Paragraph;
@@ -265,13 +271,24 @@ impl BlockDocument {
     /// Converting to `Divider` is special: the block becomes an empty
     /// `Divider`, and a new empty `Paragraph` is inserted right after it;
     /// the result targets that new paragraph.
+    ///
+    /// Converting a `Code` block (which may legally contain embedded
+    /// newlines) into a text block sanitizes the text by replacing
+    /// newlines with spaces, since text blocks must hold single-line
+    /// content for the markdown codec's serialize/parse round trip to
+    /// hold. Converting into `Code` keeps the text as-is.
     pub fn convert(&mut self, id: BlockId, block_type: BlockType) -> Option<EditTarget> {
         let index = self.index_of(id)?;
+        let prev_type = self.blocks[index].block_type;
 
         if block_type != BlockType::Todo {
             self.blocks[index].checked = false;
         }
         self.blocks[index].block_type = block_type;
+
+        if prev_type == BlockType::Code && block_type.is_text() {
+            self.blocks[index].text = self.blocks[index].text.replace('\n', " ");
+        }
 
         if block_type == BlockType::Divider {
             self.blocks[index].text.clear();
@@ -649,6 +666,23 @@ mod tests {
         assert_eq!(target.caret, CaretPos::Offset(5));
     }
 
+    #[test]
+    fn test_backspace_on_code_or_divider_is_noop() {
+        let mut doc = doc_from(vec![(BlockType::Code, "let x = 1;\nlet y = 2;", false)]);
+        let id = doc.blocks()[0].id;
+        assert_eq!(doc.backspace_at_start(id), None);
+        assert_eq!(doc.len(), 1);
+        assert_eq!(doc.blocks()[0].block_type, BlockType::Code);
+        assert_eq!(doc.blocks()[0].text, "let x = 1;\nlet y = 2;");
+
+        let mut doc = doc_from(vec![(BlockType::Divider, "", false)]);
+        let id = doc.blocks()[0].id;
+        assert_eq!(doc.backspace_at_start(id), None);
+        assert_eq!(doc.len(), 1);
+        assert_eq!(doc.blocks()[0].block_type, BlockType::Divider);
+        assert_eq!(doc.blocks()[0].text, "");
+    }
+
     // --- convert ---
 
     #[test]
@@ -684,6 +718,64 @@ mod tests {
         assert_eq!(doc.blocks()[0].block_type, BlockType::Todo);
         assert_eq!(doc.blocks()[0].text, "task");
         assert!(!doc.blocks()[0].checked);
+    }
+
+    #[test]
+    fn test_convert_code_to_paragraph_sanitizes_newlines() {
+        let mut doc = doc_from(vec![(BlockType::Code, "a\nb", false)]);
+        let id = doc.blocks()[0].id;
+        doc.convert(id, BlockType::Paragraph).unwrap();
+        assert_eq!(doc.blocks()[0].block_type, BlockType::Paragraph);
+        assert_eq!(doc.blocks()[0].text, "a b");
+
+        // The whole point of sanitizing is to keep serialize ∘ parse an
+        // identity for text blocks: a multi-line Code block turned into a
+        // Paragraph must not re-split into multiple blocks on round trip.
+        let serialized = doc.to_markdown();
+        let round_tripped = BlockDocument::from_markdown(&serialized);
+        assert_eq!(round_tripped.to_markdown(), serialized);
+        assert_eq!(round_tripped.len(), doc.len());
+        assert_eq!(round_tripped.blocks()[0].block_type, BlockType::Paragraph);
+        assert_eq!(round_tripped.blocks()[0].text, "a b");
+    }
+
+    #[test]
+    fn test_convert_code_to_other_text_types_sanitizes_newlines() {
+        for block_type in [
+            BlockType::H1,
+            BlockType::H2,
+            BlockType::Todo,
+            BlockType::Bullet,
+            BlockType::Quote,
+        ] {
+            let mut doc = doc_from(vec![(BlockType::Code, "line1\nline2\nline3", false)]);
+            let id = doc.blocks()[0].id;
+            doc.convert(id, block_type).unwrap();
+            assert_eq!(doc.blocks()[0].block_type, block_type);
+            assert_eq!(
+                doc.blocks()[0].text,
+                "line1 line2 line3",
+                "{block_type:?} should have sanitized newlines"
+            );
+        }
+    }
+
+    #[test]
+    fn test_convert_code_to_code_keeps_newlines() {
+        let mut doc = doc_from(vec![(BlockType::Code, "a\nb", false)]);
+        let id = doc.blocks()[0].id;
+        doc.convert(id, BlockType::Code).unwrap();
+        assert_eq!(doc.blocks()[0].block_type, BlockType::Code);
+        assert_eq!(doc.blocks()[0].text, "a\nb");
+    }
+
+    #[test]
+    fn test_convert_code_to_divider_empties_text() {
+        let mut doc = doc_from(vec![(BlockType::Code, "a\nb", false)]);
+        let id = doc.blocks()[0].id;
+        doc.convert(id, BlockType::Divider).unwrap();
+        assert_eq!(doc.blocks()[0].block_type, BlockType::Divider);
+        assert_eq!(doc.blocks()[0].text, "");
     }
 
     // --- remove / move / duplicate ---
