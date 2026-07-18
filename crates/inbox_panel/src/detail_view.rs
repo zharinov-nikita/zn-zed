@@ -1003,13 +1003,14 @@ impl InboxDetailView {
     }
 
     fn render_title(&self, item: &InboxItem, cx: &mut Context<Self>) -> impl IntoElement {
-        let (type_label, type_square_color) = {
+        let type_info: Option<(SharedString, gpui::Hsla)> = {
             let store = self.store.read(cx);
-            let inbox_type = store.resolve_kind(item);
-            (
-                SharedString::from(inbox_type.label.clone()),
-                type_color(&inbox_type.color, cx),
-            )
+            store.resolve_kind(item).map(|inbox_type| {
+                (
+                    SharedString::from(inbox_type.label.clone()),
+                    type_color(&inbox_type.color, cx),
+                )
+            })
         };
 
         let mut meta = h_flex()
@@ -1019,11 +1020,13 @@ impl InboxDetailView {
             .pl(px(16.))
             .text_xs()
             .font_buffer(cx)
-            .text_color(cx.theme().colors().text_placeholder)
-            .child(type_label);
+            .text_color(cx.theme().colors().text_placeholder);
+        if let Some((type_label, _)) = type_info.clone() {
+            meta = meta.child(type_label);
+        }
         if let Some(created) = item.created {
             let age = format_age(created, now_unix());
-            let captured = if age == "сейчас" {
+            let captured = if age == "now" {
                 "захвачено только что".to_string()
             } else {
                 format!("захвачено {age} назад")
@@ -1069,20 +1072,20 @@ impl InboxDetailView {
             // (plain Enter is unbound in auto-height editors) and moves
             // editing into the first block of the body.
             .on_action(cx.listener(Self::handle_title_confirm))
-            .child(
-                h_flex()
-                    .items_start()
-                    .gap_2()
-                    .child(
+            .child({
+                let mut title_row = h_flex().items_start().gap_2();
+                if let Some((_, type_square_color)) = type_info {
+                    title_row = title_row.child(
                         div()
                             .flex_none()
                             .mt(px(5.))
                             .size(px(8.))
                             .rounded_xs()
                             .bg(type_square_color),
-                    )
-                    .child(div().flex_1().min_w_0().child(self.title_editor.clone())),
-            )
+                    );
+                }
+                title_row.child(div().flex_1().min_w_0().child(self.title_editor.clone()))
+            })
             .child(meta)
     }
 

@@ -31,7 +31,7 @@ use workspace::{
 };
 
 use crate::inbox_model::{
-    InboxItem, ItemId, classify, format_age, now_unix, parse_context, subtask_counts, type_color,
+    InboxItem, ItemId, format_age, now_unix, parse_context, subtask_counts, type_color,
 };
 use crate::inbox_panel_settings::{DockSide, InboxPanelSettings, Settings};
 use crate::type_editor::TypeEditorState;
@@ -111,8 +111,7 @@ pub struct InboxPanel {
     focus_handle: FocusHandle,
     store: Entity<InboxStore>,
     capture_editor: Entity<Editor>,
-    /// Type key preselected for the next capture. `None` means "Авто"
-    /// (classify the text on capture).
+    /// Type key preselected for the next capture. `None` means no type.
     capture_kind: Option<String>,
     view_mode: ViewMode,
     /// Type keys of the groups collapsed in the grouped view.
@@ -349,12 +348,7 @@ impl InboxPanel {
         if text.is_empty() {
             return;
         }
-        // "Авто" resolves to the classified kind at capture time, so the file
-        // is self-contained.
-        let kind = self
-            .capture_kind
-            .clone()
-            .or_else(|| Some(classify(&text).to_string()));
+        let kind = self.capture_kind.clone();
         let from = self.active_editor_context(window, cx);
         self.store.update(cx, |store, cx| {
             store.capture(text, kind, from, cx);
@@ -422,15 +416,6 @@ impl InboxPanel {
                             this.show_archive = !this.show_archive;
                             cx.notify();
                         })),
-                    )
-                    .child(
-                        IconButton::new("archive-cleared", IconName::Trash)
-                            .icon_size(IconSize::Small)
-                            .icon_color(Color::Muted)
-                            .tooltip(Tooltip::text("Убрать разобранные в архив"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.store.update(cx, |store, cx| store.archive_cleared(cx));
-                            })),
                     )
                     .child(
                         IconButton::new("inbox-type-settings", IconName::Settings)
@@ -624,7 +609,8 @@ impl InboxPanel {
                     let store_ref = store.read(cx);
                     let current_key = store_ref
                         .item(&item_id)
-                        .map(|item| store_ref.resolve_kind(item).key.clone());
+                        .and_then(|item| store_ref.resolve_kind(item))
+                        .map(|inbox_type| inbox_type.key.clone());
                     let types: Vec<(String, SharedString, gpui::Hsla)> = store_ref
                         .types()
                         .iter()
@@ -778,11 +764,13 @@ impl InboxPanel {
         let is_archive_row = row != ItemRow::Open;
         let (type_label, type_chip_color) = {
             let store = self.store.read(cx);
-            let inbox_type = store.resolve_kind(item);
-            (
-                SharedString::from(inbox_type.label.clone()),
-                type_color(&inbox_type.color, cx),
-            )
+            match store.resolve_kind(item) {
+                Some(inbox_type) => (
+                    SharedString::from(inbox_type.label.clone()),
+                    type_color(&inbox_type.color, cx),
+                ),
+                None => (SharedString::from(""), Color::Muted.color(cx)),
+            }
         };
 
         let checkbox_id = SharedString::from(format!("inbox-checkbox-{}", item.id));
@@ -1063,12 +1051,12 @@ impl InboxPanel {
                 })
                 .collect()
         };
-        // Group by the resolved kind so items with an unknown or deleted kind
-        // land in the "note" group instead of disappearing.
-        let item_keys: Vec<String> = {
+        // Group by the resolved kind. Items with no kind, or an unknown/deleted
+        // kind, resolve to `None` and currently land in no group.
+        let item_keys: Vec<Option<String>> = {
             let store = self.store.read(cx);
             open.iter()
-                .map(|item| store.resolve_kind(item).key.clone())
+                .map(|item| store.resolve_kind(item).map(|t| t.key.clone()))
                 .collect()
         };
 
@@ -1077,7 +1065,7 @@ impl InboxPanel {
             let items: Vec<&InboxItem> = open
                 .iter()
                 .zip(&item_keys)
-                .filter(|(_, item_key)| **item_key == key)
+                .filter(|(_, item_key)| item_key.as_deref() == Some(key.as_str()))
                 .map(|(item, _)| item)
                 .collect();
             if items.is_empty() {
@@ -1094,9 +1082,10 @@ impl InboxPanel {
                     let key = key.clone();
                     move |this, drag: &DraggedInboxItem, _, cx| {
                         this.store.update(cx, |store, cx| {
-                            let already_there = store
-                                .item(&drag.id)
-                                .is_some_and(|item| store.resolve_kind(item).key == key);
+                            let already_there = store.item(&drag.id).is_some_and(|item| {
+                                store.resolve_kind(item).map(|t| t.key.as_str())
+                                    == Some(key.as_str())
+                            });
                             if !already_there {
                                 store.set_kind(&drag.id, Some(key.clone()), cx);
                             }

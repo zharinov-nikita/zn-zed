@@ -1,4 +1,4 @@
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use gpui::{App, Hsla};
 use serde::{Deserialize, Serialize};
@@ -46,8 +46,7 @@ pub struct InboxFile {
     pub version: Option<u32>,
     #[serde(default)]
     pub inbox: Vec<InboxItem>,
-    /// Custom item types. Empty means "use the built-in defaults", which are
-    /// intentionally not serialized.
+    /// Custom item types. Empty by default (no built-in types).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub types: Vec<InboxType>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -116,76 +115,7 @@ pub fn type_color(token: &str, cx: &App) -> Hsla {
     }
 }
 
-/// The built-in item types, used when the inbox file defines none.
-pub fn default_types() -> Vec<InboxType> {
-    [
-        ("task", "Задача", "created"),
-        ("note", "Заметка", "muted"),
-        ("idea", "Идея", "modified"),
-        ("ask", "Вопрос", "accent"),
-        ("link", "Ссылка", "info"),
-    ]
-    .into_iter()
-    .map(|(key, label, color)| InboxType {
-        key: key.to_string(),
-        label: label.to_string(),
-        color: color.to_string(),
-    })
-    .collect()
-}
-
-static DEFAULT_TYPES: LazyLock<Vec<InboxType>> = LazyLock::new(default_types);
-
-/// Shared slice of the built-in item types.
-pub fn default_types_ref() -> &'static [InboxType] {
-    &DEFAULT_TYPES
-}
-
-/// Guesses the type key of a captured text.
-pub fn classify(text: &str) -> &'static str {
-    const QUESTION_STARTS: &[&str] = &[
-        "как",
-        "что",
-        "почему",
-        "зачем",
-        "спросить",
-        "узнать",
-        "уточнить",
-        "how",
-        "why",
-        "ask",
-    ];
-    const IDEA_MARKERS: &[&str] = &["идея", "idea:", "мысль", "подумать"];
-    const ACTION_MARKERS: &[&str] = &[
-        "сделать",
-        "фикс",
-        "добавить",
-        "написать",
-        "починить",
-        "проверить",
-        "глянуть",
-        "fix",
-        "add",
-        "todo",
-        "refactor",
-        "check",
-    ];
-
-    let text = text.trim().to_lowercase();
-    if text.contains("http://") || text.contains("https://") {
-        "link"
-    } else if text.ends_with('?') || QUESTION_STARTS.iter().any(|word| text.starts_with(word)) {
-        "ask"
-    } else if IDEA_MARKERS.iter().any(|marker| text.contains(marker)) {
-        "idea"
-    } else if ACTION_MARKERS.iter().any(|marker| text.contains(marker)) {
-        "task"
-    } else {
-        "note"
-    }
-}
-
-/// Formats the age of an item in compact Russian notation.
+/// Formats the age of an item in compact English notation.
 pub fn format_age(created_unix: i64, now_unix: i64) -> String {
     const MINUTE: i64 = 60;
     const HOUR: i64 = 60 * MINUTE;
@@ -194,15 +124,15 @@ pub fn format_age(created_unix: i64, now_unix: i64) -> String {
 
     let seconds = now_unix.saturating_sub(created_unix).max(0);
     if seconds < MINUTE {
-        "сейчас".to_string()
+        "now".to_string()
     } else if seconds < HOUR {
-        format!("{}м", seconds / MINUTE)
+        format!("{}m", seconds / MINUTE)
     } else if seconds < DAY {
-        format!("{}ч", seconds / HOUR)
+        format!("{}h", seconds / HOUR)
     } else if seconds < WEEK {
-        format!("{}д", seconds / DAY)
+        format!("{}d", seconds / DAY)
     } else {
-        format!("{}нед", seconds / WEEK)
+        format!("{}w", seconds / WEEK)
     }
 }
 
@@ -286,43 +216,19 @@ mod tests {
     }
 
     #[test]
-    fn test_classify() {
-        // Links win over everything else.
-        assert_eq!(classify("https://zed.dev/blog"), "link");
-        assert_eq!(classify("почитать http://example.com"), "link");
-        // Questions.
-        assert_eq!(classify("деплой опять сломан?"), "ask");
-        assert_eq!(classify("Как настроить lsp"), "ask");
-        assert_eq!(classify("why is startup slow"), "ask");
-        assert_eq!(classify("спросить у команды про релиз"), "ask");
-        // Ideas.
-        assert_eq!(classify("идея: панель инбокса"), "idea");
-        assert_eq!(classify("есть мысль про кеширование"), "idea");
-        assert_eq!(classify("Idea: inline hints"), "idea");
-        // Tasks.
-        assert_eq!(classify("Фикс панели гита"), "task");
-        assert_eq!(classify("todo: cleanup"), "task");
-        assert_eq!(classify("надо починить скролл"), "task");
-        assert_eq!(classify("fix the flaky test"), "task");
-        // Everything else is a note.
-        assert_eq!(classify("просто текст на память"), "note");
-        assert_eq!(classify(""), "note");
-    }
-
-    #[test]
     fn test_format_age() {
-        assert_eq!(format_age(100, 100), "сейчас");
-        assert_eq!(format_age(100, 159), "сейчас");
+        assert_eq!(format_age(100, 100), "now");
+        assert_eq!(format_age(100, 159), "now");
         // Future timestamps are clamped.
-        assert_eq!(format_age(200, 100), "сейчас");
-        assert_eq!(format_age(100, 160), "1м");
-        assert_eq!(format_age(0, 3599), "59м");
-        assert_eq!(format_age(0, 3600), "1ч");
-        assert_eq!(format_age(0, 86399), "23ч");
-        assert_eq!(format_age(0, 86400), "1д");
-        assert_eq!(format_age(0, 604799), "6д");
-        assert_eq!(format_age(0, 604800), "1нед");
-        assert_eq!(format_age(0, 3 * 604800), "3нед");
+        assert_eq!(format_age(200, 100), "now");
+        assert_eq!(format_age(100, 160), "1m");
+        assert_eq!(format_age(0, 3599), "59m");
+        assert_eq!(format_age(0, 3600), "1h");
+        assert_eq!(format_age(0, 86399), "23h");
+        assert_eq!(format_age(0, 86400), "1d");
+        assert_eq!(format_age(0, 604799), "6d");
+        assert_eq!(format_age(0, 604800), "1w");
+        assert_eq!(format_age(0, 3 * 604800), "3w");
     }
 
     #[test]

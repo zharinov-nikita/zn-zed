@@ -71,18 +71,6 @@ impl TypeEditorState {
         }
     }
 
-    /// Drops all rename editors and recreates them from the store. Used after
-    /// "Сброс", when the labels change out from under the editors.
-    pub(crate) fn rebuild(
-        &mut self,
-        store: &Entity<InboxStore>,
-        window: &mut Window,
-        cx: &mut Context<InboxPanel>,
-    ) {
-        self.rename_editors.clear();
-        self.sync(store, window, cx);
-    }
-
     fn editor(&self, key: &str) -> Option<&Entity<Editor>> {
         self.rename_editors.get(key).map(|(editor, _)| editor)
     }
@@ -227,19 +215,6 @@ impl InboxPanel {
                 div()
                     .flex_1()
                     .child(Label::new("Списки записей").weight(FontWeight::MEDIUM)),
-            )
-            .child(
-                Button::new("inbox-types-reset", "Сброс")
-                    .style(ButtonStyle::Subtle)
-                    .label_size(LabelSize::XSmall)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        let store = this.store.clone();
-                        store.update(cx, |store, cx| store.reset_types(cx));
-                        if let Some(state) = this.type_editor.as_mut() {
-                            state.rebuild(&store, window, cx);
-                        }
-                        cx.notify();
-                    })),
             );
 
         let type_rows: Vec<AnyElement> = types

@@ -6,8 +6,7 @@ use project::{Project, WorktreeId};
 use util::rel_path::RelPath;
 
 use crate::inbox_model::{
-    InboxFile, InboxItem, InboxType, ItemId, TYPE_COLOR_TOKENS, default_types, default_types_ref,
-    new_item_id, now_unix,
+    InboxFile, InboxItem, InboxType, ItemId, TYPE_COLOR_TOKENS, new_item_id, now_unix,
 };
 
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(250);
@@ -285,23 +284,14 @@ impl InboxStore {
     }
 
     pub fn types(&self) -> &[InboxType] {
-        if self.state.types.is_empty() {
-            default_types_ref()
-        } else {
-            &self.state.types
-        }
+        &self.state.types
     }
 
-    /// Resolves the type of an item. Unset or unknown kinds fall back to the
-    /// "note" type, or to the first type if there is no "note".
-    pub fn resolve_kind(&self, item: &InboxItem) -> &InboxType {
-        let types = self.types();
-        let key = item.kind.as_deref().unwrap_or("note");
-        types
-            .iter()
-            .find(|inbox_type| inbox_type.key == key)
-            .or_else(|| types.iter().find(|inbox_type| inbox_type.key == "note"))
-            .unwrap_or(&types[0])
+    /// Resolves the type of an item. Returns `None` when the item has no
+    /// kind, or when its kind matches no existing type.
+    pub fn resolve_kind(&self, item: &InboxItem) -> Option<&InboxType> {
+        let key = item.kind.as_deref()?;
+        self.types().iter().find(|inbox_type| inbox_type.key == key)
     }
 
     pub fn load_error(&self) -> Option<&str> {
@@ -405,19 +395,6 @@ impl InboxStore {
         self.on_mutated(cx);
     }
 
-    /// Moves all cleared inbox items to the front of the archive.
-    pub fn archive_cleared(&mut self, cx: &mut Context<Self>) {
-        let (cleared, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.state.inbox)
-            .into_iter()
-            .partition(|item| item.is_cleared());
-        self.state.inbox = kept;
-        if cleared.is_empty() {
-            return;
-        }
-        self.state.archived.splice(0..0, cleared);
-        self.on_mutated(cx);
-    }
-
     /// Moves an archived item back to the top of the inbox, un-clearing it.
     pub fn restore(&mut self, id: &ItemId, cx: &mut Context<Self>) {
         let Some(index) = self.state.archived.iter().position(|item| &item.id == id) else {
@@ -429,17 +406,9 @@ impl InboxStore {
         self.on_mutated(cx);
     }
 
-    // Type mutations. Each of these materializes the default types into the
-    // state first, so that customized types get serialized.
-
-    fn materialize_types(&mut self) {
-        if self.state.types.is_empty() {
-            self.state.types = default_types();
-        }
-    }
+    // Type mutations.
 
     pub fn rename_type(&mut self, key: &str, label: String, cx: &mut Context<Self>) {
-        self.materialize_types();
         let Some(inbox_type) = self
             .state
             .types
@@ -454,7 +423,6 @@ impl InboxStore {
 
     /// Switches the type's color to the next token in [`TYPE_COLOR_TOKENS`].
     pub fn cycle_type_color(&mut self, key: &str, cx: &mut Context<Self>) {
-        self.materialize_types();
         let Some(inbox_type) = self
             .state
             .types
@@ -477,7 +445,6 @@ impl InboxStore {
     /// Deletes a type; items of that type become notes. The last remaining
     /// type cannot be deleted.
     pub fn delete_type(&mut self, key: &str, cx: &mut Context<Self>) {
-        self.materialize_types();
         if self.state.types.len() <= 1 {
             return;
         }
@@ -506,25 +473,15 @@ impl InboxStore {
     /// Adds a new type with a generated key and the next color in the palette.
     /// Returns the new key.
     pub fn add_type(&mut self, cx: &mut Context<Self>) -> String {
-        self.materialize_types();
         let key = format!("k{}", new_item_id());
         let color = TYPE_COLOR_TOKENS[self.state.types.len() % TYPE_COLOR_TOKENS.len()];
         self.state.types.push(InboxType {
             key: key.clone(),
-            label: "новый тип".to_string(),
+            label: "New list".to_string(),
             color: color.to_string(),
         });
         self.on_mutated(cx);
         key
-    }
-
-    /// Reverts to the built-in types (which are not serialized).
-    pub fn reset_types(&mut self, cx: &mut Context<Self>) {
-        if self.state.types.is_empty() {
-            return;
-        }
-        self.state.types = Vec::new();
-        self.on_mutated(cx);
     }
 }
 
@@ -614,9 +571,9 @@ mod tests {
             assert!(store.items()[1].created.is_some());
             assert_eq!(store.archived().len(), 1);
             assert!(store.archived()[0].is_cleared());
-            // No custom types in the file means the built-in defaults.
-            assert_eq!(store.types(), default_types_ref());
-            assert_eq!(store.resolve_kind(&store.items()[1]).key, "note");
+            // No custom types in the file means no types at all.
+            assert!(store.types().is_empty());
+            assert!(store.resolve_kind(&store.items()[1]).is_none());
         });
     }
 
@@ -770,22 +727,25 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_archive_restore_delete(cx: &mut TestAppContext) {
+    async fn test_restore_and_delete(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(path!("/root"), json!({})).await;
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".zed": {
+                    "inbox.json": r#"{ "archived": [{ "id": "b", "text": "b", "cleared": 1 }] }"#
+                }
+            }),
+        )
+        .await;
         let (_project, store) = build_store(fs.clone(), cx).await;
 
-        let (id_a, id_b) = store.update(cx, |store, cx| {
-            let id_b = store.capture("b".to_string(), None, None, cx);
-            let id_a = store.capture("a".to_string(), None, None, cx);
-            (id_a, id_b)
+        let id_a = store.update(cx, |store, cx| {
+            store.capture("a".to_string(), None, None, cx)
         });
+        let id_b: ItemId = "b".into();
 
-        store.update(cx, |store, cx| {
-            store.toggle_cleared(&id_b, cx);
-            store.archive_cleared(cx);
-        });
         store.read_with(cx, |store, _| {
             assert_eq!(store.items().len(), 1);
             assert_eq!(store.items()[0].id, id_a);
@@ -845,10 +805,15 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert!(value.get("types").is_none(), "defaults must not be written");
+        assert!(
+            value.get("types").is_none(),
+            "no types by default must not be written"
+        );
 
-        store.update(cx, |store, cx| {
-            store.rename_type("task", "TODO".to_string(), cx)
+        let key = store.update(cx, |store, cx| {
+            let key = store.add_type(cx);
+            store.rename_type(&key, "TODO".to_string(), cx);
+            key
         });
         flush_saves(cx);
         let parsed: InboxFile = serde_json::from_str(
@@ -857,22 +822,9 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(parsed.types.len(), default_types().len());
-        assert_eq!(parsed.types[0].key, "task");
+        assert_eq!(parsed.types.len(), 1);
+        assert_eq!(parsed.types[0].key, key);
         assert_eq!(parsed.types[0].label, "TODO");
-
-        store.update(cx, |store, cx| store.reset_types(cx));
-        flush_saves(cx);
-        let value: serde_json::Value = serde_json::from_str(
-            &fs.load(path!("/root/.zed/inbox.json").as_ref())
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert!(
-            value.get("types").is_none(),
-            "reset must remove types from the file"
-        );
     }
 
     #[gpui::test]
@@ -882,36 +834,48 @@ mod tests {
         fs.insert_tree(path!("/root"), json!({})).await;
         let (_project, store) = build_store(fs.clone(), cx).await;
 
-        store.update(cx, |store, cx| {
-            store.capture("idea item".to_string(), Some("idea".to_string()), None, cx);
+        // No types exist by default.
+        store.read_with(cx, |store, _| assert!(store.types().is_empty()));
+
+        let (key_a, key_b) = store.update(cx, |store, cx| {
+            // Adding a type appends a fresh one with the next color and a
+            // default label.
+            let key_a = store.add_type(cx);
+            assert_eq!(store.types()[0].label, "New list");
+            assert_eq!(store.types()[0].color, "accent");
+
+            let key_b = store.add_type(cx);
+            assert_eq!(store.types()[1].color, "created");
+            (key_a, key_b)
+        });
+
+        let item_id = store.update(cx, |store, cx| {
+            store.capture("idea item".to_string(), Some(key_b.clone()), None, cx)
         });
 
         store.update(cx, |store, cx| {
-            // "task" starts with "created"; cycling moves it to the next token.
-            store.cycle_type_color("task", cx);
-            assert_eq!(store.types()[0].color, "modified");
+            // Cycling moves the color to the next token.
+            store.cycle_type_color(&key_a, cx);
+            assert_eq!(store.types()[0].color, "created");
 
             // Deleting a type reassigns its items to "note".
-            store.delete_type("idea", cx);
-            assert!(store.types().iter().all(|t| t.key != "idea"));
-            assert_eq!(store.items()[0].kind.as_deref(), Some("note"));
+            store.delete_type(&key_b, cx);
+            assert!(store.types().iter().all(|t| t.key != key_b));
+        });
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.item(&item_id).unwrap().kind.as_deref(), Some("note"));
+        });
 
+        store.update(cx, |store, cx| {
             // The last type cannot be deleted.
-            for key in store
-                .types()
-                .iter()
-                .map(|t| t.key.clone())
-                .collect::<Vec<_>>()
-            {
-                store.delete_type(&key, cx);
-            }
+            store.delete_type(&key_a, cx);
             assert_eq!(store.types().len(), 1);
 
             // Adding a type appends a fresh one.
             let key = store.add_type(cx);
             assert_eq!(store.types().len(), 2);
             assert_eq!(store.types()[1].key, key);
-            assert_eq!(store.types()[1].label, "новый тип");
+            assert_eq!(store.types()[1].label, "New list");
         });
     }
 
