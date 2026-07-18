@@ -22,9 +22,9 @@ use gpui::{
 };
 use theme_settings::ThemeSettings;
 use ui::{
-    ButtonLike, Checkbox, ContextMenu, ContextMenuEntry, ContextMenuItem, Disclosure, PopoverMenu,
-    ScrollAxes, Scrollbars, Tab, TintColor, ToggleButtonGroup, ToggleButtonSimple, ToggleState,
-    Tooltip, WithScrollbar, prelude::*,
+    ButtonLike, Checkbox, ContextMenu, ContextMenuEntry, ContextMenuItem, Disclosure, IconPosition,
+    PopoverMenu, ScrollAxes, Scrollbars, Tab, TintColor, ToggleState, Tooltip, WithScrollbar,
+    prelude::*,
 };
 use workspace::{
     Workspace,
@@ -400,6 +400,45 @@ impl InboxPanel {
             .child(
                 h_flex()
                     .gap_1()
+                    // Collapse/expand every list group at once. Only meaningful
+                    // in the "By list" view, where groups exist.
+                    .when(self.view_mode == ViewMode::Grouped, |this| {
+                        let any_collapsed = !self.collapsed_groups.is_empty();
+                        this.child(
+                            IconButton::new(
+                                "inbox-toggle-groups",
+                                if any_collapsed {
+                                    IconName::ListTree
+                                } else {
+                                    IconName::ListCollapse
+                                },
+                            )
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Muted)
+                                .tooltip(Tooltip::text(if any_collapsed {
+                                    "Expand all lists"
+                                } else {
+                                    "Collapse all lists"
+                                }))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if this.collapsed_groups.is_empty() {
+                                        let keys: Vec<String> = this
+                                            .store
+                                            .read(cx)
+                                            .types()
+                                            .iter()
+                                            .map(|inbox_type| inbox_type.key.clone())
+                                            .collect();
+                                        this.collapsed_groups.extend(keys);
+                                        this.collapsed_groups
+                                            .insert(Self::UNASSIGNED_GROUP_KEY.to_string());
+                                    } else {
+                                        this.collapsed_groups.clear();
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    })
                     .child(
                         IconButton::new(
                             "toggle-archive",
@@ -809,11 +848,14 @@ impl InboxPanel {
         }));
 
         let text_label = if is_archive_row {
+            // `Muted` (not `Disabled`) so cleared/archived text stays legible in
+            // both themes, including under the hover background on dark themes.
             Label::new(item.text.clone())
-                .color(Color::Disabled)
+                .size(LabelSize::Large)
+                .color(Color::Muted)
                 .strikethrough()
         } else {
-            Label::new(item.text.clone())
+            Label::new(item.text.clone()).size(LabelSize::Large)
         };
 
         let mut meta = h_flex().flex_wrap().items_center().gap_2();
@@ -949,6 +991,15 @@ impl InboxPanel {
                 "inbox-archive-disclosure",
                 self.show_archive,
             ))
+            // Muted color swatch mirroring the list group headers, so the
+            // archive section lines up visually with the "By list" groups.
+            .child(
+                div()
+                    .flex_none()
+                    .size(px(7.))
+                    .rounded_xs()
+                    .bg(Color::Muted.color(cx)),
+            )
             .child(
                 Label::new("ARCHIVE")
                     .size(LabelSize::XSmall)
@@ -968,42 +1019,74 @@ impl InboxPanel {
             )
     }
 
-    /// The "All" / "By list" segmented switch above the item list.
+    /// A minimalist dropdown that switches between "All" and "By list": a
+    /// compact muted label + chevron that opens a small select menu.
     fn render_view_mode_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex()
-            .flex_none()
-            .mb_1()
-            .p(px(2.))
-            .bg(cx.theme().colors().editor_background)
-            .border_1()
-            .border_color(cx.theme().colors().border_variant)
-            .rounded_md()
-            .child(
-                ToggleButtonGroup::single_row(
-                    "inbox-view-mode",
-                    [
-                        ToggleButtonSimple::new(
-                            "All",
-                            cx.listener(|this, _, _, cx| {
-                                this.view_mode = ViewMode::All;
-                                cx.notify();
-                            }),
+        let current_label = match self.view_mode {
+            ViewMode::All => "All",
+            ViewMode::Grouped => "By list",
+        };
+        let panel = cx.entity().downgrade();
+        h_flex().flex_none().mb_1().child(
+            PopoverMenu::new("inbox-view-mode-menu")
+                .trigger(
+                    ButtonLike::new("inbox-view-mode-trigger")
+                        .size(ButtonSize::None)
+                        .child(
+                            h_flex()
+                                .px_1()
+                                .py_0p5()
+                                .gap_0p5()
+                                .child(
+                                    Label::new(current_label)
+                                        .size(LabelSize::Default)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    Icon::new(IconName::ChevronDown)
+                                        .size(IconSize::Small)
+                                        .color(Color::Muted),
+                                ),
                         ),
-                        ToggleButtonSimple::new(
-                            "By list",
-                            cx.listener(|this, _, _, cx| {
-                                this.view_mode = ViewMode::Grouped;
-                                cx.notify();
-                            }),
-                        ),
-                    ],
                 )
-                .selected_index(match self.view_mode {
-                    ViewMode::All => 0,
-                    ViewMode::Grouped => 1,
-                })
-                .label_size(LabelSize::XSmall),
-            )
+                .menu(move |window, cx| {
+                    let panel = panel.clone();
+                    Some(ContextMenu::build(window, cx, move |menu, _, cx| {
+                        let current = panel.upgrade().map(|panel| panel.read(cx).view_mode);
+                        menu.toggleable_entry(
+                            "All",
+                            current == Some(ViewMode::All),
+                            IconPosition::End,
+                            None,
+                            {
+                                let panel = panel.clone();
+                                move |_, cx| {
+                                    panel
+                                        .update(cx, |this, cx| {
+                                            this.view_mode = ViewMode::All;
+                                            cx.notify();
+                                        })
+                                        .ok();
+                                }
+                            },
+                        )
+                        .toggleable_entry(
+                            "By list",
+                            current == Some(ViewMode::Grouped),
+                            IconPosition::End,
+                            None,
+                            move |_, cx| {
+                                panel
+                                    .update(cx, |this, cx| {
+                                        this.view_mode = ViewMode::Grouped;
+                                        cx.notify();
+                                    })
+                                    .ok();
+                            },
+                        )
+                    }))
+                }),
+        )
     }
 
     fn render_group_header(
@@ -1209,28 +1292,40 @@ impl InboxPanel {
 
         let show_empty_state = open.is_empty() && (archive_count == 0 || !self.show_archive);
 
+        // Two layers: the outer container hosts the scrollbar overlay and does
+        // NOT scroll, while the inner container carries `overflow_y_scroll` +
+        // `track_scroll` and holds the rows. The scrollbar must live outside the
+        // scrolled content, otherwise its thumb rides along with the content and
+        // appears frozen. Both share `scroll_handle`; `tracked_scroll_handle`
+        // keeps the thumb tracking it and `tracked_entity` re-renders the panel
+        // while dragging the thumb. Matches memory_view / breakpoint_list.
         v_flex()
-            .id("inbox-list")
+            .id("inbox-list-container")
             .flex_1()
             .min_h_0()
-            .p_1()
-            .when(!open.is_empty(), |this| {
-                this.child(self.render_view_mode_toggle(cx))
-            })
-            .when(show_empty_state, |this| {
-                this.child(self.render_empty_state(cx))
-            })
-            .children(open_rows)
-            .when(archive_count > 0, |this| {
-                this.child(self.render_archive_header(archive_count, cx))
-                    .children(archive_rows)
-            })
-            // Visible, auto-hiding vertical scrollbar matching Zed's other
-            // dock panels (see e.g. project_panel/outline_panel). This also
-            // takes over the scroll tracking/overflow that used to be set
-            // manually via `.overflow_y_scroll().track_scroll(...)`.
+            .child(
+                v_flex()
+                    .id("inbox-list")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll_handle)
+                    .p_1()
+                    .when(!open.is_empty(), |this| {
+                        this.child(self.render_view_mode_toggle(cx))
+                    })
+                    .when(show_empty_state, |this| {
+                        this.child(self.render_empty_state(cx))
+                    })
+                    .children(open_rows)
+                    .when(archive_count > 0, |this| {
+                        this.child(self.render_archive_header(archive_count, cx))
+                            .children(archive_rows)
+                    }),
+            )
             .custom_scrollbars(
-                Scrollbars::new(ScrollAxes::Vertical).tracked_scroll_handle(&self.scroll_handle),
+                Scrollbars::new(ScrollAxes::Vertical)
+                    .tracked_scroll_handle(&self.scroll_handle)
+                    .tracked_entity(cx.entity_id()),
                 window,
                 cx,
             )

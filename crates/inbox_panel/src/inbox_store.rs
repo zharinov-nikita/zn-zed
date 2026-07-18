@@ -442,12 +442,9 @@ impl InboxStore {
         self.on_mutated(cx);
     }
 
-    /// Deletes a type; items of that type become unassigned. The last
-    /// remaining type cannot be deleted.
+    /// Deletes a type; items of that type become unassigned. Any list can be
+    /// deleted, including the last one — lists start empty by default.
     pub fn delete_type(&mut self, key: &str, cx: &mut Context<Self>) {
-        if self.state.types.len() <= 1 {
-            return;
-        }
         let Some(index) = self
             .state
             .types
@@ -867,15 +864,15 @@ mod tests {
         });
 
         store.update(cx, |store, cx| {
-            // The last type cannot be deleted.
+            // The last remaining type can be deleted, leaving no lists.
             store.delete_type(&key_a, cx);
-            assert_eq!(store.types().len(), 1);
+            assert_eq!(store.types().len(), 0);
 
             // Adding a type appends a fresh one.
             let key = store.add_type(cx);
-            assert_eq!(store.types().len(), 2);
-            assert_eq!(store.types()[1].key, key);
-            assert_eq!(store.types()[1].label, "New list");
+            assert_eq!(store.types().len(), 1);
+            assert_eq!(store.types()[0].key, key);
+            assert_eq!(store.types()[0].label, "New list");
         });
     }
 

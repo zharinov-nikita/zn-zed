@@ -132,7 +132,6 @@ impl InboxPanel {
         key: &str,
         color: gpui::Hsla,
         editor: Entity<Editor>,
-        can_delete: bool,
         confirming_delete: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -192,7 +191,6 @@ impl InboxPanel {
             )
             .icon_size(IconSize::XSmall)
             .icon_color(Color::Muted)
-            .disabled(!can_delete)
             .tooltip(Tooltip::text("Delete list"))
             .on_click(cx.listener({
                 let key = key.to_string();
@@ -252,7 +250,6 @@ impl InboxPanel {
                 .map(|inbox_type| (inbox_type.key.clone(), type_color(&inbox_type.color, cx)))
                 .collect()
         };
-        let can_delete = types.len() > 1;
 
         let header = h_flex()
             .flex_none()
@@ -283,7 +280,7 @@ impl InboxPanel {
                 let editor = state.editor(key)?.clone();
                 let confirming_delete = state.confirming_delete.as_deref() == Some(key.as_str());
                 Some(
-                    self.render_type_row(key, *color, editor, can_delete, confirming_delete, cx)
+                    self.render_type_row(key, *color, editor, confirming_delete, cx)
                         .into_any_element(),
                 )
             })
