@@ -9035,6 +9035,7 @@ dependencies = [
  "serde_json",
  "settings",
  "text",
+ "theme_settings",
  "ui",
  "util",
  "workspace",

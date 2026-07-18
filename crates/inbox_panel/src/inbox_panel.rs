@@ -4,7 +4,7 @@ pub mod inbox_store;
 
 pub use inbox_store::{InboxStore, InboxStoreEvent};
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use editor::Editor;
 use fs::Fs;
@@ -14,7 +14,11 @@ use gpui::{
     Render, ScrollHandle, Styled, Subscription, Task, WeakEntity, Window, actions, anchored,
     deferred,
 };
-use ui::{Checkbox, Disclosure, Tab, TintColor, ToggleState, Tooltip, prelude::*};
+use theme_settings::ThemeSettings;
+use ui::{
+    Checkbox, Disclosure, Tab, TintColor, ToggleButtonGroup, ToggleButtonSimple, ToggleState,
+    Tooltip, prelude::*,
+};
 use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
@@ -40,6 +44,43 @@ const INBOX_PANEL_KEY: &str = "InboxPanel";
 /// How often the item age labels ("2м"/"15ч") are refreshed.
 const AGE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Whether the open items are shown as a flat list or grouped by type.
+#[derive(Clone, Copy, PartialEq)]
+enum ViewMode {
+    /// A flat list of all open items ("Все").
+    All,
+    /// Open items grouped by their resolved type ("По спискам").
+    Grouped,
+}
+
+/// Drag payload for moving an inbox item into another group. Doubles as the
+/// ghost view that follows the cursor while dragging.
+#[derive(Clone)]
+struct DraggedInboxItem {
+    id: ItemId,
+    text: SharedString,
+}
+
+impl Render for DraggedInboxItem {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let ui_font = ThemeSettings::get_global(cx).ui_font.clone();
+        h_flex()
+            .font(ui_font)
+            .px_2()
+            .py_1()
+            .max_w(px(240.))
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .bg(cx.theme().colors().element_selected)
+            .child(
+                Label::new(self.text.clone())
+                    .size(LabelSize::Small)
+                    .truncate(),
+            )
+    }
+}
+
 /// Which section of the panel an item row is rendered in.
 #[derive(Clone, Copy, PartialEq)]
 enum ItemRow {
@@ -60,6 +101,9 @@ pub struct InboxPanel {
     /// Type key preselected for the next capture. `None` means "Авто"
     /// (classify the text on capture).
     capture_kind: Option<String>,
+    view_mode: ViewMode,
+    /// Type keys of the groups collapsed in the grouped view.
+    collapsed_groups: HashSet<String>,
     show_archive: bool,
     confirming_delete: Option<(ItemId, Point<Pixels>)>,
     scroll_handle: ScrollHandle,
@@ -136,6 +180,8 @@ impl InboxPanel {
                 store,
                 capture_editor,
                 capture_kind: None,
+                view_mode: ViewMode::Grouped,
+                collapsed_groups: HashSet::default(),
                 show_archive: false,
                 confirming_delete: None,
                 scroll_handle: ScrollHandle::new(),
@@ -194,11 +240,7 @@ impl InboxPanel {
 
     /// Returns a `"path:row"` context string for the workspace's active
     /// editor, or `None` if the active item is not a file-backed editor.
-    fn active_editor_context(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<String> {
+    fn active_editor_context(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<String> {
         let workspace = self.workspace.upgrade()?;
         let editor = workspace.read(cx).active_item_as::<Editor>(cx)?;
         if editor == self.capture_editor {
@@ -208,7 +250,11 @@ impl InboxPanel {
             let buffer = editor.buffer().read(cx).as_singleton()?;
             let path = buffer.read(cx).file()?.path().as_unix_str().to_string();
             let snapshot = editor.snapshot(window, cx);
-            let row = editor.selections.newest::<text::Point>(&snapshot).head().row;
+            let row = editor
+                .selections
+                .newest::<text::Point>(&snapshot)
+                .head()
+                .row;
             Some(format!("{path}:{}", row + 1))
         })
     }
@@ -305,7 +351,11 @@ impl InboxPanel {
         h_flex()
             .gap_1()
             .child(div().flex_none().size(px(7.)).rounded_xs().bg(color))
-            .child(Label::new(label).size(LabelSize::XSmall).color(Color::Muted))
+            .child(
+                Label::new(label)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
     }
 
     fn render_capture_box(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -321,11 +371,12 @@ impl InboxPanel {
 
         let (chip_label, chip_color) = {
             let store = self.store.read(cx);
-            match self
-                .capture_kind
-                .as_deref()
-                .and_then(|key| store.types().iter().find(|inbox_type| inbox_type.key == key))
-            {
+            match self.capture_kind.as_deref().and_then(|key| {
+                store
+                    .types()
+                    .iter()
+                    .find(|inbox_type| inbox_type.key == key)
+            }) {
                 Some(inbox_type) => (
                     SharedString::from(inbox_type.label.clone()),
                     type_color(&inbox_type.color, cx),
@@ -388,11 +439,17 @@ impl InboxPanel {
     }
 
     fn render_no_worktree(&self, _cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex().flex_1().items_center().justify_center().p_4().child(
-            div().text_center().max_w(px(240.)).child(
-                Label::new("Откройте проект, чтобы вести инбокс").color(Color::Muted),
-            ),
-        )
+        v_flex()
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .child(
+                div()
+                    .text_center()
+                    .max_w(px(240.))
+                    .child(Label::new("Откройте проект, чтобы вести инбокс").color(Color::Muted)),
+            )
     }
 
     fn render_item(
@@ -509,6 +566,15 @@ impl InboxPanel {
             .py_1p5()
             .rounded_md()
             .hover(|style| style.bg(cx.theme().colors().element_hover))
+            .when(row == ItemRow::Open, |this| {
+                this.on_drag(
+                    DraggedInboxItem {
+                        id: item.id.clone(),
+                        text: SharedString::from(item.text.clone()),
+                    },
+                    |drag, _click_offset, _window, cx| cx.new(|_| drag.clone()),
+                )
+            })
             .child(div().flex_none().child(checkbox))
             .child(
                 v_flex()
@@ -534,7 +600,10 @@ impl InboxPanel {
                 this.show_archive = !this.show_archive;
                 cx.notify();
             }))
-            .child(Disclosure::new("inbox-archive-disclosure", self.show_archive))
+            .child(Disclosure::new(
+                "inbox-archive-disclosure",
+                self.show_archive,
+            ))
             .child(
                 Label::new("АРХИВ")
                     .size(LabelSize::XSmall)
@@ -554,6 +623,166 @@ impl InboxPanel {
             )
     }
 
+    /// The "Все" / "По спискам" segmented switch above the item list.
+    fn render_view_mode_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .flex_none()
+            .mb_1()
+            .p(px(2.))
+            .bg(cx.theme().colors().editor_background)
+            .border_1()
+            .border_color(cx.theme().colors().border_variant)
+            .rounded_md()
+            .child(
+                ToggleButtonGroup::single_row(
+                    "inbox-view-mode",
+                    [
+                        ToggleButtonSimple::new(
+                            "Все",
+                            cx.listener(|this, _, _, cx| {
+                                this.view_mode = ViewMode::All;
+                                cx.notify();
+                            }),
+                        ),
+                        ToggleButtonSimple::new(
+                            "По спискам",
+                            cx.listener(|this, _, _, cx| {
+                                this.view_mode = ViewMode::Grouped;
+                                cx.notify();
+                            }),
+                        ),
+                    ],
+                )
+                .selected_index(match self.view_mode {
+                    ViewMode::All => 0,
+                    ViewMode::Grouped => 1,
+                })
+                .label_size(LabelSize::XSmall),
+            )
+    }
+
+    fn render_group_header(
+        &self,
+        key: String,
+        label: SharedString,
+        color: gpui::Hsla,
+        count: usize,
+        collapsed: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        h_flex()
+            .id(SharedString::from(format!("inbox-group-header-{key}")))
+            .cursor_pointer()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.collapsed_groups.remove(&key) {
+                    this.collapsed_groups.insert(key.clone());
+                }
+                cx.notify();
+            }))
+            .child(Disclosure::new("inbox-group-disclosure", !collapsed))
+            .child(div().flex_none().size(px(7.)).rounded_xs().bg(color))
+            .child(
+                Label::new(label.to_uppercase())
+                    .size(LabelSize::XSmall)
+                    .weight(FontWeight::BOLD)
+                    .color(Color::Muted),
+            )
+            .child(
+                div()
+                    .px_1()
+                    .rounded_sm()
+                    .bg(cx.theme().colors().element_background)
+                    .child(
+                        Label::new(count.to_string())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            )
+    }
+
+    /// Renders the open items grouped by type, in `store.types()` order.
+    /// Each group is a drop target that moves the dragged item into it.
+    fn render_grouped_items(
+        &self,
+        open: &[InboxItem],
+        now: i64,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let groups: Vec<(String, SharedString, gpui::Hsla)> = {
+            let store = self.store.read(cx);
+            store
+                .types()
+                .iter()
+                .map(|inbox_type| {
+                    (
+                        inbox_type.key.clone(),
+                        SharedString::from(inbox_type.label.clone()),
+                        type_color(&inbox_type.color, cx),
+                    )
+                })
+                .collect()
+        };
+        // Group by the resolved kind so items with an unknown or deleted kind
+        // land in the "note" group instead of disappearing.
+        let item_keys: Vec<String> = {
+            let store = self.store.read(cx);
+            open.iter()
+                .map(|item| store.resolve_kind(item).key.clone())
+                .collect()
+        };
+
+        let mut elements = Vec::new();
+        for (key, label, color) in groups {
+            let items: Vec<&InboxItem> = open
+                .iter()
+                .zip(&item_keys)
+                .filter(|(_, item_key)| **item_key == key)
+                .map(|(item, _)| item)
+                .collect();
+            if items.is_empty() {
+                continue;
+            }
+            let collapsed = self.collapsed_groups.contains(&key);
+            let mut group = v_flex()
+                .id(SharedString::from(format!("inbox-group-{key}")))
+                .rounded_md()
+                .drag_over::<DraggedInboxItem>(|style, _, _, cx| {
+                    style.bg(cx.theme().colors().drop_target_background)
+                })
+                .on_drop(cx.listener({
+                    let key = key.clone();
+                    move |this, drag: &DraggedInboxItem, _, cx| {
+                        this.store.update(cx, |store, cx| {
+                            let already_there = store
+                                .item(&drag.id)
+                                .is_some_and(|item| store.resolve_kind(item).key == key);
+                            if !already_there {
+                                store.set_kind(&drag.id, Some(key.clone()), cx);
+                            }
+                        });
+                    }
+                }))
+                .child(self.render_group_header(
+                    key.clone(),
+                    label,
+                    color,
+                    items.len(),
+                    collapsed,
+                    cx,
+                ));
+            if !collapsed {
+                for item in items {
+                    group = group.child(self.render_item(item, ItemRow::Open, now, cx));
+                }
+            }
+            elements.push(group.into_any_element());
+        }
+        elements
+    }
+
     fn render_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (open, cleared, archived) = {
             let store = self.store.read(cx);
@@ -567,10 +796,13 @@ impl InboxPanel {
         let archive_count = cleared.len() + archived.len();
         let now = now_unix();
 
-        let mut open_rows = Vec::new();
-        for item in &open {
-            open_rows.push(self.render_item(item, ItemRow::Open, now, cx));
-        }
+        let open_rows = match self.view_mode {
+            ViewMode::All => open
+                .iter()
+                .map(|item| self.render_item(item, ItemRow::Open, now, cx))
+                .collect(),
+            ViewMode::Grouped => self.render_grouped_items(&open, now, cx),
+        };
         let mut archive_rows = Vec::new();
         if self.show_archive {
             for item in &cleared {
@@ -590,6 +822,9 @@ impl InboxPanel {
             .overflow_y_scroll()
             .track_scroll(&self.scroll_handle)
             .p_1()
+            .when(!open.is_empty(), |this| {
+                this.child(self.render_view_mode_toggle(cx))
+            })
             .when(show_empty_state, |this| {
                 this.child(self.render_empty_state(cx))
             })
