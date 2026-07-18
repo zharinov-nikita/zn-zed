@@ -69,17 +69,20 @@ impl Render for DraggedInboxItem {
             .font(ui_font)
             .pl(self.click_offset.x + px(12.))
             .pt(self.click_offset.y + px(12.))
-            .px_2()
-            .py_1()
-            .max_w(px(240.))
-            .rounded_md()
-            .border_1()
-            .border_color(cx.theme().colors().border)
-            .bg(cx.theme().colors().element_selected)
             .child(
-                Label::new(self.text.clone())
-                    .size(LabelSize::Small)
-                    .truncate(),
+                h_flex()
+                    .px_2()
+                    .py_1()
+                    .max_w(px(240.))
+                    .rounded_md()
+                    .border_1()
+                    .border_color(cx.theme().colors().border)
+                    .bg(cx.theme().colors().element_selected)
+                    .child(
+                        Label::new(self.text.clone())
+                            .size(LabelSize::Small)
+                            .truncate(),
+                    ),
             )
     }
 }
