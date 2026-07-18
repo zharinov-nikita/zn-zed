@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::sync::Arc;
 
 use gpui::{App, Hsla};
@@ -39,6 +40,107 @@ fn to_base36(mut n: u64) -> String {
     String::from_utf8(out).unwrap()
 }
 
+/// How open items are ordered in the list view.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SortMode {
+    /// Items stay in the order they are stored in (the user can rearrange
+    /// them by hand). This is the default.
+    #[default]
+    Manual,
+    /// Newest captured first.
+    Newest,
+    /// Oldest captured first.
+    Oldest,
+    /// Alphabetical A→Z by text.
+    Az,
+    /// Alphabetical Z→A by text.
+    Za,
+}
+
+impl SortMode {
+    /// All modes, in menu order.
+    pub const ALL: [SortMode; 5] = [
+        SortMode::Manual,
+        SortMode::Newest,
+        SortMode::Oldest,
+        SortMode::Az,
+        SortMode::Za,
+    ];
+
+    pub fn is_manual(&self) -> bool {
+        matches!(self, SortMode::Manual)
+    }
+
+    /// Short label for the sort menu.
+    pub fn label(&self) -> &'static str {
+        match self {
+            SortMode::Manual => "Manual",
+            SortMode::Newest => "Newest",
+            SortMode::Oldest => "Oldest",
+            SortMode::Az => "A–Z",
+            SortMode::Za => "Z–A",
+        }
+    }
+
+    /// Reorders `items` in place. Uses a stable sort, so the existing (manual)
+    /// order breaks ties.
+    pub fn apply(&self, items: &mut [InboxItem]) {
+        match self {
+            SortMode::Manual => {}
+            SortMode::Newest => items.sort_by_key(|item| Reverse(item.created)),
+            SortMode::Oldest => items.sort_by_key(|item| item.created),
+            SortMode::Az => items.sort_by_key(|item| item.text.to_lowercase()),
+            SortMode::Za => items.sort_by_key(|item| Reverse(item.text.to_lowercase())),
+        }
+    }
+}
+
+/// A metadata field shown on an item row, which the user can hide. The keys
+/// are stable strings persisted in `hidden_fields`; adding a new variant makes
+/// the field hideable automatically and it stays visible until hidden.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MetaField {
+    /// The list (type) chip.
+    List,
+    /// The captured-age label.
+    Age,
+    /// The subtask counter.
+    Subtasks,
+    /// The captured-from file context link.
+    Context,
+}
+
+impl MetaField {
+    /// All fields, in display order.
+    pub const ALL: [MetaField; 4] = [
+        MetaField::List,
+        MetaField::Age,
+        MetaField::Subtasks,
+        MetaField::Context,
+    ];
+
+    /// Stable key persisted in `hidden_fields`.
+    pub fn key(&self) -> &'static str {
+        match self {
+            MetaField::List => "list",
+            MetaField::Age => "age",
+            MetaField::Subtasks => "subtasks",
+            MetaField::Context => "context",
+        }
+    }
+
+    /// Human label for the fields menu.
+    pub fn label(&self) -> &'static str {
+        match self {
+            MetaField::List => "List",
+            MetaField::Age => "Time",
+            MetaField::Subtasks => "Subtasks",
+            MetaField::Context => "Context",
+        }
+    }
+}
+
 /// The on-disk representation of `.zed/inbox.json`.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct InboxFile {
@@ -51,6 +153,13 @@ pub struct InboxFile {
     pub types: Vec<InboxType>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub archived: Vec<InboxItem>,
+    /// How open items are ordered. Omitted from disk when set to `Manual`.
+    #[serde(default, skip_serializing_if = "SortMode::is_manual")]
+    pub sort: SortMode,
+    /// Keys of [`MetaField`]s hidden on item rows. Empty (all visible) by
+    /// default; unknown keys are preserved so forward-compat is safe.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_fields: Vec<String>,
 }
 
 /// A single captured inbox entry.
@@ -275,11 +384,15 @@ mod tests {
             }],
             types: Vec::new(),
             archived: Vec::new(),
+            sort: SortMode::Manual,
+            hidden_fields: Vec::new(),
         };
         let json = serde_json::to_string(&file).unwrap();
         assert!(!json.contains("types"));
         assert!(!json.contains("archived"));
         assert!(!json.contains("kind"));
+        assert!(!json.contains("sort"));
+        assert!(!json.contains("hidden_fields"));
 
         let parsed: InboxFile = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, file);
@@ -289,5 +402,52 @@ mod tests {
     fn test_missing_id_is_backfilled_on_deserialize() {
         let parsed: InboxFile = serde_json::from_str(r#"{ "inbox": [{ "text": "x" }] }"#).unwrap();
         assert!(!parsed.inbox[0].id.is_empty());
+    }
+
+    #[test]
+    fn test_sort_mode_apply() {
+        let item = |text: &str, created: i64| InboxItem {
+            id: new_item_id(),
+            text: text.to_string(),
+            kind: None,
+            from: None,
+            body: None,
+            created: Some(created),
+            cleared: None,
+        };
+        let base = vec![item("banana", 30), item("apple", 10), item("Cherry", 20)];
+        let texts = |items: &[InboxItem]| items.iter().map(|i| i.text.clone()).collect::<Vec<_>>();
+
+        let mut manual = base.clone();
+        SortMode::Manual.apply(&mut manual);
+        assert_eq!(texts(&manual), ["banana", "apple", "Cherry"]);
+
+        let mut newest = base.clone();
+        SortMode::Newest.apply(&mut newest);
+        assert_eq!(texts(&newest), ["banana", "Cherry", "apple"]);
+
+        let mut oldest = base.clone();
+        SortMode::Oldest.apply(&mut oldest);
+        assert_eq!(texts(&oldest), ["apple", "Cherry", "banana"]);
+
+        // Case-insensitive alphabetical order.
+        let mut az = base.clone();
+        SortMode::Az.apply(&mut az);
+        assert_eq!(texts(&az), ["apple", "banana", "Cherry"]);
+
+        let mut za = base;
+        SortMode::Za.apply(&mut za);
+        assert_eq!(texts(&za), ["Cherry", "banana", "apple"]);
+    }
+
+    #[test]
+    fn test_sort_mode_serde_roundtrip() {
+        assert_eq!(serde_json::to_string(&SortMode::Az).unwrap(), "\"az\"");
+        assert_eq!(
+            serde_json::to_string(&SortMode::Newest).unwrap(),
+            "\"newest\""
+        );
+        let parsed: SortMode = serde_json::from_str("\"za\"").unwrap();
+        assert_eq!(parsed, SortMode::Za);
     }
 }

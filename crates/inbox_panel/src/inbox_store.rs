@@ -6,7 +6,7 @@ use project::{Project, WorktreeId};
 use util::rel_path::RelPath;
 
 use crate::inbox_model::{
-    InboxFile, InboxItem, InboxType, ItemId, TYPE_COLOR_TOKENS, new_item_id, now_unix,
+    InboxFile, InboxItem, InboxType, ItemId, SortMode, TYPE_COLOR_TOKENS, new_item_id, now_unix,
 };
 
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(250);
@@ -287,6 +287,31 @@ impl InboxStore {
         &self.state.types
     }
 
+    /// Current ordering of open items.
+    pub fn sort_mode(&self) -> SortMode {
+        self.state.sort
+    }
+
+    /// Whether the meta field with the given key is hidden on item rows.
+    pub fn is_field_hidden(&self, key: &str) -> bool {
+        self.state.hidden_fields.iter().any(|hidden| hidden == key)
+    }
+
+    /// Shows/hides the meta field with the given key on item rows.
+    pub fn toggle_field(&mut self, key: &str, cx: &mut Context<Self>) {
+        if let Some(index) = self
+            .state
+            .hidden_fields
+            .iter()
+            .position(|hidden| hidden == key)
+        {
+            self.state.hidden_fields.remove(index);
+        } else {
+            self.state.hidden_fields.push(key.to_string());
+        }
+        self.on_mutated(cx);
+    }
+
     /// Resolves the type of an item. Returns `None` when the item has no
     /// kind, or when its kind matches no existing type.
     pub fn resolve_kind(&self, item: &InboxItem) -> Option<&InboxType> {
@@ -363,6 +388,84 @@ impl InboxStore {
 
     pub fn set_kind(&mut self, id: &ItemId, kind: Option<String>, cx: &mut Context<Self>) {
         self.update_item(id, cx, |item| item.kind = kind);
+    }
+
+    /// Sets how open items are ordered.
+    pub fn set_sort(&mut self, mode: SortMode, cx: &mut Context<Self>) {
+        if self.state.sort != mode {
+            self.state.sort = mode;
+            self.on_mutated(cx);
+        }
+    }
+
+    /// Moves the item `id` to just before `target_id` in manual order. No-op if
+    /// either id is missing, they are equal, or the order would not change.
+    pub fn move_item_before(&mut self, id: &ItemId, target_id: &ItemId, cx: &mut Context<Self>) {
+        if id == target_id {
+            return;
+        }
+        let before: Vec<ItemId> = self
+            .state
+            .inbox
+            .iter()
+            .map(|item| item.id.clone())
+            .collect();
+        let Some(from) = self.state.inbox.iter().position(|item| &item.id == id) else {
+            return;
+        };
+        let item = self.state.inbox.remove(from);
+        let insert_at = self
+            .state
+            .inbox
+            .iter()
+            .position(|item| &item.id == target_id)
+            .unwrap_or_else(|| from.min(self.state.inbox.len()));
+        self.state.inbox.insert(insert_at, item);
+        let after: Vec<ItemId> = self
+            .state
+            .inbox
+            .iter()
+            .map(|item| item.id.clone())
+            .collect();
+        if before != after {
+            self.on_mutated(cx);
+        }
+    }
+
+    /// Reorders the lists alphabetically by label (case-insensitive).
+    pub fn sort_types_alpha(&mut self, cx: &mut Context<Self>) {
+        let before: Vec<String> = self.state.types.iter().map(|t| t.key.clone()).collect();
+        self.state
+            .types
+            .sort_by_key(|inbox_type| inbox_type.label.to_lowercase());
+        let after: Vec<String> = self.state.types.iter().map(|t| t.key.clone()).collect();
+        if before != after {
+            self.on_mutated(cx);
+        }
+    }
+
+    /// Moves the list `key` to just before `target_key`. No-op if either key is
+    /// missing, they are equal, or the order would not change.
+    pub fn move_type_before(&mut self, key: &str, target_key: &str, cx: &mut Context<Self>) {
+        if key == target_key {
+            return;
+        }
+        let before: Vec<String> = self.state.types.iter().map(|t| t.key.clone()).collect();
+        let Some(from) = self.state.types.iter().position(|t| t.key == key) else {
+            return;
+        };
+        let inbox_type = self.state.types.remove(from);
+        let insert_at = self
+            .state
+            .types
+            .iter()
+            .position(|t| t.key == target_key)
+            .unwrap_or_else(|| from.min(self.state.types.len()));
+        self.state.types.insert(insert_at, inbox_type);
+        let after: Vec<String> = self.state.types.iter().map(|t| t.key.clone()).collect();
+        if before != after {
+            self.on_mutated(cx);
+        }
     }
 
     pub fn set_text(&mut self, id: &ItemId, text: String, cx: &mut Context<Self>) {
@@ -822,6 +925,100 @@ mod tests {
         assert_eq!(parsed.types.len(), 1);
         assert_eq!(parsed.types[0].key, key);
         assert_eq!(parsed.types[0].label, "TODO");
+    }
+
+    #[gpui::test]
+    async fn test_sort_mutations(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({})).await;
+        let (_project, store) = build_store(fs.clone(), cx).await;
+
+        // Default sort is Manual.
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.sort_mode(), SortMode::Manual)
+        });
+
+        store.update(cx, |store, cx| {
+            store.set_sort(SortMode::Az, cx);
+            assert_eq!(store.sort_mode(), SortMode::Az);
+        });
+
+        // Sorting lists alphabetically reorders types by label (case-insensitive).
+        let (key_banana, key_apple) = store.update(cx, |store, cx| {
+            let key_banana = store.add_type(cx);
+            store.rename_type(&key_banana, "Banana".to_string(), cx);
+            let key_apple = store.add_type(cx);
+            store.rename_type(&key_apple, "apple".to_string(), cx);
+            (key_banana, key_apple)
+        });
+        store.update(cx, |store, cx| {
+            store.sort_types_alpha(cx);
+            let labels: Vec<_> = store.types().iter().map(|t| t.label.clone()).collect();
+            assert_eq!(labels, ["apple", "Banana"]);
+            assert_eq!(store.types()[0].key, key_apple);
+            assert_eq!(store.types()[1].key, key_banana);
+        });
+
+        // Field visibility toggles are additive and reversible; unknown fields
+        // default to visible.
+        store.update(cx, |store, cx| {
+            assert!(!store.is_field_hidden("age"));
+            store.toggle_field("age", cx);
+            assert!(store.is_field_hidden("age"));
+            store.toggle_field("age", cx);
+            assert!(!store.is_field_hidden("age"));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_reorder_mutations(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({})).await;
+        let (_project, store) = build_store(fs.clone(), cx).await;
+
+        // Capture inserts at the top, so the order becomes c, b, a.
+        let (item_a, _item_b, item_c) = store.update(cx, |store, cx| {
+            let a = store.capture("a".to_string(), None, None, cx);
+            let b = store.capture("b".to_string(), None, None, cx);
+            let c = store.capture("c".to_string(), None, None, cx);
+            (a, b, c)
+        });
+        let texts = |store: &InboxStore| {
+            store
+                .items()
+                .iter()
+                .map(|item| item.text.clone())
+                .collect::<Vec<_>>()
+        };
+        store.read_with(cx, |store, _| assert_eq!(texts(store), ["c", "b", "a"]));
+
+        // Move `a` to just before `c`: a, c, b.
+        store.update(cx, |store, cx| store.move_item_before(&item_a, &item_c, cx));
+        store.read_with(cx, |store, _| assert_eq!(texts(store), ["a", "c", "b"]));
+
+        // Moving onto itself is a no-op.
+        store.update(cx, |store, cx| store.move_item_before(&item_a, &item_a, cx));
+        store.read_with(cx, |store, _| assert_eq!(texts(store), ["a", "c", "b"]));
+
+        // Lists: order one, two, three; move three before one -> three, one, two.
+        let (key_one, _key_two, key_three) = store.update(cx, |store, cx| {
+            let one = store.add_type(cx);
+            store.rename_type(&one, "one".to_string(), cx);
+            let two = store.add_type(cx);
+            store.rename_type(&two, "two".to_string(), cx);
+            let three = store.add_type(cx);
+            store.rename_type(&three, "three".to_string(), cx);
+            (one, two, three)
+        });
+        store.update(cx, |store, cx| {
+            store.move_type_before(&key_three, &key_one, cx)
+        });
+        store.read_with(cx, |store, _| {
+            let labels: Vec<_> = store.types().iter().map(|t| t.label.clone()).collect();
+            assert_eq!(labels, ["three", "one", "two"]);
+        });
     }
 
     #[gpui::test]

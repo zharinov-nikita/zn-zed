@@ -32,7 +32,8 @@ use workspace::{
 };
 
 use crate::inbox_model::{
-    InboxItem, ItemId, format_age, now_unix, parse_context, subtask_counts, type_color,
+    InboxItem, ItemId, MetaField, SortMode, format_age, now_unix, parse_context, subtask_counts,
+    type_color,
 };
 use crate::inbox_panel_settings::{DockSide, InboxPanelSettings, Settings};
 use crate::type_editor::TypeEditorState;
@@ -400,6 +401,8 @@ impl InboxPanel {
             .child(
                 h_flex()
                     .gap_1()
+                    .child(self.render_fields_menu(cx))
+                    .child(self.render_sort_menu(cx))
                     // Collapse/expand every list group at once. Only meaningful
                     // in the "By list" view, where groups exist.
                     .when(self.view_mode == ViewMode::Grouped, |this| {
@@ -413,30 +416,30 @@ impl InboxPanel {
                                     IconName::ListCollapse
                                 },
                             )
-                                .icon_size(IconSize::Small)
-                                .icon_color(Color::Muted)
-                                .tooltip(Tooltip::text(if any_collapsed {
-                                    "Expand all lists"
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text(if any_collapsed {
+                                "Expand all lists"
+                            } else {
+                                "Collapse all lists"
+                            }))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if this.collapsed_groups.is_empty() {
+                                    let keys: Vec<String> = this
+                                        .store
+                                        .read(cx)
+                                        .types()
+                                        .iter()
+                                        .map(|inbox_type| inbox_type.key.clone())
+                                        .collect();
+                                    this.collapsed_groups.extend(keys);
+                                    this.collapsed_groups
+                                        .insert(Self::UNASSIGNED_GROUP_KEY.to_string());
                                 } else {
-                                    "Collapse all lists"
-                                }))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if this.collapsed_groups.is_empty() {
-                                        let keys: Vec<String> = this
-                                            .store
-                                            .read(cx)
-                                            .types()
-                                            .iter()
-                                            .map(|inbox_type| inbox_type.key.clone())
-                                            .collect();
-                                        this.collapsed_groups.extend(keys);
-                                        this.collapsed_groups
-                                            .insert(Self::UNASSIGNED_GROUP_KEY.to_string());
-                                    } else {
-                                        this.collapsed_groups.clear();
-                                    }
-                                    cx.notify();
-                                })),
+                                    this.collapsed_groups.clear();
+                                }
+                                cx.notify();
+                            })),
                         )
                     })
                     .child(
@@ -467,6 +470,122 @@ impl InboxPanel {
                             })),
                     ),
             )
+    }
+
+    /// The "Fields" dropdown: toggles which meta fields show on item rows.
+    /// Iterating [`MetaField::ALL`] keeps it generic — a new field appears here
+    /// automatically and is hideable without touching this menu.
+    fn render_fields_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let any_hidden = {
+            let store = self.store.read(cx);
+            MetaField::ALL
+                .iter()
+                .any(|field| store.is_field_hidden(field.key()))
+        };
+        let panel = cx.entity().downgrade();
+        PopoverMenu::new("inbox-fields-menu")
+            .trigger(
+                IconButton::new("inbox-fields", IconName::Filter)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .toggle_state(any_hidden)
+                    .tooltip(Tooltip::text("Fields")),
+            )
+            .menu(move |window, cx| {
+                let panel = panel.clone();
+                // A persistent menu stays open on click and rebuilds itself, so
+                // several fields can be toggled without reopening it. Each row's
+                // eye icon reflects visibility.
+                Some(ContextMenu::build_persistent(
+                    window,
+                    cx,
+                    move |mut menu, _, cx| {
+                        menu = menu.header("Fields");
+                        for field in MetaField::ALL {
+                            let hidden = panel
+                                .upgrade()
+                                .is_some_and(|panel| panel.read(cx).is_field_hidden(field, cx));
+                            let panel = panel.clone();
+                            menu = menu.item(
+                                ContextMenuEntry::new(field.label())
+                                    .icon(if hidden {
+                                        IconName::EyeOff
+                                    } else {
+                                        IconName::Eye
+                                    })
+                                    .icon_color(if hidden { Color::Muted } else { Color::Default })
+                                    .handler(move |_, cx| {
+                                        panel
+                                            .update(cx, |this, cx| {
+                                                this.store.update(cx, |store, cx| {
+                                                    store.toggle_field(field.key(), cx)
+                                                });
+                                            })
+                                            .ok();
+                                    }),
+                            );
+                        }
+                        menu
+                    },
+                ))
+            })
+    }
+
+    /// Whether a meta field is hidden. Small helper so menus can read it
+    /// without reaching through `store`.
+    fn is_field_hidden(&self, field: MetaField, cx: &App) -> bool {
+        self.store.read(cx).is_field_hidden(field.key())
+    }
+
+    /// The "Sort by" dropdown: picks how open items are ordered.
+    fn render_sort_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = self.store.read(cx).sort_mode();
+        let panel = cx.entity().downgrade();
+        PopoverMenu::new("inbox-sort-menu")
+            .trigger(
+                ButtonLike::new("inbox-sort")
+                    .size(ButtonSize::None)
+                    .tooltip(Tooltip::text("Sort"))
+                    .child(
+                        h_flex()
+                            .px_1()
+                            .py_0p5()
+                            .gap_0p5()
+                            .child(
+                                Icon::new(IconName::ArrowDown10)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                Label::new(current.label())
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
+                    ),
+            )
+            .menu(move |window, cx| {
+                let panel = panel.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    menu = menu.header("Sort by");
+                    for mode in SortMode::ALL {
+                        let panel = panel.clone();
+                        menu = menu.toggleable_entry(
+                            mode.label(),
+                            current == mode,
+                            IconPosition::End,
+                            None,
+                            move |_, cx| {
+                                panel
+                                    .update(cx, |this, cx| {
+                                        this.store.update(cx, |store, cx| store.set_sort(mode, cx));
+                                    })
+                                    .ok();
+                            },
+                        );
+                    }
+                    menu
+                }))
+            })
     }
 
     fn render_error_banner(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -858,8 +977,19 @@ impl InboxPanel {
             Label::new(item.text.clone()).size(LabelSize::Large)
         };
 
+        // Per-field visibility, toggled from the header "Fields" menu.
+        let (hide_list, hide_age, hide_subtasks, hide_context) = {
+            let store = self.store.read(cx);
+            (
+                store.is_field_hidden(MetaField::List.key()),
+                store.is_field_hidden(MetaField::Age.key()),
+                store.is_field_hidden(MetaField::Subtasks.key()),
+                store.is_field_hidden(MetaField::Context.key()),
+            )
+        };
+
         let mut meta = h_flex().flex_wrap().items_center().gap_2();
-        if let Some((type_label, type_chip_color)) = type_chip {
+        if let Some((type_label, type_chip_color)) = type_chip.filter(|_| !hide_list) {
             meta = meta.child(self.render_item_type_menu(
                 item.id.clone(),
                 type_label,
@@ -867,7 +997,7 @@ impl InboxPanel {
                 cx,
             ));
         }
-        if let Some(created) = item.created {
+        if let Some(created) = item.created.filter(|_| !hide_age) {
             meta = meta.child(
                 div()
                     .text_xs()
@@ -876,7 +1006,12 @@ impl InboxPanel {
                     .child(format_age(created, now)),
             );
         }
-        if let Some((done, total)) = item.body.as_deref().and_then(subtask_counts) {
+        if let Some((done, total)) = item
+            .body
+            .as_deref()
+            .and_then(subtask_counts)
+            .filter(|_| !hide_subtasks)
+        {
             meta = meta.child(
                 h_flex()
                     .gap_0p5()
@@ -892,7 +1027,7 @@ impl InboxPanel {
                     ),
             );
         }
-        if let Some(from) = item.from.clone() {
+        if let Some(from) = item.from.clone().filter(|_| !hide_context) {
             meta = meta.child(
                 h_flex()
                     .id(SharedString::from(format!("inbox-item-from-{}", item.id)))
@@ -928,6 +1063,9 @@ impl InboxPanel {
                 cx.notify();
             }));
 
+        // Item-to-item drag reorder only makes sense in manual order; the other
+        // sort modes compute the order, so a manual drop would not stick.
+        let reorderable = row == ItemRow::Open && self.store.read(cx).sort_mode().is_manual();
         h_flex()
             .id(SharedString::from(format!("inbox-item-{}", item.id)))
             .group("inbox-item")
@@ -951,6 +1089,33 @@ impl InboxPanel {
                         })
                     },
                 )
+            })
+            .when(reorderable, |this| {
+                this.drag_over::<DraggedInboxItem>(|style, _, _, cx| {
+                    style.bg(cx.theme().colors().drop_target_background)
+                })
+                .on_drop(cx.listener({
+                    let target_id = item.id.clone();
+                    move |this, drag: &DraggedInboxItem, _, cx| {
+                        if drag.id == target_id {
+                            return;
+                        }
+                        this.store.update(cx, |store, cx| {
+                            // Dropping onto an item in another list also moves
+                            // the dragged item into that list.
+                            let target_kind = store
+                                .item(&target_id)
+                                .and_then(|item| store.resolve_kind(item).map(|t| t.key.clone()));
+                            let drag_kind = store
+                                .item(&drag.id)
+                                .and_then(|item| store.resolve_kind(item).map(|t| t.key.clone()));
+                            if target_kind != drag_kind {
+                                store.set_kind(&drag.id, target_kind, cx);
+                            }
+                            store.move_item_before(&drag.id, &target_id, cx);
+                        });
+                    }
+                }))
             })
             .child(div().flex_none().child(checkbox))
             .child(
@@ -1261,15 +1426,18 @@ impl InboxPanel {
     }
 
     fn render_list(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (open, cleared, archived) = {
+        let (mut open, cleared, archived, sort_mode) = {
             let store = self.store.read(cx);
             let (cleared, open): (Vec<_>, Vec<_>) = store
                 .items()
                 .iter()
                 .cloned()
                 .partition(InboxItem::is_cleared);
-            (open, cleared, store.archived().to_vec())
+            (open, cleared, store.archived().to_vec(), store.sort_mode())
         };
+        // Sorting the flat list also orders items within each "By list" group,
+        // since the groups keep the flat order.
+        sort_mode.apply(&mut open);
         let archive_count = cleared.len() + archived.len();
         let now = now_unix();
 

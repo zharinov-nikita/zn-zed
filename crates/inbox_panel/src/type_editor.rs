@@ -4,12 +4,35 @@
 use std::collections::HashMap;
 
 use editor::{Editor, EditorEvent};
-use gpui::{AnyElement, Context, Entity, FontWeight, Subscription, Window};
+use gpui::{AnyElement, Context, Entity, FontWeight, Hsla, Render, Subscription, Window};
 use ui::{Tab, TintColor, Tooltip, prelude::*};
 
 use crate::InboxPanel;
 use crate::inbox_model::type_color;
 use crate::inbox_store::InboxStore;
+
+/// Drag payload and ghost view for reordering lists in the type editor.
+#[derive(Clone)]
+struct DraggedInboxType {
+    key: String,
+    label: SharedString,
+    color: Hsla,
+}
+
+impl Render for DraggedInboxType {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .gap_1()
+            .px_2()
+            .py_0p5()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .bg(cx.theme().colors().element_selected)
+            .child(div().flex_none().size(px(7.)).rounded_xs().bg(self.color))
+            .child(Label::new(self.label.clone()).size(LabelSize::Small))
+    }
+}
 
 /// Editor state of the type editor overlay: one single-line rename editor per
 /// type, keyed by the type key. Created when the overlay opens and dropped
@@ -133,6 +156,7 @@ impl InboxPanel {
         color: gpui::Hsla,
         editor: Entity<Editor>,
         confirming_delete: bool,
+        reorderable: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let trailing: AnyElement = if confirming_delete {
@@ -204,10 +228,51 @@ impl InboxPanel {
             .into_any_element()
         };
 
+        let label = SharedString::from(editor.read(cx).text(cx));
         h_flex()
+            .id(SharedString::from(format!("inbox-type-row-{key}")))
             .gap_2()
             .px_1()
             .py_0p5()
+            .when(reorderable, |this| {
+                this.drag_over::<DraggedInboxType>(|style, _, _, cx| {
+                    style.bg(cx.theme().colors().drop_target_background)
+                })
+                .on_drop(cx.listener({
+                    let target_key = key.to_string();
+                    move |this, drag: &DraggedInboxType, window, cx| {
+                        let store = this.store.clone();
+                        store.update(cx, |store, cx| {
+                            store.move_type_before(&drag.key, &target_key, cx)
+                        });
+                        if let Some(state) = this.type_editor.as_mut() {
+                            state.sync(&store, window, cx);
+                        }
+                        cx.notify();
+                    }
+                }))
+            })
+            .when(reorderable, |this| {
+                this.child(
+                    div()
+                        .id(SharedString::from(format!("inbox-type-grip-{key}")))
+                        .flex_none()
+                        .cursor_pointer()
+                        .on_drag(
+                            DraggedInboxType {
+                                key: key.to_string(),
+                                label: label.clone(),
+                                color,
+                            },
+                            |drag, _offset, _window, cx| cx.new(|_| drag.clone()),
+                        )
+                        .child(
+                            Icon::new(IconName::Menu)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                )
+            })
             .child(
                 div()
                     .id(SharedString::from(format!("inbox-type-swatch-{key}")))
@@ -274,13 +339,15 @@ impl InboxPanel {
                     .child(Label::new("Lists").weight(FontWeight::MEDIUM)),
             );
 
+        // Reordering by drag only makes sense with more than one list.
+        let reorderable = types.len() >= 2;
         let type_rows: Vec<AnyElement> = types
             .iter()
             .filter_map(|(key, color)| {
                 let editor = state.editor(key)?.clone();
                 let confirming_delete = state.confirming_delete.as_deref() == Some(key.as_str());
                 Some(
-                    self.render_type_row(key, *color, editor, confirming_delete, cx)
+                    self.render_type_row(key, *color, editor, confirming_delete, reorderable, cx)
                         .into_any_element(),
                 )
             })
@@ -302,7 +369,30 @@ impl InboxPanel {
                     .border_t_1()
                     .border_color(cx.theme().colors().border_variant),
             )
-            .child(div().px_1().child(section_label("YOUR LISTS")))
+            .child(
+                h_flex()
+                    .px_1()
+                    .items_center()
+                    .justify_between()
+                    .child(section_label("YOUR LISTS"))
+                    .when(types.len() >= 2, |this| {
+                        this.child(
+                            Button::new("inbox-sort-lists", "Sort A–Z")
+                                .style(ButtonStyle::Subtle)
+                                .size(ButtonSize::Compact)
+                                .label_size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    let store = this.store.clone();
+                                    store.update(cx, |store, cx| store.sort_types_alpha(cx));
+                                    if let Some(state) = this.type_editor.as_mut() {
+                                        state.sync(&store, window, cx);
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            )
             .children(type_rows)
             .child(
                 h_flex()

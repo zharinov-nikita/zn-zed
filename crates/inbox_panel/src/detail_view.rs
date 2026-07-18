@@ -19,7 +19,10 @@ use gpui::{
 use markdown::{Markdown, MarkdownElement, MarkdownStyle};
 use settings::Settings as _;
 use theme_settings::ThemeSettings;
-use ui::{Checkbox, ContextMenu, ContextMenuEntry, Divider, Tab, ToggleState, Tooltip, prelude::*};
+use ui::{
+    Checkbox, ContextMenu, ContextMenuEntry, Divider, Tab, TintColor, ToggleState, Tooltip,
+    prelude::*,
+};
 use workspace::Workspace;
 
 use crate::block::{Block, BlockDocument, BlockId, BlockType, CaretPos, EditTarget};
@@ -63,6 +66,8 @@ pub struct InboxDetailView {
     block_bounds: Rc<RefCell<HashMap<BlockId, Bounds<Pixels>>>>,
     /// The open grip (block actions) context menu.
     grip_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
+    /// Window position of the delete-confirmation popover while it is open.
+    confirming_delete: Option<Point<Pixels>>,
     scroll_handle: ScrollHandle,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
@@ -105,6 +110,7 @@ impl InboxDetailView {
             slash_menu: None,
             block_bounds: Rc::default(),
             grip_menu: None,
+            confirming_delete: None,
             scroll_handle: ScrollHandle::new(),
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
@@ -982,12 +988,11 @@ impl InboxDetailView {
                     .icon_size(IconSize::Small)
                     .icon_color(Color::Muted)
                     .tooltip(Tooltip::text("Delete item"))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        let item_id = this.item_id.clone();
-                        // The store emits `ItemDeleted`, which closes this
-                        // view; no extra confirmation here, as in the design.
-                        this.store
-                            .update(cx, |store, cx| store.delete_item(&item_id, cx));
+                    .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                        // Ask for confirmation first, matching the item rows in
+                        // the list; the actual delete happens from the popover.
+                        this.confirming_delete = Some(event.position());
+                        cx.notify();
                     })),
             )
     }
@@ -1441,6 +1446,59 @@ impl InboxDetailView {
             .into_any_element(),
         )
     }
+
+    /// The delete-confirmation popover, anchored where the trash button was
+    /// clicked. Mirrors the item rows' confirmation in the list panel.
+    fn render_delete_confirmation(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let position = self.confirming_delete?;
+        Some(
+            deferred(
+                anchored()
+                    .position(position)
+                    .anchor(gpui::Anchor::TopRight)
+                    .child(
+                        v_flex()
+                            .occlude()
+                            .elevation_2(cx)
+                            .p_2()
+                            .gap_2()
+                            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                this.confirming_delete = None;
+                                cx.notify();
+                            }))
+                            .child(Label::new("Delete item?"))
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .justify_end()
+                                    .child(
+                                        Button::new("inbox-detail-delete-cancel", "Cancel")
+                                            .style(ButtonStyle::Subtle)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.confirming_delete = None;
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("inbox-detail-delete-confirm", "Delete")
+                                            .style(ButtonStyle::Tinted(TintColor::Error))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.confirming_delete = None;
+                                                let item_id = this.item_id.clone();
+                                                // The store emits `ItemDeleted`,
+                                                // which closes this view.
+                                                this.store.update(cx, |store, cx| {
+                                                    store.delete_item(&item_id, cx)
+                                                });
+                                            })),
+                                    ),
+                            ),
+                    ),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
+    }
 }
 
 impl Focusable for InboxDetailView {
@@ -1478,6 +1536,7 @@ impl Render for InboxDetailView {
                 )
                 .with_priority(1)
             }))
+            .children(self.render_delete_confirmation(cx))
     }
 }
 
