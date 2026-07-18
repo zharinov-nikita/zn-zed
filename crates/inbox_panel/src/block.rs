@@ -373,7 +373,9 @@ impl BlockDocument {
         }
     }
 
-    /// Inserts a new empty `Paragraph` right after block `id`.
+    /// Inserts a new empty `Paragraph` right after block `id`. If `id` is
+    /// not in the document (e.g. the block was removed by a concurrent
+    /// operation), the paragraph is appended at the end instead.
     pub fn insert_after(&mut self, id: BlockId) -> EditTarget {
         let index = self
             .index_of(id)

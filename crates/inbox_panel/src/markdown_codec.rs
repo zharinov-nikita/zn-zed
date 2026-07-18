@@ -18,7 +18,7 @@ pub fn parse_blocks(src: &str, next_id: &mut u64) -> Vec<Block> {
     };
 
     let mut blocks = Vec::new();
-    let mut lines = src.lines().peekable();
+    let mut lines = src.lines();
 
     while let Some(line) = lines.next() {
         if let Some(rest) = line.strip_prefix("```") {

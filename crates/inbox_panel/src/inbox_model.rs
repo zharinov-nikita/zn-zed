@@ -57,6 +57,10 @@ pub struct InboxFile {
 /// A single captured inbox entry.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct InboxItem {
+    /// Note: an entry stored without an id gets a *freshly generated* one
+    /// every time the file is loaded, so its id is not stable across
+    /// reloads until the file is written back (which persists the
+    /// generated id).
     #[serde(default = "new_item_id")]
     pub id: ItemId,
     pub text: String,
