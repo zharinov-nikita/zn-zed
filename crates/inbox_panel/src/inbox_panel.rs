@@ -59,6 +59,7 @@ enum ViewMode {
 struct DraggedInboxItem {
     id: ItemId,
     text: SharedString,
+    click_offset: Point<Pixels>,
 }
 
 impl Render for DraggedInboxItem {
@@ -66,6 +67,8 @@ impl Render for DraggedInboxItem {
         let ui_font = ThemeSettings::get_global(cx).ui_font.clone();
         h_flex()
             .font(ui_font)
+            .pl(self.click_offset.x + px(12.))
+            .pt(self.click_offset.y + px(12.))
             .px_2()
             .py_1()
             .max_w(px(240.))
@@ -571,8 +574,14 @@ impl InboxPanel {
                     DraggedInboxItem {
                         id: item.id.clone(),
                         text: SharedString::from(item.text.clone()),
+                        click_offset: Point::default(),
                     },
-                    |drag, _click_offset, _window, cx| cx.new(|_| drag.clone()),
+                    |drag, click_offset, _window, cx| {
+                        cx.new(|_| DraggedInboxItem {
+                            click_offset,
+                            ..drag.clone()
+                        })
+                    },
                 )
             })
             .child(div().flex_none().child(checkbox))
