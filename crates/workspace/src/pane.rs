@@ -528,6 +528,19 @@ pub struct DraggedTab {
     pub is_active: bool,
 }
 
+/// A snippet of text dragged out of a panel row so it can be dropped into a
+/// text input (e.g. the agent panel's message editor). `id` identifies the
+/// source row, letting the originating panel also accept the drag for its own
+/// purposes — such as reordering — the way `project_panel` reuses
+/// [`DraggedSelection`].
+#[derive(Clone)]
+pub struct DraggedText {
+    /// Stable id of the source row. Opaque to consumers other than the origin.
+    pub id: gpui::SharedString,
+    /// The text to insert where the drag is dropped.
+    pub text: gpui::SharedString,
+}
+
 impl EventEmitter<Event> for Pane {}
 
 pub enum Side {

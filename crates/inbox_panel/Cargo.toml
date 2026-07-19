@@ -13,6 +13,7 @@ path = "src/inbox_panel.rs"
 doctest = false
 
 [dependencies]
+agent_ui.workspace = true
 anyhow.workspace = true
 editor.workspace = true
 fs.workspace = true
@@ -30,6 +31,7 @@ serde_json.workspace = true
 settings.workspace = true
 sha2.workspace = true
 text.workspace = true
+time.workspace = true
 theme_settings.workspace = true
 ui.workspace = true
 util.workspace = true
@@ -41,6 +43,10 @@ fs = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 pretty_assertions.workspace = true
 project = { workspace = true, features = ["test-support"] }
+# agent_ui pulls in remote_connection; project/workspace dev-deps enable
+# `remote/test-support` (exposing the Mock variant), so pair it with
+# remote_connection's own test-support to keep its match exhaustive.
+remote_connection = { workspace = true, features = ["test-support"] }
 settings = { workspace = true, features = ["test-support"] }
 theme.workspace = true
 workspace = { workspace = true, features = ["test-support"] }

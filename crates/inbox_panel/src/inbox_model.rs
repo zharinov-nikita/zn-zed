@@ -350,6 +350,72 @@ pub fn parse_context(from: &str) -> Option<(String, Option<u32>)> {
     Some((from.to_string(), None))
 }
 
+/// Formats a unix-seconds timestamp as an ISO date (`YYYY-MM-DD`, UTC).
+/// Returns `None` for a timestamp outside the representable range.
+fn format_date(unix_secs: i64) -> Option<String> {
+    time::OffsetDateTime::from_unix_timestamp(unix_secs)
+        .ok()
+        .map(|datetime| datetime.date().to_string())
+}
+
+/// Renders an item as a standalone Markdown document: a title heading, a
+/// metadata line, the body, and an attachments list. Empty parts are omitted.
+/// `type_label` is the resolved list label (the caller looks it up via the
+/// store, so this function stays free of theme/store dependencies).
+pub fn item_to_markdown(item: &InboxItem, type_label: Option<&str>) -> String {
+    let mut out = String::new();
+
+    let title = item.text.trim();
+    out.push_str("# ");
+    out.push_str(if title.is_empty() { "(untitled)" } else { title });
+
+    // Metadata line: only the fields that are present.
+    let mut meta = Vec::new();
+    if let Some(label) = type_label {
+        meta.push(format!("**Type:** {label}"));
+    }
+    if let Some(created) = item.created
+        && let Some(date) = format_date(created)
+    {
+        meta.push(format!("**Created:** {date}"));
+    }
+    if let Some(from) = item
+        .from
+        .as_deref()
+        .map(str::trim)
+        .filter(|from| !from.is_empty())
+    {
+        meta.push(format!("**From:** {from}"));
+    }
+    if !meta.is_empty() {
+        out.push_str("\n\n");
+        out.push_str(&meta.join(" · "));
+    }
+
+    if let Some(body) = item
+        .body
+        .as_deref()
+        .map(str::trim)
+        .filter(|body| !body.is_empty())
+    {
+        out.push_str("\n\n");
+        out.push_str(body);
+    }
+
+    if !item.attachments.is_empty() {
+        out.push_str("\n\n**Attachments:**\n");
+        let attachments = item
+            .attachments
+            .iter()
+            .map(|attachment| format!("- {} — {}", attachment.display_name(), attachment.path()))
+            .collect::<Vec<_>>();
+        out.push_str(&attachments.join("\n"));
+    }
+
+    out.push('\n');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,6 +445,64 @@ mod tests {
         assert!(!item.is_cleared());
         item.cleared = Some(1);
         assert!(item.is_cleared());
+    }
+
+    fn sample_item() -> InboxItem {
+        InboxItem {
+            id: "id".into(),
+            text: "Ship the release".into(),
+            kind: Some("task".into()),
+            from: None,
+            body: None,
+            attachments: Vec::new(),
+            created: None,
+            cleared: None,
+        }
+    }
+
+    #[test]
+    fn test_item_to_markdown_title_only() {
+        let item = sample_item();
+        assert_eq!(item_to_markdown(&item, None), "# Ship the release\n");
+    }
+
+    #[test]
+    fn test_item_to_markdown_empty_title_falls_back() {
+        let mut item = sample_item();
+        item.text = "   ".into();
+        assert_eq!(item_to_markdown(&item, None), "# (untitled)\n");
+    }
+
+    #[test]
+    fn test_item_to_markdown_full() {
+        let mut item = sample_item();
+        item.from = Some("src/editor.rs:1240".into());
+        item.body = Some("- [x] done\n- [ ] todo".into());
+        item.created = Some(0); // 1970-01-01
+        item.attachments = vec![
+            AttachmentRef::Project {
+                path: "src/main.rs".into(),
+            },
+            AttachmentRef::External {
+                path: "/tmp/note.txt".into(),
+            },
+        ];
+        let expected = "# Ship the release\n\n\
+             **Type:** Task · **Created:** 1970-01-01 · **From:** src/editor.rs:1240\n\n\
+             - [x] done\n- [ ] todo\n\n\
+             **Attachments:**\n\
+             - main.rs — src/main.rs\n\
+             - note.txt — /tmp/note.txt\n";
+        assert_eq!(item_to_markdown(&item, Some("Task")), expected);
+    }
+
+    #[test]
+    fn test_item_to_markdown_omits_empty_body_and_meta() {
+        let mut item = sample_item();
+        item.body = Some("   \n\t".into());
+        item.from = Some("  ".into());
+        // No type label, blank body, blank from → title only.
+        assert_eq!(item_to_markdown(&item, None), "# Ship the release\n");
     }
 
     #[test]

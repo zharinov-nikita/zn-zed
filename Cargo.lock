@@ -9025,6 +9025,7 @@ checksum = "e7c5cedc30da3a610cac6b4ba17597bdf7152cf974e8aab3afb3d54455e371c8"
 name = "inbox_panel"
 version = "0.1.0"
 dependencies = [
+ "agent_ui",
  "anyhow",
  "editor",
  "fs",
@@ -9038,6 +9039,7 @@ dependencies = [
  "paths",
  "pretty_assertions",
  "project",
+ "remote_connection",
  "serde",
  "serde_json",
  "settings",
@@ -9045,6 +9047,7 @@ dependencies = [
  "text",
  "theme",
  "theme_settings",
+ "time",
  "ui",
  "util",
  "workspace",

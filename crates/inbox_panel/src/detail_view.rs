@@ -30,7 +30,10 @@ use crate::attachment::{AttachmentCompletionProvider, OnPick, attach_external_pa
 use crate::block::{Block, BlockDocument, BlockId, BlockType, CaretPos};
 use crate::inbox_model::{AttachmentRef, InboxItem, ItemId, format_age, now_unix};
 use crate::inbox_store::{InboxStore, InboxStoreEvent};
-use crate::{confirmation_popover, open_attachment, open_capture_context};
+use crate::{
+    confirmation_popover, copy_item_as_markdown, open_attachment, open_capture_context,
+    send_item_to_chat,
+};
 use crate::slash_menu::{self, SlashEntry, SlashMenuState};
 
 pub enum InboxDetailEvent {
@@ -1049,6 +1052,28 @@ impl InboxDetailView {
                     .icon_color(Color::Muted)
                     .tooltip(Tooltip::text("Attach file"))
                     .on_click(cx.listener(|this, _, window, cx| this.pick_attachment(window, cx))),
+            )
+            .child(
+                IconButton::new("inbox-detail-copy", IconName::Copy)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Copy as Markdown"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(item) = this.store.read(cx).item(&this.item_id).cloned() {
+                            copy_item_as_markdown(&this.workspace, &this.store, &item, cx);
+                        }
+                    })),
+            )
+            .child(
+                IconButton::new("inbox-detail-to-chat", IconName::Thread)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Send to AI Chat"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        if let Some(item) = this.store.read(cx).item(&this.item_id).cloned() {
+                            send_item_to_chat(&this.workspace, &this.store, &item, window, cx);
+                        }
+                    })),
             )
             .child(
                 IconButton::new("inbox-detail-delete", IconName::Trash)

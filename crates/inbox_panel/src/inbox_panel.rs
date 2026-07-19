@@ -12,20 +12,22 @@ pub use detail_view::{InboxDetailEvent, InboxDetailView};
 pub use inbox_store::{InboxStore, InboxStoreEvent};
 
 use std::{
-    collections::HashSet,
+    cell::RefCell,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
     time::Duration,
 };
 
+use agent_ui::AgentPanel;
 use editor::Editor;
 use fs::Fs;
 use gpui::{
-    Action, AnyElement, App, AppContext as _, AsyncWindowContext, ClickEvent, Context, Div,
-    ElementId, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, FontWeight, IntoElement,
-    ParentElement, Pixels, Point, Render, ScrollHandle, Stateful, Styled, Subscription, Task,
-    WeakEntity, Window, actions, anchored, deferred,
+    Action, AnyElement, App, AppContext as _, AsyncWindowContext, ClickEvent, ClipboardItem,
+    Context, Div, ElementId, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable,
+    FontWeight, IntoElement, ParentElement, Pixels, Point, Render, ScrollHandle, Stateful, Styled,
+    Subscription, Task, WeakEntity, Window, actions, anchored, deferred,
 };
 use theme_settings::ThemeSettings;
 use ui::{
@@ -34,14 +36,15 @@ use ui::{
     prelude::*,
 };
 use workspace::{
-    Workspace,
+    DraggedText, Toast, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
+    notifications::NotificationId,
 };
 
 use crate::attachment::{AttachmentCompletionProvider, AttachmentSet, OnPick, attach_external_paths};
 use crate::inbox_model::{
-    AttachmentRef, InboxItem, ItemId, MetaField, SortMode, format_age, now_unix, parse_context,
-    subtask_counts, type_color,
+    AttachmentRef, InboxItem, ItemId, MetaField, SortMode, format_age, item_to_markdown, now_unix,
+    parse_context, subtask_counts, type_color,
 };
 use crate::inbox_panel_settings::{DockSide, InboxPanelSettings, Settings};
 use crate::type_editor::TypeEditorState;
@@ -77,15 +80,16 @@ enum ViewMode {
 }
 
 /// Drag payload for moving an inbox item into another group. Doubles as the
-/// ghost view that follows the cursor while dragging.
+/// ghost view that follows the cursor while dragging. The drag payload itself
+/// is a shared [`DraggedText`] (so the agent panel can accept it); this struct
+/// only renders the floating preview.
 #[derive(Clone)]
-struct DraggedInboxItem {
-    id: ItemId,
+struct InboxItemGhost {
     text: SharedString,
     click_offset: Point<Pixels>,
 }
 
-impl Render for DraggedInboxItem {
+impl Render for InboxItemGhost {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui_font = ThemeSettings::get_global(cx).ui_font.clone();
         h_flex()
@@ -145,6 +149,9 @@ pub struct InboxPanel {
     /// Pending confirmation before removing a staged capture attachment.
     confirming_attachment_removal: Option<(AttachmentRef, Point<Pixels>)>,
     scroll_handle: ScrollHandle,
+    /// Per-item Markdown cache for the drag payload, so the eager `on_drag`
+    /// value isn't rebuilt on every panel render. Cleared on any store change.
+    markdown_cache: RefCell<HashMap<ItemId, SharedString>>,
     _age_refresh: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -239,6 +246,77 @@ pub(crate) fn open_attachment(
                 .detach_and_log_err(cx);
         }
     }
+}
+
+/// Renders an item as Markdown, resolving its list label through the store.
+/// Shared by the copy-to-clipboard and send-to-chat actions in both the list
+/// rows and the detail view.
+pub(crate) fn item_markdown(store: &Entity<InboxStore>, item: &InboxItem, cx: &App) -> String {
+    let label = store
+        .read(cx)
+        .resolve_kind(item)
+        .map(|kind| kind.label.clone());
+    item_to_markdown(item, label.as_deref())
+}
+
+/// Copies the item's Markdown to the clipboard and shows a confirmation toast.
+pub(crate) fn copy_item_as_markdown(
+    workspace: &WeakEntity<Workspace>,
+    store: &Entity<InboxStore>,
+    item: &InboxItem,
+    cx: &mut App,
+) {
+    let markdown = item_markdown(store, item, cx);
+    cx.write_to_clipboard(ClipboardItem::new_string(markdown));
+    show_inbox_toast(workspace, "inbox-copy-markdown", "Copied task as Markdown", cx);
+}
+
+/// Opens the Zed agent panel and drops the item's Markdown into the message
+/// editor as a draft. The item itself is left untouched.
+pub(crate) fn send_item_to_chat(
+    workspace: &WeakEntity<Workspace>,
+    store: &Entity<InboxStore>,
+    item: &InboxItem,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(workspace_entity) = workspace.upgrade() else {
+        return;
+    };
+    let markdown = item_markdown(store, item, cx);
+    let Some(panel) = workspace_entity.read(cx).panel::<AgentPanel>(cx) else {
+        show_inbox_toast(
+            workspace,
+            "inbox-agent-unavailable",
+            "The Zed agent panel is unavailable",
+            cx,
+        );
+        return;
+    };
+    workspace_entity.update(cx, |workspace, cx| {
+        workspace.focus_panel::<AgentPanel>(window, cx);
+    });
+    panel.update(cx, |panel, cx| {
+        panel.insert_prompt_text(markdown, window, cx);
+    });
+}
+
+/// Shows a short auto-hiding toast in the workspace.
+fn show_inbox_toast(
+    workspace: &WeakEntity<Workspace>,
+    id: &'static str,
+    message: &'static str,
+    cx: &mut App,
+) {
+    let Some(workspace) = workspace.upgrade() else {
+        return;
+    };
+    workspace.update(cx, |workspace, cx| {
+        workspace.show_toast(
+            Toast::new(NotificationId::named(id.into()), message).autohide(),
+            cx,
+        );
+    });
 }
 
 /// The shared visual for a file-attachment chip: a file icon and the display
@@ -449,6 +527,7 @@ impl InboxPanel {
                 confirming_delete: None,
                 confirming_attachment_removal: None,
                 scroll_handle: ScrollHandle::new(),
+                markdown_cache: RefCell::new(HashMap::new()),
                 _age_refresh: age_refresh,
                 _subscriptions: subscriptions,
             }
@@ -461,6 +540,9 @@ impl InboxPanel {
         event: &InboxStoreEvent,
         cx: &mut Context<Self>,
     ) {
+        // Any store change can affect an item's rendered Markdown (body, kind,
+        // type labels), so drop the drag cache wholesale.
+        self.markdown_cache.borrow_mut().clear();
         match event {
             InboxStoreEvent::ItemDeleted(id) => {
                 if self
@@ -1472,28 +1554,31 @@ impl InboxPanel {
             .rounded_md()
             .hover(|style| style.bg(cx.theme().colors().element_hover))
             .when(row == ItemRow::Open, |this| {
-                this.on_drag(
-                    DraggedInboxItem {
-                        id: item.id.clone(),
-                        text: SharedString::from(item.text.clone()),
-                        click_offset: Point::default(),
-                    },
-                    |drag, click_offset, _window, cx| {
-                        cx.new(|_| DraggedInboxItem {
-                            click_offset,
-                            ..drag.clone()
-                        })
-                    },
-                )
+                // The drag payload is a shared `DraggedText` carrying the item's
+                // Markdown, so it can be dropped onto the agent panel (send to
+                // chat) as well as onto other lists (reorder / move). The ghost
+                // preview shows just the title.
+                let title = SharedString::from(item.text.clone());
+                let payload = DraggedText {
+                    id: SharedString::from(item.id.to_string()),
+                    text: self.drag_markdown(item, cx),
+                };
+                this.on_drag(payload, move |_payload, click_offset, _window, cx| {
+                    cx.new(|_| InboxItemGhost {
+                        text: title.clone(),
+                        click_offset,
+                    })
+                })
             })
             .when(reorderable, |this| {
-                this.drag_over::<DraggedInboxItem>(|style, _, _, cx| {
+                this.drag_over::<DraggedText>(|style, _, _, cx| {
                     style.bg(cx.theme().colors().drop_target_background)
                 })
                 .on_drop(cx.listener({
                     let target_id = item.id.clone();
-                    move |this, drag: &DraggedInboxItem, _, cx| {
-                        if drag.id == target_id {
+                    move |this, drag: &DraggedText, _, cx| {
+                        let drag_id: ItemId = drag.id.as_ref().into();
+                        if drag_id == target_id {
                             return;
                         }
                         this.store.update(cx, |store, cx| {
@@ -1503,12 +1588,12 @@ impl InboxPanel {
                                 .item(&target_id)
                                 .and_then(|item| store.resolve_kind(item).map(|t| t.key.clone()));
                             let drag_kind = store
-                                .item(&drag.id)
+                                .item(&drag_id)
                                 .and_then(|item| store.resolve_kind(item).map(|t| t.key.clone()));
                             if target_kind != drag_kind {
-                                store.set_kind(&drag.id, target_kind, cx);
+                                store.set_kind(&drag_id, target_kind, cx);
                             }
-                            store.move_item_before(&drag.id, &target_id, cx);
+                            store.move_item_before(&drag_id, &target_id, cx);
                         });
                     }
                 }))
@@ -1539,8 +1624,80 @@ impl InboxPanel {
                     )
                     .child(meta),
             )
-            .child(div().flex_none().child(delete_button))
+            .child(
+                h_flex()
+                    .flex_none()
+                    .child(self.render_item_actions_menu(item, cx))
+                    .child(delete_button),
+            )
             .into_any_element()
+    }
+
+    /// The item's Markdown for the drag payload, memoized so the eager
+    /// `on_drag` value isn't rebuilt for every open row on every render. The
+    /// cache is invalidated on any store change in [`Self::handle_store_event`].
+    fn drag_markdown(&self, item: &InboxItem, cx: &App) -> SharedString {
+        if let Some(cached) = self.markdown_cache.borrow().get(&item.id) {
+            return cached.clone();
+        }
+        let markdown = SharedString::from(item_markdown(&self.store, item, cx));
+        self.markdown_cache
+            .borrow_mut()
+            .insert(item.id.clone(), markdown.clone());
+        markdown
+    }
+
+    /// The per-row overflow menu (`…`): Copy as Markdown / Send to AI Chat.
+    fn render_item_actions_menu(
+        &self,
+        item: &InboxItem,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let panel = cx.entity().downgrade();
+        let item = item.clone();
+        let menu_id = SharedString::from(format!("inbox-item-actions-{}", item.id));
+        let trigger_id = SharedString::from(format!("inbox-item-actions-trigger-{}", item.id));
+        PopoverMenu::new(menu_id)
+            .trigger(
+                IconButton::new(trigger_id, IconName::Ellipsis)
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(Color::Muted)
+                    .visible_on_hover("inbox-item")
+                    .tooltip(Tooltip::text("More actions")),
+            )
+            .menu(move |window, cx| {
+                let panel = panel.clone();
+                let item = item.clone();
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    let (copy_item, copy_panel) = (item.clone(), panel.clone());
+                    let (chat_item, chat_panel) = (item.clone(), panel);
+                    menu.entry("Copy as Markdown", None, move |_window, cx| {
+                        copy_panel
+                            .update(cx, |this, cx| {
+                                copy_item_as_markdown(
+                                    &this.workspace,
+                                    &this.store,
+                                    &copy_item,
+                                    cx,
+                                );
+                            })
+                            .ok();
+                    })
+                    .entry("Send to AI Chat", None, move |window, cx| {
+                        chat_panel
+                            .update(cx, |this, cx| {
+                                send_item_to_chat(
+                                    &this.workspace,
+                                    &this.store,
+                                    &chat_item,
+                                    window,
+                                    cx,
+                                );
+                            })
+                            .ok();
+                    })
+                }))
+            })
     }
 
     fn render_archive_header(&self, count: usize, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1751,19 +1908,20 @@ impl InboxPanel {
             let mut group = v_flex()
                 .id(SharedString::from(format!("inbox-group-{key}")))
                 .rounded_md()
-                .drag_over::<DraggedInboxItem>(|style, _, _, cx| {
+                .drag_over::<DraggedText>(|style, _, _, cx| {
                     style.bg(cx.theme().colors().drop_target_background)
                 })
                 .on_drop(cx.listener({
                     let key = key.clone();
-                    move |this, drag: &DraggedInboxItem, _, cx| {
+                    move |this, drag: &DraggedText, _, cx| {
+                        let drag_id: ItemId = drag.id.as_ref().into();
                         this.store.update(cx, |store, cx| {
-                            let already_there = store.item(&drag.id).is_some_and(|item| {
+                            let already_there = store.item(&drag_id).is_some_and(|item| {
                                 store.resolve_kind(item).map(|t| t.key.as_str())
                                     == Some(key.as_str())
                             });
                             if !already_there {
-                                store.set_kind(&drag.id, Some(key.clone()), cx);
+                                store.set_kind(&drag_id, Some(key.clone()), cx);
                             }
                         });
                     }
@@ -1795,16 +1953,17 @@ impl InboxPanel {
             let mut group = v_flex()
                 .id("inbox-group-unassigned")
                 .rounded_md()
-                .drag_over::<DraggedInboxItem>(|style, _, _, cx| {
+                .drag_over::<DraggedText>(|style, _, _, cx| {
                     style.bg(cx.theme().colors().drop_target_background)
                 })
-                .on_drop(cx.listener(|this, drag: &DraggedInboxItem, _, cx| {
+                .on_drop(cx.listener(|this, drag: &DraggedText, _, cx| {
+                    let drag_id: ItemId = drag.id.as_ref().into();
                     this.store.update(cx, |store, cx| {
                         let already_unassigned = store
-                            .item(&drag.id)
+                            .item(&drag_id)
                             .is_some_and(|item| store.resolve_kind(item).is_none());
                         if !already_unassigned {
-                            store.set_kind(&drag.id, None, cx);
+                            store.set_kind(&drag_id, None, cx);
                         }
                     });
                 }))
