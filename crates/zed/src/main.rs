@@ -271,6 +271,14 @@ fn main() {
     // Set custom data directory.
     if let Some(dir) = &args.user_data_dir {
         paths::set_custom_data_dir(dir);
+    } else if cfg!(target_os = "windows")
+        && *release_channel::RELEASE_CHANNEL == ReleaseChannel::Nightly
+    {
+        // zn-zed fork: keep Nightly data separate from official Zed installs,
+        // which all share %LOCALAPPDATA%\Zed regardless of channel.
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            paths::set_custom_data_dir(&format!("{local}\\ZedNightly"));
+        }
     }
 
     #[cfg(target_os = "windows")]
