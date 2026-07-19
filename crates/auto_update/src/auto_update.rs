@@ -32,6 +32,8 @@ use std::{
 use util::command::new_command;
 use workspace::Workspace;
 
+mod fork_updates;
+
 const SHOULD_SHOW_UPDATE_NOTIFICATION_KEY: &str = "auto-updater-should-show-updated-notification";
 
 #[derive(Debug)]
@@ -350,7 +352,8 @@ pub fn release_notes_url(cx: &mut App) -> Option<String> {
             auto_updater.client.http_client().build_url(&path)
         }
         ReleaseChannel::Nightly => {
-            "https://github.com/zed-industries/zed/commits/nightly/".to_string()
+            // zn-zed fork: nightly builds come from the fork's releases.
+            format!("https://github.com/{}/releases", fork_updates::FORK_REPO)
         }
         ReleaseChannel::Dev => "https://github.com/zed-industries/zed/commits/main/".to_string(),
     };
@@ -649,6 +652,11 @@ impl AutoUpdater {
         cx: &mut AsyncApp,
     ) -> Result<ReleaseAsset> {
         let client = this.read_with(cx, |this, _| this.client.clone());
+
+        // zn-zed fork: nightly app updates come from the fork's GitHub Releases.
+        if release_channel == ReleaseChannel::Nightly && asset == "zed" {
+            return fork_updates::get_release_asset(&client.http_client(), asset, os, arch).await;
+        }
 
         let (system_id, metrics_id, is_staff) = if client.telemetry().metrics_enabled() {
             (
