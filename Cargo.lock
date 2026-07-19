@@ -9028,6 +9028,7 @@ dependencies = [
  "agent_ui",
  "anyhow",
  "collections",
+ "db",
  "editor",
  "fs",
  "futures 0.3.32",

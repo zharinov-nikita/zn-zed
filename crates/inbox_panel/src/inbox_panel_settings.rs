@@ -11,11 +11,16 @@ pub struct InboxPanelSettings {
 
 impl Settings for InboxPanelSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
-        let panel = content.inbox_panel.as_ref().unwrap();
+        // Fall back to the documented defaults (matching
+        // `assets/settings/default.json`) instead of unwrapping, so a missing
+        // section can never panic.
+        let panel = content.inbox_panel.as_ref();
         Self {
-            button: panel.button.unwrap(),
-            default_width: panel.default_width.map(gpui::px).unwrap(),
-            dock: panel.dock.unwrap(),
+            button: panel.and_then(|panel| panel.button).unwrap_or(true),
+            default_width: panel
+                .and_then(|panel| panel.default_width)
+                .map_or(gpui::px(300.), gpui::px),
+            dock: panel.and_then(|panel| panel.dock).unwrap_or(DockSide::Left),
         }
     }
 }

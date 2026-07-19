@@ -5,12 +5,13 @@ use std::{
 };
 
 use collections::HashSet;
+use db::kvp::KeyValueStore;
 use fs::{Fs, RemoveOptions};
 use futures::StreamExt as _;
-use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Subscription, Task, TaskExt as _};
+use gpui::{AppContext as _, Context, Entity, EventEmitter, Subscription, Task, TaskExt as _};
 use project::{Project, WorktreeId};
 use sha2::{Digest as _, Sha256};
-use util::{ResultExt as _, rel_path::RelPath};
+use util::ResultExt as _;
 
 use crate::inbox_model::{
     AttachmentRef, CATALOG_COLOR_TOKENS, CatalogEntry, CatalogKind, InboxFile, InboxItem, ItemId,
@@ -22,11 +23,29 @@ const SAVE_DEBOUNCE: Duration = Duration::from_millis(250);
 /// How many backup snapshots to keep per project in the out-of-repo ring.
 const BACKUP_KEEP: usize = 10;
 
-/// Path of the inbox file, relative to the worktree root.
-pub fn inbox_file_relative_path() -> &'static RelPath {
-    static CACHED: std::sync::LazyLock<&'static RelPath> =
-        std::sync::LazyLock::new(|| RelPath::from_unix_str(".zed/inbox.json").unwrap());
-    *CACHED
+/// Namespace of the inbox entries in Zed's scoped key-value store; the key
+/// within it identifies the project (see [`project_key`]).
+const INBOX_KV_NAMESPACE: &str = "inbox_panel";
+
+/// Version pinned into every write. Loads refuse a document written by a
+/// newer Zed so an older build can't destroy data it doesn't understand.
+const CURRENT_INBOX_VERSION: u32 = 1;
+
+/// Key of a project's entry in the scoped key-value store: a hash of the
+/// worktree root, so different projects never collide. The backup ring uses
+/// the same key, keeping a project's backups findable even when its stored
+/// entry is corrupt.
+fn project_key(worktree_root: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(worktree_root.to_string_lossy().as_bytes());
+    let key = format!("{:x}", hasher.finalize());
+    key[..16].to_string()
+}
+
+/// Directory holding a project's out-of-repo backups. Lives under Zed's
+/// global data dir, so it survives DB-level problems and bulk deletes.
+fn backup_dir_for_key(key: &str) -> PathBuf {
+    paths::data_dir().join("inbox_backups").join(key)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -34,16 +53,6 @@ pub enum InboxStoreEvent {
     Changed,
     Reloaded,
     ItemDeleted(ItemId),
-}
-
-/// Where a pending recovery snapshot came from. A memory-sourced offer is a
-/// copy of the live state, so any later mutation supersedes it; a
-/// backup-sourced offer holds data that exists nowhere else in memory and
-/// must survive until the user acts on it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum RestoreSource {
-    Memory,
-    Backup,
 }
 
 /// Merges `snapshot` into `state` non-destructively: items and catalog
@@ -82,44 +91,49 @@ fn merge_missing(state: &mut InboxFile, snapshot: InboxFile) {
     }
 }
 
-/// Result of reading `.zed/inbox.json`, computed off the main thread so parsing
-/// and the backup lookup don't block the UI.
+/// Result of reading the persisted inbox document, computed off the main
+/// thread so parsing and the backup lookup don't block the UI.
 enum ReloadOutcome {
-    /// The file does not exist.
+    /// No entry exists in the key-value store and no legacy file was found.
     Missing,
-    /// The file exists but could not be read, or was read but is not valid
-    /// JSON for our schema; the error text carries the distinction.
+    /// The stored value could not be read, or was read but is not valid JSON
+    /// for our schema; the error text carries the distinction.
     Failed(String),
-    /// The file parsed successfully. Boxed to keep the enum small.
-    Loaded { text: String, state: Box<InboxFile> },
+    /// The stored value parsed successfully. Boxed to keep the enum small.
+    Loaded(Box<InboxFile>),
+    /// No entry exists in the key-value store, but a legacy `.zed/inbox.json`
+    /// parsed successfully; adopting it schedules a save that imports it.
+    LegacyImported(Box<InboxFile>),
+    /// The stored value was written by a newer Zed (`version` above ours);
+    /// it must be neither loaded nor offered for a downgrading restore.
+    NewerVersion,
 }
 
 /// Holds the in-memory inbox state for the first visible worktree of a
-/// project, persists it to `.zed/inbox.json` (debounced, atomic), and watches
-/// the file for external changes.
+/// project and persists it (debounced) to Zed's SQLite key-value store, one
+/// entry per project. Legacy `.zed/inbox.json` files are imported once and
+/// left untouched.
 pub struct InboxStore {
     project: Entity<Project>,
     fs: Arc<dyn Fs>,
+    key_value_store: KeyValueStore,
     state: InboxFile,
     worktree_id: Option<WorktreeId>,
-    /// Absolute path of the bound worktree's inbox file plus its backup dir,
-    /// cached while the worktree is alive: on a `WorktreeRemoved` event the
-    /// worktree is already gone from the project, but a pending edit must
-    /// still be flushed to the file it owned.
-    bound_paths: Option<(PathBuf, Option<PathBuf>)>,
-    /// The last content we wrote (or loaded), used to suppress reloads caused
-    /// by our own writes.
-    last_saved_content: Option<String>,
+    /// KV key of the bound worktree's project, cached while the worktree is
+    /// alive: on a `WorktreeRemoved` event the worktree is already gone from
+    /// the project, but a pending edit must still be flushed to the entry it
+    /// owned. The backup directory is derived via [`backup_dir_for_key`].
+    bound_project_key: Option<String>,
     load_error: Option<String>,
-    /// Set when the most recent debounced save failed to write to disk. The
-    /// mutation stays `dirty` in that case so it keeps being retried on the
-    /// next mutation instead of being silently lost.
+    /// Set when the most recent debounced save failed to write to the
+    /// database. The mutation stays `dirty` in that case so it keeps being
+    /// retried on the next mutation instead of being silently lost.
     save_error: Option<String>,
-    /// Whether the in-memory state has mutations that are not on disk yet.
+    /// Whether the in-memory state has mutations that are not persisted yet.
     dirty: bool,
-    /// Snapshot recovered from a backup when the on-disk file went missing or
-    /// corrupt; `Some` while the recovery banner is offered.
-    restorable: Option<(RestoreSource, InboxFile)>,
+    /// Snapshot recovered from the backup ring when the stored document went
+    /// missing or corrupt; `Some` while the recovery banner is offered.
+    restorable: Option<InboxFile>,
     /// Monotonic counter that keeps backup filenames unique within a session,
     /// even for two saves that land in the same millisecond.
     backup_seq: u64,
@@ -140,10 +154,10 @@ impl InboxStore {
         let mut this = Self {
             project,
             fs,
+            key_value_store: KeyValueStore::global(cx),
             state: InboxFile::default(),
             worktree_id,
-            bound_paths: None,
-            last_saved_content: None,
+            bound_project_key: None,
             load_error: None,
             save_error: None,
             dirty: false,
@@ -163,15 +177,6 @@ impl InboxStore {
         cx: &mut Context<Self>,
     ) {
         match event {
-            project::Event::WorktreeUpdatedEntries(worktree_id, changes) => {
-                if Some(*worktree_id) == self.worktree_id
-                    && changes
-                        .iter()
-                        .any(|(path, _, _)| path.as_ref() == inbox_file_relative_path())
-                {
-                    self.reload(cx);
-                }
-            }
             project::Event::WorktreeAdded(_) | project::Event::WorktreeRemoved(_) => {
                 self.rebind_worktree(cx);
             }
@@ -192,15 +197,14 @@ impl InboxStore {
         if self.dirty {
             // The pending debounced save would run after the switch, see
             // `dirty == false` and silently drop the edit; write it to the
-            // outgoing worktree's file now, while its path is still bound.
-            self.flush_state_to_disk(cx);
+            // outgoing project's entry now, while its key is still bound.
+            self.flush_state_to_database(cx);
         }
         self.worktree_id = worktree_id;
         // Reset to a clean slate before reloading: carrying the old
         // worktree's items across would leak them into the new project (and
-        // a missing inbox.json there would even offer to "restore" them).
+        // a missing entry there would even offer to "restore" them).
         self.state = InboxFile::default();
-        self.last_saved_content = None;
         self.dirty = false;
         self.restorable = None;
         self.load_error = None;
@@ -209,71 +213,50 @@ impl InboxStore {
         self.reload(cx);
     }
 
-    /// Immediately writes the current state to the bound worktree's file and
+    /// Immediately writes the current state to the bound project's entry and
     /// backup ring, bypassing the save debounce. Fire-and-forget: the store
     /// may be rebinding away from this worktree, so failures are only logged.
-    fn flush_state_to_disk(&mut self, cx: &mut Context<Self>) {
-        // The cached path, not `inbox_abs_path`: on a `WorktreeRemoved` event
-        // the worktree is already gone from the project, but the file it
-        // owned is still on disk and must receive the pending edit.
-        let Some((abs_path, backup_dir)) = self.bound_paths.clone() else {
+    fn flush_state_to_database(&mut self, cx: &mut Context<Self>) {
+        // The cached key, not a live worktree lookup: on a `WorktreeRemoved`
+        // event the worktree is already gone from the project, but the entry
+        // it owned must still receive the pending edit.
+        let Some(key) = self.bound_project_key.clone() else {
             return;
         };
-        let fs = self.fs.clone();
-        let mut file = self.state.clone();
-        file.version = Some(1);
-        let backup_dir = backup_dir.filter(|_| file.has_content());
-        let seq = self.backup_seq;
-        self.backup_seq += 1;
-        cx.background_spawn(async move {
-            let mut content = serde_json::to_string_pretty(&file)?;
-            content.push('\n');
-            if let Some(dir) = abs_path.parent() {
-                fs.create_dir(dir).await?;
-            }
-            fs.atomic_write(abs_path, content.clone()).await?;
-            if let Some(dir) = backup_dir {
-                write_backup(&fs, dir, content, now_unix_millis(), seq).await;
-            }
-            anyhow::Ok(())
-        })
+        let backup_seq = self.next_backup_seq();
+        cx.background_spawn(persist_snapshot(
+            self.key_value_store.clone(),
+            self.fs.clone(),
+            key,
+            self.state.clone(),
+            backup_seq,
+        ))
         .detach_and_log_err(cx);
     }
 
-    fn inbox_abs_path(&self, cx: &App) -> Option<PathBuf> {
-        let worktree = self
-            .project
-            .read(cx)
-            .worktree_for_id(self.worktree_id?, cx)?;
-        Some(worktree.read(cx).absolutize(inbox_file_relative_path()))
-    }
-
-    /// Directory holding this project's out-of-repo backups, keyed by a hash of
-    /// the worktree root so different projects never share a ring. Lives under
-    /// Zed's global data dir, so it survives deleting the project's `.zed`.
-    fn backup_dir(&self, cx: &App) -> Option<PathBuf> {
-        let worktree = self
-            .project
-            .read(cx)
-            .worktree_for_id(self.worktree_id?, cx)?;
-        let root = worktree.read(cx).abs_path();
-        let mut hasher = Sha256::new();
-        hasher.update(root.to_string_lossy().as_bytes());
-        let key = format!("{:x}", hasher.finalize());
-        Some(paths::data_dir().join("inbox_backups").join(&key[..16]))
+    /// Allocates the next backup sequence number. One owner for the
+    /// monotonic-uniqueness contract: two snapshots written in the same
+    /// millisecond must never share a filename.
+    fn next_backup_seq(&mut self) -> u64 {
+        let backup_seq = self.backup_seq;
+        self.backup_seq += 1;
+        backup_seq
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
-        let Some(abs_path) = self.inbox_abs_path(cx) else {
-            self.bound_paths = None;
+        let worktree_root = self
+            .worktree_id
+            .and_then(|worktree_id| self.project.read(cx).worktree_for_id(worktree_id, cx))
+            .map(|worktree| worktree.read(cx).abs_path());
+        let Some(worktree_root) = worktree_root else {
+            self.bound_project_key = None;
             if self.dirty {
-                // Unsaved local mutations win over whatever is on disk right
+                // Unsaved local mutations win over whatever is stored right
                 // now; the pending save will persist them shortly.
                 return;
             }
             if self.state != InboxFile::default() {
                 self.state = InboxFile::default();
-                self.last_saved_content = None;
                 self.load_error = None;
                 self.save_error = None;
                 self.restorable = None;
@@ -281,42 +264,40 @@ impl InboxStore {
             }
             return;
         };
-        let backup_dir = self.backup_dir(cx);
-        self.bound_paths = Some((abs_path.clone(), backup_dir.clone()));
+        let key = project_key(&worktree_root);
+        let backup_dir = backup_dir_for_key(&key);
+        self.bound_project_key = Some(key.clone());
         let fs = self.fs.clone();
+        let key_value_store = self.key_value_store.clone();
+        let legacy_path = worktree_root.join(".zed").join("inbox.json");
         cx.spawn(async move |this, cx| {
-            let raw = if fs.is_file(&abs_path).await {
-                Some(fs.load(&abs_path).await)
-            } else {
-                None
-            };
-            let outcome = match raw {
-                None => ReloadOutcome::Missing,
-                Some(Err(error)) => ReloadOutcome::Failed(format!("{error:#}")),
-                // Parse off the UI thread: a large inbox.json would otherwise
-                // stall the foreground executor on every external change.
-                Some(Ok(text)) => {
-                    cx.background_executor()
-                        .spawn(async move {
-                            match serde_json::from_str::<InboxFile>(&text) {
-                                Ok(state) => ReloadOutcome::Loaded {
-                                    text,
-                                    state: Box::new(state),
-                                },
-                                Err(error) => ReloadOutcome::Failed(error.to_string()),
-                            }
-                        })
-                        .await
+            // Read and parse off the UI thread: a large document would
+            // otherwise stall the foreground executor.
+            let quarantine_dir = backup_dir.clone();
+            let fs_for_load = fs.clone();
+            let outcome = cx
+                .background_executor()
+                .spawn(async move {
+                    load_outcome(
+                        &key_value_store,
+                        &key,
+                        &fs_for_load,
+                        &legacy_path,
+                        &quarantine_dir,
+                    )
+                    .await
+                })
+                .await;
+            // Only reach for a backup when the store didn't yield usable
+            // data; a healthy reload never touches the backup ring, and a
+            // newer-version document must not surface a downgrading restore.
+            let backup = match &outcome {
+                ReloadOutcome::Loaded(_)
+                | ReloadOutcome::LegacyImported(_)
+                | ReloadOutcome::NewerVersion => None,
+                ReloadOutcome::Missing | ReloadOutcome::Failed(_) => {
+                    load_latest_backup(&fs, &backup_dir).await
                 }
-            };
-            // Only reach for a backup when the live file didn't yield usable
-            // data; a healthy reload never touches the backup ring.
-            let backup = if matches!(outcome, ReloadOutcome::Loaded { .. }) {
-                None
-            } else if let Some(dir) = backup_dir {
-                load_latest_backup(&fs, &dir).await
-            } else {
-                None
             };
             this.update(cx, |this, cx| this.finish_reload(outcome, backup, cx))
                 .ok();
@@ -331,44 +312,37 @@ impl InboxStore {
         cx: &mut Context<Self>,
     ) {
         if self.dirty {
-            // Unsaved local mutations win over whatever is on disk right now;
+            // Unsaved local mutations win over whatever is stored right now;
             // the pending save will persist them shortly.
             return;
         }
         match outcome {
-            ReloadOutcome::Loaded { text, state } => {
-                if self.last_saved_content.as_deref() == Some(text.as_str()) {
-                    // Echo of our own write.
-                    return;
-                }
-                let mut state = *state;
-                let now = now_unix();
-                for item in state.inbox.iter_mut().chain(state.archived.iter_mut()) {
-                    if item.created.is_none() {
-                        item.created = Some(now);
-                    }
-                }
-                self.state = state;
-                self.last_saved_content = Some(text);
-                self.load_error = None;
+            ReloadOutcome::Loaded(state) => {
+                self.adopt_loaded_state(*state, cx);
+            }
+            ReloadOutcome::LegacyImported(state) => {
+                self.adopt_loaded_state(*state, cx);
+                // Persist the imported legacy file through the one normal
+                // mutation path; the file itself is left untouched and never
+                // written again.
+                self.on_mutated(cx);
+            }
+            ReloadOutcome::NewerVersion => {
+                self.load_error =
+                    Some("inbox data was written by a newer version of Zed".to_string());
+                // Never offer a restore here: re-saving an older snapshot
+                // (or the parsed newer document itself) would downgrade and
+                // truncate data written by the newer build. The raw value is
+                // preserved in the quarantine file.
                 self.restorable = None;
-                cx.emit(InboxStoreEvent::Reloaded);
+                cx.emit(InboxStoreEvent::Changed);
             }
             ReloadOutcome::Missing => {
                 self.load_error = None;
-                self.last_saved_content = None;
-                // Prefer the data still in memory (file deleted while Zed was
-                // open); fall back to the newest backup (file gone before this
-                // session started).
-                let recovered = if self.state.has_content() {
-                    Some((RestoreSource::Memory, self.state.clone()))
-                } else {
-                    backup.map(|data| (RestoreSource::Backup, data))
-                };
-                match recovered {
+                match backup {
                     Some(offer) => {
-                        // Don't wipe memory or auto-write: offer a restore
-                        // banner so an intentional deletion isn't undone.
+                        // Don't auto-adopt the backup: offer a restore banner
+                        // so a deliberate fresh start isn't silently undone.
                         self.restorable = Some(offer);
                         cx.emit(InboxStoreEvent::Changed);
                     }
@@ -382,33 +356,30 @@ impl InboxStore {
                 }
             }
             ReloadOutcome::Failed(error) => {
-                // Keep the last good in-memory state and surface the error.
-                // Offer to restore from whatever holds data: the in-memory
-                // state (freshest, when Zed was open) or the newest backup.
+                // Keep the in-memory state, surface the error, and offer the
+                // newest backup holding data, if any.
                 self.load_error = Some(error);
-                let recovered = if self.state.has_content() {
-                    Some((RestoreSource::Memory, self.state.clone()))
-                } else {
-                    backup.map(|data| (RestoreSource::Backup, data))
-                };
-                self.restorable = recovered.filter(|(_, data)| data.has_content());
+                self.restorable = backup;
                 cx.emit(InboxStoreEvent::Changed);
             }
         }
     }
 
+    /// Installs a freshly loaded document as the live state, backfilling
+    /// missing `created` timestamps.
+    fn adopt_loaded_state(&mut self, mut state: InboxFile, cx: &mut Context<Self>) {
+        backfill_created(&mut state);
+        self.state = state;
+        self.load_error = None;
+        self.restorable = None;
+        cx.emit(InboxStoreEvent::Reloaded);
+    }
+
     fn on_mutated(&mut self, cx: &mut Context<Self>) {
         self.dirty = true;
         self.load_error = None;
-        // A memory-sourced recovery offer is a snapshot of the state being
-        // mutated right now — the live data supersedes it, so retire the
-        // offer (and its banner) immediately. Otherwise a click on the stale
-        // banner's "Keep empty" would wipe a healthy in-memory state.
-        // Backup-sourced offers hold data that is nowhere else in memory and
-        // survive until the user decides.
-        if matches!(self.restorable, Some((RestoreSource::Memory, _))) {
-            self.restorable = None;
-        }
+        // A pending recovery offer is always backup-sourced: its data exists
+        // nowhere else in memory, so it survives edits until the user decides.
         cx.emit(InboxStoreEvent::Changed);
         self.schedule_save(cx);
     }
@@ -416,90 +387,44 @@ impl InboxStore {
     fn schedule_save(&mut self, cx: &mut Context<Self>) {
         self.pending_save = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SAVE_DEBOUNCE).await;
-            let Ok(Some((fs, abs_path, file, backup_dir, should_backup))) =
-                this.update(cx, |this, cx| {
+            let Ok(Some((key_value_store, fs, key, file, backup_seq))) =
+                this.update(cx, |this, _| {
                     if !this.dirty {
                         return None;
                     }
-                    let abs_path = this.inbox_abs_path(cx)?;
-                    let mut file = this.state.clone();
-                    file.version = Some(1);
-                    let should_backup = file.has_content();
+                    let key = this.bound_project_key.clone()?;
+                    // Optimistically clear `dirty`: a mutation landing while
+                    // the write is in flight re-marks it and replaces this
+                    // task with a fresh save.
+                    this.dirty = false;
                     Some((
+                        this.key_value_store.clone(),
                         this.fs.clone(),
-                        abs_path,
-                        file,
-                        this.backup_dir(cx),
-                        should_backup,
+                        key,
+                        this.state.clone(),
+                        this.next_backup_seq(),
                     ))
                 })
             else {
                 return;
             };
-            let Ok(content) = cx
-                .background_executor()
-                .spawn(async move {
-                    serde_json::to_string_pretty(&file).map(|mut content| {
-                        content.push('\n');
-                        content
-                    })
-                })
-                .await
-            else {
-                return;
-            };
-            let Ok(previous_last_saved_content) = this.update(cx, |this, _| {
-                let previous = this.last_saved_content.take();
-                this.dirty = false;
-                this.last_saved_content = Some(content.clone());
-                previous
-            }) else {
-                return;
-            };
 
-            let backup_content = content.clone();
-            let write_result = async {
-                if let Some(dir) = abs_path.parent() {
-                    fs.create_dir(dir).await?;
+            let write_result = cx
+                .background_spawn(persist_snapshot(key_value_store, fs, key, file, backup_seq))
+                .await;
+
+            this.update(cx, |this, cx| match write_result {
+                Ok(()) => this.save_error = None,
+                Err(error) => {
+                    // The write failed: restore `dirty` so the mutation is
+                    // retried on the next edit instead of being silently
+                    // lost.
+                    this.dirty = true;
+                    this.save_error = Some(format!("{error:#}"));
+                    cx.emit(InboxStoreEvent::Changed);
                 }
-                fs.atomic_write(abs_path, content).await
-            }
-            .await;
-
-            let saved = this
-                .update(cx, |this, cx| match write_result {
-                    Ok(()) => {
-                        this.save_error = None;
-                        true
-                    }
-                    Err(error) => {
-                        // The write failed: restore `dirty` and the previous
-                        // `last_saved_content` so the mutation is retried on the
-                        // next edit instead of being silently lost, and so a
-                        // later file-change event for the (still stale) on-disk
-                        // content isn't mistaken for an echo of our own write.
-                        this.dirty = true;
-                        this.last_saved_content = previous_last_saved_content;
-                        this.save_error = Some(format!("{error:#}"));
-                        cx.emit(InboxStoreEvent::Changed);
-                        false
-                    }
-                })
-                .unwrap_or(false);
-
-            // Mirror the just-saved content into the out-of-repo backup ring.
-            if saved && should_backup {
-                if let Some(dir) = backup_dir {
-                    let seq = this
-                        .update(cx, |this, _| {
-                            let seq = this.backup_seq;
-                            this.backup_seq += 1;
-                            seq
-                        })
-                        .unwrap_or(0);
-                    write_backup(&fs, dir, backup_content, now_unix_millis(), seq).await;
-                }
-            }
+            })
+            .ok();
         });
     }
 
@@ -606,8 +531,9 @@ impl InboxStore {
         self.load_error.as_deref()
     }
 
-    /// Set when the most recent debounced save failed to write to disk. The
-    /// mutation remains dirty and will be retried on the next save attempt.
+    /// Set when the most recent debounced save failed to write to the
+    /// database. The mutation remains dirty and will be retried on the next
+    /// save attempt.
     pub fn save_error(&self) -> Option<&str> {
         self.save_error.as_deref()
     }
@@ -616,47 +542,82 @@ impl InboxStore {
         self.worktree_id.is_some()
     }
 
-    /// Whether the on-disk file went missing or corrupt while a backup with data
-    /// is available to restore. Drives the recovery banner.
+    /// KV key of the currently bound project, if any. Lets the panel detect
+    /// a project switch that happened while a file dialog was open.
+    pub fn bound_project_key(&self) -> Option<&str> {
+        self.bound_project_key.as_deref()
+    }
+
+    /// Whether the stored document went missing or corrupt while a backup
+    /// with data is available to restore. Drives the recovery banner.
     pub fn can_restore(&self) -> bool {
         self.restorable.is_some()
     }
 
-    /// Re-persists the recovered snapshot to `.zed/inbox.json`, recreating the
-    /// file (and a fresh backup) from the ring. Edits made while the offer was
-    /// pending are kept: the snapshot only fills in what they don't cover.
+    /// Re-persists the recovered snapshot to the key-value store (and a fresh
+    /// backup). Edits made while the offer was pending are kept: the snapshot
+    /// only fills in what they don't cover.
     pub fn restore_from_backup(&mut self, cx: &mut Context<Self>) {
-        let Some((_, snapshot)) = self.restorable.take() else {
+        let Some(snapshot) = self.restorable.take() else {
             return;
         };
+        self.adopt_snapshot(snapshot, cx);
+    }
+
+    /// A copy of the current document for exporting to a file, with the
+    /// version pinned like every persisted write.
+    pub fn export_snapshot(&self) -> InboxFile {
+        let mut file = self.state.clone();
+        file.version = Some(CURRENT_INBOX_VERSION);
+        file
+    }
+
+    /// Merges a document imported from a file into the current state (same
+    /// non-destructive semantics as a backup restore: dedup by item id and
+    /// catalog key, current state wins) and persists it. Returns how many
+    /// items the import added. Refuses documents written by a newer Zed,
+    /// mirroring the load policy — re-saving one would silently downgrade it.
+    pub fn import_snapshot(
+        &mut self,
+        snapshot: InboxFile,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<usize> {
+        anyhow::ensure!(
+            snapshot
+                .version
+                .is_none_or(|version| version <= CURRENT_INBOX_VERSION),
+            "the file was exported by a newer version of Zed"
+        );
+        let item_count_before = self.state.inbox.len() + self.state.archived.len();
+        self.adopt_snapshot(snapshot, cx);
+        Ok(self.state.inbox.len() + self.state.archived.len() - item_count_before)
+    }
+
+    /// Adopts `snapshot` into the live state — merged under current data when
+    /// any exists, wholesale otherwise — and persists it through the normal
+    /// mutation path. Shared by backup restore and file import.
+    fn adopt_snapshot(&mut self, mut snapshot: InboxFile, cx: &mut Context<Self>) {
+        backfill_created(&mut snapshot);
         if self.state.has_content() {
             merge_missing(&mut self.state, snapshot);
         } else {
             self.state = snapshot;
         }
         self.load_error = None;
-        // Marks dirty and schedules the debounced save, which rewrites the file.
+        // Marks dirty and schedules the debounced save, which rewrites the
+        // stored entry.
         self.on_mutated(cx);
         cx.emit(InboxStoreEvent::Reloaded);
     }
 
-    /// Dismisses the recovery offer. For a memory-sourced offer this accepts
-    /// the loss of the on-disk file and empties the live state; a
-    /// backup-sourced offer is simply dropped, leaving whatever the user has
-    /// built up since untouched. Nothing is written until the next real edit.
+    /// Dismisses the recovery offer, leaving whatever the user has built up
+    /// since untouched. Nothing is written until the next real edit.
     pub fn dismiss_restore(&mut self, cx: &mut Context<Self>) {
-        let Some((source, _)) = self.restorable.take() else {
+        if self.restorable.take().is_none() {
             return;
-        };
-        self.load_error = None;
-        match source {
-            RestoreSource::Memory => {
-                self.state = InboxFile::default();
-                self.last_saved_content = None;
-                cx.emit(InboxStoreEvent::Reloaded);
-            }
-            RestoreSource::Backup => cx.emit(InboxStoreEvent::Changed),
         }
+        self.load_error = None;
+        cx.emit(InboxStoreEvent::Changed);
     }
 
     // Mutations
@@ -1037,6 +998,104 @@ fn move_before<T>(
     insert_at != from
 }
 
+/// Backfills missing `created` timestamps with "now" so age labels and
+/// date sorting have something to work with.
+fn backfill_created(state: &mut InboxFile) {
+    let now = now_unix();
+    for item in state.inbox.iter_mut().chain(state.archived.iter_mut()) {
+        if item.created.is_none() {
+            item.created = Some(now);
+        }
+    }
+}
+
+/// Serializes `file` and writes it to the project's entry, mirroring the
+/// content into the backup ring when it carries data. The one owner of the
+/// "what a persisted document looks like" invariant (pinned version, compact
+/// JSON, content-gated backup) shared by the debounced save and the rebind
+/// flush.
+async fn persist_snapshot(
+    key_value_store: KeyValueStore,
+    fs: Arc<dyn Fs>,
+    key: String,
+    mut file: InboxFile,
+    backup_seq: u64,
+) -> anyhow::Result<()> {
+    file.version = Some(CURRENT_INBOX_VERSION);
+    let should_backup = file.has_content();
+    let backup_dir = backup_dir_for_key(&key);
+    let content = serde_json::to_string(&file)?;
+    key_value_store
+        .scoped(INBOX_KV_NAMESPACE)
+        .write(key, content.clone())
+        .await?;
+    if should_backup {
+        write_backup(&fs, backup_dir, content, now_unix_millis(), backup_seq).await;
+    }
+    Ok(())
+}
+
+/// Reads and parses the project's stored document, falling back to a legacy
+/// `.zed/inbox.json` when no entry exists yet. An unusable raw value
+/// (corrupt or newer-versioned) is quarantined first, so a later save
+/// overwriting the entry can't destroy it.
+async fn load_outcome(
+    key_value_store: &KeyValueStore,
+    key: &str,
+    fs: &Arc<dyn Fs>,
+    legacy_path: &Path,
+    quarantine_dir: &Path,
+) -> ReloadOutcome {
+    let text = match key_value_store.scoped(INBOX_KV_NAMESPACE).read(key) {
+        Err(error) => return ReloadOutcome::Failed(format!("{error:#}")),
+        Ok(Some(text)) => text,
+        Ok(None) => {
+            if !fs.is_file(legacy_path).await {
+                return ReloadOutcome::Missing;
+            }
+            return match fs.load(legacy_path).await {
+                Err(error) => ReloadOutcome::Failed(format!("{error:#}")),
+                Ok(text) => match serde_json::from_str::<InboxFile>(&text) {
+                    Ok(state) => ReloadOutcome::LegacyImported(Box::new(state)),
+                    Err(error) => ReloadOutcome::Failed(error.to_string()),
+                },
+            };
+        }
+    };
+    match serde_json::from_str::<InboxFile>(&text) {
+        Ok(state)
+            if state
+                .version
+                .is_none_or(|version| version <= CURRENT_INBOX_VERSION) =>
+        {
+            ReloadOutcome::Loaded(Box::new(state))
+        }
+        parsed => {
+            write_quarantine(fs, quarantine_dir, text).await;
+            match parsed {
+                Ok(_) => ReloadOutcome::NewerVersion,
+                Err(error) => ReloadOutcome::Failed(error.to_string()),
+            }
+        }
+    }
+}
+
+/// Preserves an unusable raw stored value as a single overwrite-in-place
+/// file next to the backup ring, so a later save overwriting the entry can't
+/// destroy it. Deliberately named without a `.json` extension: the ring's
+/// key listing (and thus trimming and the restore lookup) must never pick it
+/// up — repeated reloads over a bad entry would otherwise fill the ring with
+/// copies of the unusable blob and evict every good snapshot.
+async fn write_quarantine(fs: &Arc<dyn Fs>, dir: &Path, text: String) {
+    let write = async {
+        fs.create_dir(dir).await?;
+        fs.atomic_write(dir.join("quarantine"), text).await
+    };
+    if let Err(error) = write.await {
+        log::warn!("inbox: failed to quarantine unreadable stored value: {error:#}");
+    }
+}
+
 /// Sort key for a backup file: its `<timestamp>-<seq>` stem. `None` for any
 /// entry that isn't one of our `.json` snapshots.
 fn backup_sort_key(path: &Path) -> Option<String> {
@@ -1126,9 +1185,32 @@ mod tests {
 
     fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {
+            // A fresh in-memory database per test: without it the store would
+            // fall back to the process-wide shared test DB and tests would
+            // pollute each other through it.
+            cx.set_global(db::AppDatabase::test_new());
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
         });
+    }
+
+    /// The raw stored inbox document for the project at `root`, if any.
+    fn stored_for_root(cx: &mut TestAppContext, root: &Path) -> Option<String> {
+        let key_value_store = cx.update(|cx| KeyValueStore::global(cx));
+        key_value_store
+            .scoped(INBOX_KV_NAMESPACE)
+            .read(&project_key(root))
+            .unwrap()
+    }
+
+    /// Seeds the stored inbox document for the project at `root`.
+    async fn seed_kv(cx: &mut TestAppContext, root: &Path, value: &str) {
+        let key_value_store = cx.update(|cx| KeyValueStore::global(cx));
+        key_value_store
+            .scoped(INBOX_KV_NAMESPACE)
+            .write(project_key(root), value.to_string())
+            .await
+            .unwrap();
     }
 
     async fn build_store(
@@ -1162,25 +1244,23 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_load_existing_file(cx: &mut TestAppContext) {
+    async fn test_load_existing_document(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".zed": {
-                    "inbox.json": r#"{
-                        "version": 1,
-                        "inbox": [
-                            { "id": "abc", "text": "first", "kind": "task", "created": 100 },
-                            { "text": "second" }
-                        ],
-                        "archived": [
-                            { "id": "old", "text": "done", "cleared": 200 }
-                        ]
-                    }"#
-                }
-            }),
+        fs.insert_tree(path!("/root"), json!({})).await;
+        seed_kv(
+            cx,
+            Path::new(path!("/root")),
+            r#"{
+                "version": 1,
+                "inbox": [
+                    { "id": "abc", "text": "first", "kind": "task", "created": 100 },
+                    { "text": "second" }
+                ],
+                "archived": [
+                    { "id": "old", "text": "done", "cleared": 200 }
+                ]
+            }"#,
         )
         .await;
         let (_project, store) = build_store(fs, cx).await;
@@ -1204,7 +1284,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_capture_creates_file(cx: &mut TestAppContext) {
+    async fn test_capture_persists(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(path!("/root"), json!({})).await;
@@ -1220,11 +1300,7 @@ mod tests {
         });
         flush_saves(cx);
 
-        let content = fs
-            .load(path!("/root/.zed/inbox.json").as_ref())
-            .await
-            .unwrap();
-        assert!(content.ends_with('\n'));
+        let content = stored_for_root(cx, Path::new(path!("/root"))).unwrap();
         let parsed: InboxFile = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed.version, Some(1));
         assert_eq!(parsed.inbox.len(), 1);
@@ -1236,133 +1312,247 @@ mod tests {
         // Default types are not serialized.
         let value: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert!(value.get("types").is_none());
+        // The legacy file is never created.
+        assert!(!fs.is_file(path!("/root/.zed/inbox.json").as_ref()).await);
     }
 
     #[gpui::test]
-    async fn test_external_change_reloads(cx: &mut TestAppContext) {
+    async fn test_migrates_legacy_file(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let legacy = r#"{ "inbox": [{ "id": "one", "text": "from file" }] }"#;
+        fs.insert_tree(path!("/root"), json!({ ".zed": { "inbox.json": legacy } }))
+            .await;
+        let (_project, store) = build_store(fs.clone(), cx).await;
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.load_error(), None);
+            assert_eq!(store.items().len(), 1);
+            assert_eq!(store.items()[0].text, "from file");
+        });
+
+        // The import lands in the key-value store through the normal save
+        // path...
+        flush_saves(cx);
+        let stored = stored_for_root(cx, Path::new(path!("/root"))).unwrap();
+        let parsed: InboxFile = serde_json::from_str(&stored).unwrap();
+        assert_eq!(parsed.version, Some(1));
+        assert_eq!(parsed.inbox.len(), 1);
+        assert_eq!(parsed.inbox[0].text, "from file");
+
+        // ...while the legacy file keeps its original bytes.
+        let on_disk = fs
+            .load(path!("/root/.zed/inbox.json").as_ref())
+            .await
+            .unwrap();
+        assert_eq!(on_disk, legacy);
+    }
+
+    #[gpui::test]
+    async fn test_kv_wins_over_legacy_file(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
             path!("/root"),
             json!({
                 ".zed": {
-                    "inbox.json": r#"{ "inbox": [{ "id": "one", "text": "old" }] }"#
+                    "inbox.json": r#"{ "inbox": [{ "id": "f", "text": "from file" }] }"#
+                }
+            }),
+        )
+        .await;
+        seed_kv(
+            cx,
+            Path::new(path!("/root")),
+            r#"{ "version": 1, "inbox": [{ "id": "k", "text": "from kv" }] }"#,
+        )
+        .await;
+        let (_project, store) = build_store(fs, cx).await;
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.load_error(), None);
+            assert_eq!(store.items().len(), 1);
+            assert_eq!(store.items()[0].text, "from kv");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_legacy_file_edits_after_migration_are_ignored(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".zed": {
+                    "inbox.json": r#"{ "inbox": [{ "id": "one", "text": "imported" }] }"#
                 }
             }),
         )
         .await;
         let (_project, store) = build_store(fs.clone(), cx).await;
-        let events = track_events(&store, cx);
+        flush_saves(cx);
 
+        // Nothing watches the legacy file anymore: an external edit to it
+        // must not affect the store.
         fs.save(
             path!("/root/.zed/inbox.json").as_ref(),
-            &r#"{ "inbox": [{ "id": "one", "text": "new" }, { "id": "two", "text": "added" }] }"#
-                .into(),
+            &r#"{ "inbox": [{ "id": "two", "text": "changed on disk" }] }"#.into(),
             Default::default(),
         )
         .await
         .unwrap();
-        flush_saves(cx);
-
-        assert!(events.borrow().contains(&InboxStoreEvent::Reloaded));
-        store.read_with(cx, |store, _| {
-            assert_eq!(store.load_error(), None);
-            assert_eq!(store.items().len(), 2);
-            assert_eq!(store.items()[0].text, "new");
-            assert_eq!(store.items()[1].id.as_ref(), "two");
-        });
-    }
-
-    #[gpui::test]
-    async fn test_own_save_does_not_reload(cx: &mut TestAppContext) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(path!("/root"), json!({})).await;
-        let (_project, store) = build_store(fs.clone(), cx).await;
-        let events = track_events(&store, cx);
-
-        store.update(cx, |store, cx| {
-            store.capture("only item".to_string(), None, None, cx);
-        });
-        flush_saves(cx);
-        // Give the worktree plenty of time to deliver the file event back.
         cx.executor().advance_clock(Duration::from_secs(2));
         cx.run_until_parked();
 
-        assert!(
-            fs.is_file(path!("/root/.zed/inbox.json").as_ref()).await,
-            "the file should have been written"
-        );
-        assert_eq!(
-            events.borrow().as_slice(),
-            &[InboxStoreEvent::Changed],
-            "our own write must not produce a Reloaded event"
-        );
         store.read_with(cx, |store, _| {
             assert_eq!(store.items().len(), 1);
-            assert_eq!(store.items()[0].text, "only item");
+            assert_eq!(store.items()[0].text, "imported");
         });
     }
 
     #[gpui::test]
-    async fn test_broken_json_sets_load_error(cx: &mut TestAppContext) {
+    async fn test_broken_stored_value_sets_load_error(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".zed": {
-                    "inbox.json": r#"{ "inbox": [{ "id": "one", "text": "keep me" }] }"#
-                }
-            }),
-        )
-        .await;
+        fs.insert_tree(path!("/root"), json!({})).await;
+        seed_kv(cx, Path::new(path!("/root")), r#"{ "inbox": [ broken"#).await;
         let (_project, store) = build_store(fs.clone(), cx).await;
-        let events = track_events(&store, cx);
 
-        fs.save(
-            path!("/root/.zed/inbox.json").as_ref(),
-            &r#"{ "inbox": [ broken"#.into(),
-            Default::default(),
-        )
-        .await
-        .unwrap();
-        flush_saves(cx);
-
-        assert!(events.borrow().contains(&InboxStoreEvent::Changed));
-        assert!(!events.borrow().contains(&InboxStoreEvent::Reloaded));
         store.read_with(cx, |store, _| {
             assert!(store.load_error().is_some());
-            // The previous state is kept.
-            assert_eq!(store.items().len(), 1);
-            assert_eq!(store.items()[0].text, "keep me");
+            assert!(store.items().is_empty());
+            // The unparseable raw value doesn't parse as a snapshot, so
+            // there is nothing to offer for restore.
+            assert!(!store.can_restore());
         });
 
-        // An explicit user mutation clears the error and writes the file.
+        // The raw value is preserved in the quarantine file, without
+        // consuming backup-ring slots.
+        let backup_dir = backup_dir_for_key(&project_key(Path::new(path!("/root"))));
+        assert!(
+            fs.is_file(&backup_dir.join("quarantine")).await,
+            "the unparseable raw value must be quarantined"
+        );
+        assert!(backup_keys(&fs, &backup_dir).await.is_empty());
+
+        // An explicit user mutation clears the error and overwrites the entry.
         store.update(cx, |store, cx| {
             store.capture("fresh".to_string(), None, None, cx);
         });
         flush_saves(cx);
         store.read_with(cx, |store, _| assert_eq!(store.load_error(), None));
-        let content = fs
-            .load(path!("/root/.zed/inbox.json").as_ref())
-            .await
-            .unwrap();
-        let parsed: InboxFile = serde_json::from_str(&content).unwrap();
-        assert_eq!(parsed.inbox.len(), 2);
+        let stored = stored_for_root(cx, Path::new(path!("/root"))).unwrap();
+        let parsed: InboxFile = serde_json::from_str(&stored).unwrap();
+        assert_eq!(parsed.inbox.len(), 1);
+        assert_eq!(parsed.inbox[0].text, "fresh");
+    }
+
+    #[gpui::test]
+    async fn test_newer_version_is_not_loaded(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({})).await;
+        seed_kv(
+            cx,
+            Path::new(path!("/root")),
+            r#"{ "version": 99, "inbox": [{ "id": "n", "text": "from the future" }] }"#,
+        )
+        .await;
+        let (_project, store) = build_store(fs.clone(), cx).await;
+
+        store.read_with(cx, |store, _| {
+            assert!(
+                store
+                    .load_error()
+                    .is_some_and(|error| error.contains("newer version")),
+                "a newer-version document must be refused with a specific error"
+            );
+            assert!(store.items().is_empty());
+            assert!(
+                !store.can_restore(),
+                "no restore may be offered for a newer-version document — \
+                 re-saving it (or an older snapshot over it) would downgrade \
+                 data written by the newer build"
+            );
+        });
+
+        // The raw newer-version payload is preserved in the quarantine file,
+        // outside the ring, so it survives a later overwriting save.
+        let backup_dir = backup_dir_for_key(&project_key(Path::new(path!("/root"))));
+        let quarantined = fs.load(&backup_dir.join("quarantine")).await.unwrap();
+        assert!(quarantined.contains("from the future"));
+        assert!(backup_keys(&fs, &backup_dir).await.is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_import_snapshot_merges_and_persists(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({})).await;
+        let (_project, store) = build_store(fs, cx).await;
+
+        let local_id = store.update(cx, |store, cx| {
+            store.capture("local".to_string(), None, None, cx)
+        });
+        flush_saves(cx);
+
+        // An export snapshot carries the pinned version.
+        let exported = store.read_with(cx, |store, _| store.export_snapshot());
+        assert_eq!(exported.version, Some(1));
+        assert_eq!(exported.inbox.len(), 1);
+
+        // Import a snapshot sharing one id with the current state: the
+        // duplicate is skipped (current wins), the new item is appended.
+        let snapshot: InboxFile = serde_json::from_str(&format!(
+            r#"{{ "version": 1, "inbox": [
+                {{ "id": "{local_id}", "text": "stale copy" }},
+                {{ "id": "imported", "text": "from export" }}
+            ] }}"#
+        ))
+        .unwrap();
+        let imported =
+            store.update(cx, |store, cx| store.import_snapshot(snapshot, cx).unwrap());
+        assert_eq!(imported, 1, "only the genuinely new item counts");
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.items().len(), 2);
+            assert_eq!(store.item(&local_id).unwrap().text, "local");
+            assert!(store.items().iter().any(|item| item.text == "from export"));
+        });
+
+        // The merge is persisted like any other mutation.
+        flush_saves(cx);
+        let stored = stored_for_root(cx, Path::new(path!("/root"))).unwrap();
+        assert!(stored.contains("from export"));
+    }
+
+    #[gpui::test]
+    async fn test_import_snapshot_refuses_newer_version(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({})).await;
+        let (_project, store) = build_store(fs, cx).await;
+
+        let snapshot: InboxFile = serde_json::from_str(
+            r#"{ "version": 99, "inbox": [{ "id": "n", "text": "future" }] }"#,
+        )
+        .unwrap();
+        let result = store.update(cx, |store, cx| store.import_snapshot(snapshot, cx));
+        assert!(
+            result.is_err(),
+            "importing a newer-version snapshot would downgrade it on the next save"
+        );
+        store.read_with(cx, |store, _| assert!(store.items().is_empty()));
     }
 
     #[gpui::test]
     async fn test_restore_and_delete(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".zed": {
-                    "inbox.json": r#"{ "archived": [{ "id": "b", "text": "b", "cleared": 1 }] }"#
-                }
-            }),
+        fs.insert_tree(path!("/root"), json!({})).await;
+        seed_kv(
+            cx,
+            Path::new(path!("/root")),
+            r#"{ "archived": [{ "id": "b", "text": "b", "cleared": 1 }] }"#,
         )
         .await;
         let (_project, store) = build_store(fs.clone(), cx).await;
@@ -1405,10 +1595,7 @@ mod tests {
 
         // Everything survives a save/parse round-trip.
         flush_saves(cx);
-        let content = fs
-            .load(path!("/root/.zed/inbox.json").as_ref())
-            .await
-            .unwrap();
+        let content = stored_for_root(cx, Path::new(path!("/root"))).unwrap();
         let parsed: InboxFile = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed.inbox.len(), 1);
         assert_eq!(parsed.inbox[0].id, id_b);
@@ -1425,12 +1612,8 @@ mod tests {
             store.capture("x".to_string(), None, None, cx);
         });
         flush_saves(cx);
-        let value: serde_json::Value = serde_json::from_str(
-            &fs.load(path!("/root/.zed/inbox.json").as_ref())
-                .await
-                .unwrap(),
-        )
-        .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&stored_for_root(cx, Path::new(path!("/root"))).unwrap()).unwrap();
         assert!(
             value.get("types").is_none(),
             "no types by default must not be written"
@@ -1442,12 +1625,8 @@ mod tests {
             key
         });
         flush_saves(cx);
-        let parsed: InboxFile = serde_json::from_str(
-            &fs.load(path!("/root/.zed/inbox.json").as_ref())
-                .await
-                .unwrap(),
-        )
-        .unwrap();
+        let parsed: InboxFile =
+            serde_json::from_str(&stored_for_root(cx, Path::new(path!("/root"))).unwrap()).unwrap();
         assert_eq!(parsed.types.len(), 1);
         assert_eq!(parsed.types[0].key, key);
         assert_eq!(parsed.types[0].label, "TODO");
@@ -1754,21 +1933,17 @@ mod tests {
     async fn test_save_failure_keeps_mutation_dirty(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
-        // `inbox.json` already exists as a directory, so the debounced save's
-        // `atomic_write` will genuinely fail (writing a file over a
-        // directory is not allowed) without needing any error-injection
-        // hook.
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".zed": {
-                    "inbox.json": {}
-                }
-            }),
-        )
-        .await;
+        fs.insert_tree(path!("/root"), json!({})).await;
         let (_project, store) = build_store(fs.clone(), cx).await;
         let events = track_events(&store, cx);
+
+        // Swap in a connection whose database has no tables at all, so the
+        // debounced save's write genuinely fails ("no such table") without
+        // needing any error-injection hook.
+        let broken = KeyValueStore::from_app_db(&db::AppDatabase(
+            db::open_test_db::<()>("inbox-broken-kv").await,
+        ));
+        store.update(cx, |store, _| store.key_value_store = broken);
 
         store.update(cx, |store, cx| {
             store.capture("keep me".to_string(), None, None, cx);
@@ -1785,19 +1960,12 @@ mod tests {
                 store.save_error().is_some(),
                 "the failure must be surfaced to the UI"
             );
-            assert!(
-                store.last_saved_content.is_none(),
-                "last_saved_content must be rolled back to its pre-write \
-                 value on failure, otherwise a later echo of the (still \
-                 stale) on-disk content could be mistaken for our own write"
-            );
             assert_eq!(store.items().len(), 1);
             assert_eq!(store.items()[0].text, "keep me");
         });
         assert!(events.borrow().contains(&InboxStoreEvent::Changed));
 
-        // A later reload (e.g. triggered by a worktree event for the
-        // still-broken path) must not clobber the unsaved mutation.
+        // A later reload must not clobber the unsaved mutation.
         store.update(cx, |store, cx| store.reload(cx));
         cx.run_until_parked();
         store.read_with(cx, |store, _| {
@@ -1839,7 +2007,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_backup_written_and_deletion_offers_restore(cx: &mut TestAppContext) {
+    async fn test_backup_written_after_save(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(path!("/root"), json!({})).await;
@@ -1851,40 +2019,12 @@ mod tests {
         flush_saves(cx);
 
         // A backup snapshot lands in the out-of-repo ring after the save.
-        let backup_dir = store
-            .read_with(cx, |store, cx| store.backup_dir(cx))
-            .unwrap();
+        let backup_dir = backup_dir_for_key(&project_key(Path::new(path!("/root"))));
         assert_eq!(
             backup_keys(&fs, &backup_dir).await.len(),
             1,
             "one save must produce one backup snapshot"
         );
-
-        // Delete the file out from under us (as `git clean` or an `rm` would).
-        fs.remove_file(path!("/root/.zed/inbox.json").as_ref(), Default::default())
-            .await
-            .unwrap();
-        flush_saves(cx);
-
-        // Data isn't silently dropped: the store offers to restore, and the
-        // in-memory item is still there.
-        store.read_with(cx, |store, _| {
-            assert!(store.can_restore(), "a deleted file must offer a restore");
-            assert_eq!(store.items().len(), 1);
-            assert_eq!(store.items()[0].text, "precious");
-        });
-
-        // Restoring re-persists the data to disk.
-        store.update(cx, |store, cx| store.restore_from_backup(cx));
-        flush_saves(cx);
-        store.read_with(cx, |store, _| assert!(!store.can_restore()));
-        let content = fs
-            .load(path!("/root/.zed/inbox.json").as_ref())
-            .await
-            .unwrap();
-        let parsed: InboxFile = serde_json::from_str(&content).unwrap();
-        assert_eq!(parsed.inbox.len(), 1);
-        assert_eq!(parsed.inbox[0].text, "precious");
     }
 
     #[gpui::test]
@@ -1894,33 +2034,33 @@ mod tests {
         fs.insert_tree(path!("/root"), json!({})).await;
         let (project, store) = build_store(fs.clone(), cx).await;
 
-        // First session writes data (and thus a backup), then the file is lost
-        // between sessions.
+        // First session writes data (and thus a backup), then the stored
+        // entry is lost between sessions (e.g. the local database is wiped).
         store.update(cx, |store, cx| {
             store.capture("from last time".to_string(), None, None, cx);
         });
         flush_saves(cx);
         drop(store);
-        fs.remove_file(path!("/root/.zed/inbox.json").as_ref(), Default::default())
+        let key_value_store = cx.update(|cx| KeyValueStore::global(cx));
+        key_value_store
+            .scoped(INBOX_KV_NAMESPACE)
+            .delete(project_key(Path::new(path!("/root"))))
             .await
             .unwrap();
 
-        // A brand-new store (empty memory) over the same project finds no file
-        // but recovers the data from the backup ring.
+        // A brand-new store (empty memory) over the same project finds no
+        // stored entry but recovers the data from the backup ring.
         let store2 = cx.new(|cx| InboxStore::new(project, fs.clone(), cx));
         cx.run_until_parked();
         store2.read_with(cx, |store, _| {
             assert!(
                 store.can_restore(),
-                "a fresh start with a lost file must offer to restore from backup"
+                "a fresh start with a lost entry must offer to restore from backup"
             );
         });
         store2.update(cx, |store, cx| store.restore_from_backup(cx));
         flush_saves(cx);
-        let content = fs
-            .load(path!("/root/.zed/inbox.json").as_ref())
-            .await
-            .unwrap();
+        let content = stored_for_root(cx, Path::new(path!("/root"))).unwrap();
         let parsed: InboxFile = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed.inbox.len(), 1);
         assert_eq!(parsed.inbox[0].text, "from last time");
@@ -1941,9 +2081,7 @@ mod tests {
             flush_saves(cx);
         }
 
-        let backup_dir = store
-            .read_with(cx, |store, cx| store.backup_dir(cx))
-            .unwrap();
+        let backup_dir = backup_dir_for_key(&project_key(Path::new(path!("/root"))));
         assert_eq!(
             backup_keys(&fs, &backup_dir).await.len(),
             BACKUP_KEEP,
@@ -1963,112 +2101,11 @@ mod tests {
         store.update(cx, |store, cx| store.toggle_field("age", cx));
         flush_saves(cx);
 
-        let backup_dir = store
-            .read_with(cx, |store, cx| store.backup_dir(cx))
-            .unwrap();
+        let backup_dir = backup_dir_for_key(&project_key(Path::new(path!("/root"))));
         assert!(
             backup_keys(&fs, &backup_dir).await.is_empty(),
             "an empty state must not produce a backup"
         );
-    }
-
-    #[gpui::test]
-    async fn test_corruption_offers_restore_from_memory(cx: &mut TestAppContext) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".zed": {
-                    "inbox.json": r#"{ "inbox": [{ "id": "one", "text": "keep me" }] }"#
-                }
-            }),
-        )
-        .await;
-        // The store loads data into memory, but nothing has been saved yet, so
-        // no backup exists in the ring.
-        let (_project, store) = build_store(fs.clone(), cx).await;
-
-        // The file gets corrupted out from under us.
-        fs.save(
-            path!("/root/.zed/inbox.json").as_ref(),
-            &r#"{ "inbox": [ broken"#.into(),
-            Default::default(),
-        )
-        .await
-        .unwrap();
-        flush_saves(cx);
-
-        // Even without a backup, the still-live in-memory data must be offered
-        // for restore (not just surfaced as an unrecoverable error).
-        store.read_with(cx, |store, _| {
-            assert!(store.load_error().is_some());
-            assert!(
-                store.can_restore(),
-                "corruption with live in-memory data must offer a restore"
-            );
-            assert_eq!(store.items()[0].text, "keep me");
-        });
-
-        store.update(cx, |store, cx| store.restore_from_backup(cx));
-        flush_saves(cx);
-        store.read_with(cx, |store, _| {
-            assert_eq!(store.load_error(), None);
-            assert!(!store.can_restore());
-        });
-        let content = fs
-            .load(path!("/root/.zed/inbox.json").as_ref())
-            .await
-            .unwrap();
-        let parsed: InboxFile = serde_json::from_str(&content).unwrap();
-        assert_eq!(parsed.inbox.len(), 1);
-        assert_eq!(parsed.inbox[0].text, "keep me");
-    }
-
-    #[gpui::test]
-    async fn test_mutation_retires_memory_sourced_restore_offer(cx: &mut TestAppContext) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".zed": {
-                    "inbox.json": r#"{ "inbox": [{ "id": "one", "text": "keep me" }] }"#
-                }
-            }),
-        )
-        .await;
-        let (_project, store) = build_store(fs.clone(), cx).await;
-
-        // The file gets corrupted out from under us → recovery banner offering
-        // the still-live in-memory state.
-        fs.save(
-            path!("/root/.zed/inbox.json").as_ref(),
-            &r#"{ "inbox": [ broken"#.into(),
-            Default::default(),
-        )
-        .await
-        .unwrap();
-        flush_saves(cx);
-        store.read_with(cx, |store, _| assert!(store.can_restore()));
-
-        // The user ignores the banner and keeps editing. The live state now
-        // supersedes the snapshot, so the offer must retire immediately —
-        // before the debounced save — or a "Keep empty" click in that window
-        // would wipe healthy data.
-        store.update(cx, |store, cx| {
-            store.capture("new task".into(), None, None, cx);
-        });
-        store.read_with(cx, |store, _| {
-            assert!(
-                !store.can_restore(),
-                "a mutation must retire a memory-sourced restore offer at once"
-            );
-        });
-        store.update(cx, |store, cx| store.dismiss_restore(cx));
-        store.read_with(cx, |store, _| {
-            assert_eq!(store.items().len(), 2, "dismiss must now be a no-op");
-        });
     }
 
     #[gpui::test]
@@ -2080,14 +2117,17 @@ mod tests {
         fs.insert_tree(path!("/root"), json!({})).await;
         let (project, store) = build_store(fs.clone(), cx).await;
 
-        // First session writes data (and thus a backup), then the file is
-        // lost between sessions.
+        // First session writes data (and thus a backup), then the stored
+        // entry is lost between sessions.
         store.update(cx, |store, cx| {
             store.capture("from last time".to_string(), None, None, cx);
         });
         flush_saves(cx);
         drop(store);
-        fs.remove_file(path!("/root/.zed/inbox.json").as_ref(), Default::default())
+        let key_value_store = cx.update(|cx| KeyValueStore::global(cx));
+        key_value_store
+            .scoped(INBOX_KV_NAMESPACE)
+            .delete(project_key(Path::new(path!("/root"))))
             .await
             .unwrap();
 
@@ -2136,7 +2176,10 @@ mod tests {
         });
         flush_saves(cx);
         drop(store);
-        fs.remove_file(path!("/root/.zed/inbox.json").as_ref(), Default::default())
+        let key_value_store = cx.update(|cx| KeyValueStore::global(cx));
+        key_value_store
+            .scoped(INBOX_KV_NAMESPACE)
+            .delete(project_key(Path::new(path!("/root"))))
             .await
             .unwrap();
 
@@ -2184,14 +2227,11 @@ mod tests {
         project.update(cx, |project, cx| project.remove_worktree(root_id, cx));
         cx.run_until_parked();
 
-        let on_disk = fs
-            .load(Path::new(path!("/root/.zed/inbox.json")))
-            .await
-            .unwrap();
+        let stored = stored_for_root(cx, Path::new(path!("/root"))).unwrap();
         assert!(
-            on_disk.contains("typed right before the switch"),
+            stored.contains("typed right before the switch"),
             "an edit pending in the save debounce must be flushed to the \
-             outgoing worktree's file, not silently dropped"
+             outgoing project's entry, not silently dropped"
         );
         store.read_with(cx, |store, _| {
             assert_eq!(store.items().len(), 0, "the new worktree starts empty");
@@ -2203,16 +2243,14 @@ mod tests {
     async fn test_rebind_worktree_does_not_leak_state_into_new_worktree(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                ".zed": {
-                    "inbox.json": r#"{ "inbox": [ { "id": "a", "text": "root item" } ] }"#
-                }
-            }),
+        fs.insert_tree(path!("/root"), json!({})).await;
+        fs.insert_tree(path!("/other"), json!({})).await;
+        seed_kv(
+            cx,
+            Path::new(path!("/root")),
+            r#"{ "inbox": [ { "id": "a", "text": "root item" } ] }"#,
         )
         .await;
-        fs.insert_tree(path!("/other"), json!({})).await;
         let (project, store) = build_store(fs.clone(), cx).await;
         store.read_with(cx, |store, _| assert_eq!(store.items().len(), 1));
         project
@@ -2237,14 +2275,14 @@ mod tests {
             );
             assert!(
                 !store.can_restore(),
-                "a missing inbox.json in the new worktree must not offer the \
+                "a missing entry for the new worktree must not offer the \
                  old project's data for restore"
             );
         });
         flush_saves(cx);
         assert!(
-            !fs.is_file(Path::new(path!("/other/.zed/inbox.json"))).await,
-            "nothing may be written into the new worktree without an edit there"
+            stored_for_root(cx, Path::new(path!("/other"))).is_none(),
+            "nothing may be written for the new worktree without an edit there"
         );
     }
 }

@@ -29,6 +29,7 @@ use gpui::{
     Focusable, FontWeight, IntoElement, ParentElement, Pixels, Point, Render, ScrollHandle,
     Stateful, Styled, Subscription, Task, WeakEntity, Window, actions, anchored, deferred,
 };
+use project::DirectoryLister;
 use theme_settings::ThemeSettings;
 use ui::{
     ButtonLike, Checkbox, ContextMenu, ContextMenuEntry, ContextMenuItem, Disclosure, IconPosition,
@@ -47,7 +48,7 @@ use crate::attachment::{
     AttachmentCompletionProvider, AttachmentSet, OnPick, attach_external_paths, pick_and_attach,
 };
 use crate::inbox_model::{
-    AttachmentRef, InboxItem, ItemId, MetaField, SortMode, catalog_color, format_age,
+    AttachmentRef, InboxFile, InboxItem, ItemId, MetaField, SortMode, catalog_color, format_age,
     item_to_markdown, now_unix, subtask_counts,
 };
 use crate::inbox_panel_settings::{DockSide, InboxPanelSettings, Settings};
@@ -60,6 +61,11 @@ actions!(
         ToggleFocus,
         /// Captures the text of the capture editor as a new inbox item.
         Capture,
+        /// Exports the inbox to a JSON file.
+        ExportInbox,
+        /// Imports items from an exported inbox JSON file, merging them into
+        /// the current inbox.
+        ImportInbox,
     ]
 );
 
@@ -372,7 +378,7 @@ pub(crate) fn send_item_to_chat(
 fn show_inbox_toast(
     workspace: &WeakEntity<Workspace>,
     id: &'static str,
-    message: &'static str,
+    message: impl Into<std::borrow::Cow<'static, str>>,
     cx: &mut App,
 ) {
     let Some(workspace) = workspace.upgrade() else {
@@ -758,9 +764,8 @@ impl InboxPanel {
 
     /// Drops ephemeral catalog references — the preselected capture list, the
     /// staged capture tags and the filter tags — whose keys no longer exist
-    /// in the store (e.g. the entry was deleted or the file was edited
-    /// externally). Covers both a local delete and an external reload
-    /// uniformly, since both emit store events.
+    /// in the store (e.g. the entry was deleted, or a restore/rebind replaced
+    /// the document). Covers both uniformly, since both emit store events.
     fn reconcile_catalog_refs(&mut self, cx: &Context<Self>) {
         let store = self.store.read(cx);
         if let Some(kind) = &self.capture_kind
@@ -1039,8 +1044,182 @@ impl InboxPanel {
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.open_type_editor(window, cx);
                             })),
-                    ),
+                    )
+                    // Export/import need a bound project to be meaningful.
+                    .when(has_worktree, |this| {
+                        this.child(self.render_more_menu(cx))
+                    }),
             )
+    }
+
+    /// The overflow menu: exporting the inbox to a JSON file and importing
+    /// one back — the manual bridge for moved/renamed projects, whose stored
+    /// entry is keyed by the worktree path.
+    fn render_more_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let panel = cx.entity().downgrade();
+        PopoverMenu::new("inbox-more-menu")
+            .trigger(
+                IconButton::new("inbox-more", IconName::Ellipsis)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("More")),
+            )
+            .menu(move |window, cx| {
+                let export_panel = panel.clone();
+                let import_panel = panel.clone();
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    menu.entry("Export Inbox…", None, move |window, cx| {
+                        export_panel
+                            .update(cx, |this, cx| this.export_inbox(&ExportInbox, window, cx))
+                            .ok();
+                    })
+                    .entry("Import Inbox…", None, move |window, cx| {
+                        import_panel
+                            .update(cx, |this, cx| this.import_inbox(&ImportInbox, window, cx))
+                            .ok();
+                    })
+                }))
+            })
+    }
+
+    /// Prompts for a destination and writes the current inbox there as
+    /// pretty JSON. Goes through the workspace prompt so remote projects and
+    /// the `use_system_path_prompts` setting are handled like every other
+    /// save dialog (which also picks the default directory).
+    fn export_inbox(&mut self, _: &ExportInbox, window: &mut Window, cx: &mut Context<Self>) {
+        let store = self.store.clone();
+        let fs = self.fs.clone();
+        let workspace = self.workspace.clone();
+        if !store.read(cx).has_worktree() {
+            show_inbox_toast(
+                &workspace,
+                "inbox-export",
+                "Open a project to export its inbox",
+                cx,
+            );
+            return;
+        }
+        let Some(workspace_entity) = workspace.upgrade() else {
+            return;
+        };
+        let path_prompt = workspace_entity.update(cx, |workspace, cx| {
+            workspace.prompt_for_new_path(
+                DirectoryLister::Project(workspace.project().clone()),
+                Some("inbox.json".to_string()),
+                window,
+                cx,
+            )
+        });
+        cx.spawn(async move |_, cx| {
+            // A receiver error means the dialog was torn down (the workspace
+            // prompt surfaces portal errors itself) — treat it like a cancel.
+            let Ok(Some(paths)) = path_prompt.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            // Snapshot after the dialog closes, so edits made while it was
+            // open are included.
+            let file = store.read_with(cx, |store, _| store.export_snapshot());
+            let write_result = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut content = serde_json::to_string_pretty(&file)?;
+                    content.push('\n');
+                    fs.atomic_write(path, content).await
+                })
+                .await;
+            let message = match write_result {
+                Ok(()) => "Inbox exported".to_string(),
+                Err(error) => format!("Failed to export inbox: {error:#}"),
+            };
+            cx.update(|cx| show_inbox_toast(&workspace, "inbox-export", message, cx));
+        })
+        .detach();
+    }
+
+    /// Prompts for an exported inbox JSON file and merges its items into the
+    /// current inbox (duplicate ids are skipped, current data wins).
+    fn import_inbox(&mut self, _: &ImportInbox, window: &mut Window, cx: &mut Context<Self>) {
+        let fs = self.fs.clone();
+        let workspace = self.workspace.clone();
+        // Without a bound project there is nowhere to persist: the imported
+        // items would show until the next rebind and then silently vanish.
+        if !self.store.read(cx).has_worktree() {
+            show_inbox_toast(
+                &workspace,
+                "inbox-import",
+                "Open a project to import an inbox",
+                cx,
+            );
+            return;
+        }
+        let Some(workspace_entity) = workspace.upgrade() else {
+            return;
+        };
+        let key_when_prompted = self
+            .store
+            .read(cx)
+            .bound_project_key()
+            .map(str::to_owned);
+        let paths_prompt = workspace_entity.update(cx, |workspace, cx| {
+            workspace.prompt_for_open_path(
+                gpui::PathPromptOptions {
+                    files: true,
+                    directories: false,
+                    multiple: false,
+                    prompt: None,
+                },
+                DirectoryLister::Project(workspace.project().clone()),
+                window,
+                cx,
+            )
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Some(paths)) = paths_prompt.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let loaded = cx
+                .background_executor()
+                .spawn(async move {
+                    let text = fs.load(&path).await?;
+                    anyhow::Ok(serde_json::from_str::<InboxFile>(&text)?)
+                })
+                .await;
+            let import_result = match loaded {
+                Ok(snapshot) => {
+                    let Ok(imported) = this.update(cx, |this, cx| {
+                        this.store.update(cx, |store, cx| {
+                            // The project may have been switched while the
+                            // dialog was open; merging the file into a
+                            // different project than the one the user was
+                            // looking at would cross-contaminate inboxes.
+                            anyhow::ensure!(
+                                store.bound_project_key() == key_when_prompted.as_deref(),
+                                "the project changed while the dialog was open"
+                            );
+                            store.import_snapshot(snapshot, cx)
+                        })
+                    }) else {
+                        return;
+                    };
+                    imported
+                }
+                Err(error) => Err(error),
+            };
+            let message = match import_result {
+                Ok(0) => "No new items to import".to_string(),
+                Ok(1) => "Imported 1 item".to_string(),
+                Ok(count) => format!("Imported {count} items"),
+                Err(error) => format!("Failed to import inbox: {error:#}"),
+            };
+            cx.update(|cx| show_inbox_toast(&workspace, "inbox-import", message, cx));
+        })
+        .detach();
     }
 
     /// The "Fields" dropdown: toggles which meta fields show on item rows.
@@ -1161,15 +1340,18 @@ impl InboxPanel {
 
     fn render_error_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let store = self.store.read(cx);
-        // The recovery offer takes priority: it means the file is gone or
-        // corrupt but a backup can bring the data back.
+        // The recovery offer takes priority: it means the stored data is gone
+        // or corrupt but a backup can bring it back.
         if store.can_restore() {
             return Some(self.render_restore_banner(cx));
         }
-        let message = if store.load_error().is_some() {
-            "inbox.json is corrupted — fix the file"
+        // Surface the specific load error: "written by a newer version of
+        // Zed" must reach the user as-is, or they can't know that editing
+        // (and thus overwriting the entry) is the wrong move.
+        let message = if let Some(error) = store.load_error() {
+            format!("Can't load inbox data: {error}")
         } else if store.save_error().is_some() {
-            "Failed to save inbox.json"
+            "Failed to save inbox data".to_string()
         } else {
             return None;
         };
@@ -1198,10 +1380,11 @@ impl InboxPanel {
             )
     }
 
-    /// Banner shown when `.zed/inbox.json` is missing or corrupt but a backup
-    /// holds recoverable data. Offers to restore it or accept the empty state.
+    /// Banner shown when the stored inbox data is missing or corrupt but a
+    /// backup holds recoverable data. Offers to restore it or accept the
+    /// empty state.
     fn render_restore_banner(&self, cx: &mut Context<Self>) -> AnyElement {
-        Self::warning_banner(cx, "inbox.json is missing — restore from backup?")
+        Self::warning_banner(cx, "Inbox data is missing — restore from backup?")
             .child(div().flex_1())
             .child(
                 Button::new("inbox-restore", "Restore")
@@ -2648,6 +2831,8 @@ impl Render for InboxPanel {
             .key_context("InboxPanel")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::capture))
+            .on_action(cx.listener(Self::export_inbox))
+            .on_action(cx.listener(Self::import_inbox))
             .size_full()
             .bg(cx.theme().colors().panel_background)
             .child(self.render_header(cx))

@@ -37,13 +37,12 @@ fn to_base36(mut n: u64) -> String {
     if n == 0 {
         return "0".into();
     }
-    let mut out = Vec::new();
+    let mut out = String::new();
     while n > 0 {
-        out.push(DIGITS[(n % 36) as usize]);
+        out.push(DIGITS[(n % 36) as usize] as char);
         n /= 36;
     }
-    out.reverse();
-    String::from_utf8(out).unwrap()
+    out.chars().rev().collect()
 }
 
 /// How open items are ordered in the list view.
@@ -157,7 +156,9 @@ impl MetaField {
     }
 }
 
-/// The on-disk representation of `.zed/inbox.json`.
+/// The persisted inbox document, stored as JSON in Zed's key-value store
+/// (one entry per project). Legacy `.zed/inbox.json` files are imported once
+/// and left untouched.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct InboxFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -195,8 +196,8 @@ impl InboxFile {
 }
 
 /// A reference-only pointer to a file attached to an inbox item. Only the
-/// path is stored — never file content — so it is safe to persist verbatim to
-/// the git-committed `.zed/inbox.json`.
+/// path is stored — never file content — so persisting it verbatim stays
+/// cheap no matter how large the referenced file is.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum AttachmentRef {
