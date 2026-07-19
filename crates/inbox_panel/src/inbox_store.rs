@@ -7,7 +7,7 @@ use std::{
 use collections::HashSet;
 use fs::{Fs, RemoveOptions};
 use futures::StreamExt as _;
-use gpui::{App, Context, Entity, EventEmitter, Subscription, Task};
+use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Subscription, Task, TaskExt as _};
 use project::{Project, WorktreeId};
 use sha2::{Digest as _, Sha256};
 use util::{ResultExt as _, rel_path::RelPath};
@@ -102,6 +102,11 @@ pub struct InboxStore {
     fs: Arc<dyn Fs>,
     state: InboxFile,
     worktree_id: Option<WorktreeId>,
+    /// Absolute path of the bound worktree's inbox file plus its backup dir,
+    /// cached while the worktree is alive: on a `WorktreeRemoved` event the
+    /// worktree is already gone from the project, but a pending edit must
+    /// still be flushed to the file it owned.
+    bound_paths: Option<(PathBuf, Option<PathBuf>)>,
     /// The last content we wrote (or loaded), used to suppress reloads caused
     /// by our own writes.
     last_saved_content: Option<String>,
@@ -137,6 +142,7 @@ impl InboxStore {
             fs,
             state: InboxFile::default(),
             worktree_id,
+            bound_paths: None,
             last_saved_content: None,
             load_error: None,
             save_error: None,
@@ -180,13 +186,58 @@ impl InboxStore {
             .visible_worktrees(cx)
             .next()
             .map(|worktree| worktree.read(cx).id());
-        if worktree_id != self.worktree_id {
-            self.worktree_id = worktree_id;
-            self.last_saved_content = None;
-            self.dirty = false;
-            self.restorable = None;
-            self.reload(cx);
+        if worktree_id == self.worktree_id {
+            return;
         }
+        if self.dirty {
+            // The pending debounced save would run after the switch, see
+            // `dirty == false` and silently drop the edit; write it to the
+            // outgoing worktree's file now, while its path is still bound.
+            self.flush_state_to_disk(cx);
+        }
+        self.worktree_id = worktree_id;
+        // Reset to a clean slate before reloading: carrying the old
+        // worktree's items across would leak them into the new project (and
+        // a missing inbox.json there would even offer to "restore" them).
+        self.state = InboxFile::default();
+        self.last_saved_content = None;
+        self.dirty = false;
+        self.restorable = None;
+        self.load_error = None;
+        self.save_error = None;
+        cx.emit(InboxStoreEvent::Reloaded);
+        self.reload(cx);
+    }
+
+    /// Immediately writes the current state to the bound worktree's file and
+    /// backup ring, bypassing the save debounce. Fire-and-forget: the store
+    /// may be rebinding away from this worktree, so failures are only logged.
+    fn flush_state_to_disk(&mut self, cx: &mut Context<Self>) {
+        // The cached path, not `inbox_abs_path`: on a `WorktreeRemoved` event
+        // the worktree is already gone from the project, but the file it
+        // owned is still on disk and must receive the pending edit.
+        let Some((abs_path, backup_dir)) = self.bound_paths.clone() else {
+            return;
+        };
+        let fs = self.fs.clone();
+        let mut file = self.state.clone();
+        file.version = Some(1);
+        let backup_dir = backup_dir.filter(|_| file.has_content());
+        let seq = self.backup_seq;
+        self.backup_seq += 1;
+        cx.background_spawn(async move {
+            let mut content = serde_json::to_string_pretty(&file)?;
+            content.push('\n');
+            if let Some(dir) = abs_path.parent() {
+                fs.create_dir(dir).await?;
+            }
+            fs.atomic_write(abs_path, content.clone()).await?;
+            if let Some(dir) = backup_dir {
+                write_backup(&fs, dir, content, now_unix_millis(), seq).await;
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     fn inbox_abs_path(&self, cx: &App) -> Option<PathBuf> {
@@ -214,6 +265,7 @@ impl InboxStore {
 
     fn reload(&mut self, cx: &mut Context<Self>) {
         let Some(abs_path) = self.inbox_abs_path(cx) else {
+            self.bound_paths = None;
             if self.dirty {
                 // Unsaved local mutations win over whatever is on disk right
                 // now; the pending save will persist them shortly.
@@ -230,6 +282,7 @@ impl InboxStore {
             return;
         };
         let backup_dir = self.backup_dir(cx);
+        self.bound_paths = Some((abs_path.clone(), backup_dir.clone()));
         let fs = self.fs.clone();
         cx.spawn(async move |this, cx| {
             let raw = if fs.is_file(&abs_path).await {
@@ -240,13 +293,21 @@ impl InboxStore {
             let outcome = match raw {
                 None => ReloadOutcome::Missing,
                 Some(Err(error)) => ReloadOutcome::Failed(format!("{error:#}")),
-                Some(Ok(text)) => match serde_json::from_str::<InboxFile>(&text) {
-                    Ok(state) => ReloadOutcome::Loaded {
-                        text,
-                        state: Box::new(state),
-                    },
-                    Err(error) => ReloadOutcome::Failed(error.to_string()),
-                },
+                // Parse off the UI thread: a large inbox.json would otherwise
+                // stall the foreground executor on every external change.
+                Some(Ok(text)) => {
+                    cx.background_executor()
+                        .spawn(async move {
+                            match serde_json::from_str::<InboxFile>(&text) {
+                                Ok(state) => ReloadOutcome::Loaded {
+                                    text,
+                                    state: Box::new(state),
+                                },
+                                Err(error) => ReloadOutcome::Failed(error.to_string()),
+                            }
+                        })
+                        .await
+                }
             };
             // Only reach for a backup when the live file didn't yield usable
             // data; a healthy reload never touches the backup ring.
@@ -2095,5 +2156,95 @@ mod tests {
             assert_eq!(store.items().len(), 1);
             assert_eq!(store.items()[0].text, "typed before deciding");
         });
+    }
+
+    #[gpui::test]
+    async fn test_rebind_worktree_flushes_unsaved_edits(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({})).await;
+        fs.insert_tree(path!("/other"), json!({})).await;
+        let (project, store) = build_store(fs.clone(), cx).await;
+        project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree(path!("/other"), true, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        // Capture an edit and, while its debounced save is still pending,
+        // remove the tracked worktree so the store rebinds to the other one.
+        store.update(cx, |store, cx| {
+            store.capture("typed right before the switch".to_string(), None, None, cx);
+        });
+        let root_id = project.read_with(cx, |project, cx| {
+            project.visible_worktrees(cx).next().unwrap().read(cx).id()
+        });
+        project.update(cx, |project, cx| project.remove_worktree(root_id, cx));
+        cx.run_until_parked();
+
+        let on_disk = fs
+            .load(Path::new(path!("/root/.zed/inbox.json")))
+            .await
+            .unwrap();
+        assert!(
+            on_disk.contains("typed right before the switch"),
+            "an edit pending in the save debounce must be flushed to the \
+             outgoing worktree's file, not silently dropped"
+        );
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.items().len(), 0, "the new worktree starts empty");
+            assert!(!store.can_restore());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_rebind_worktree_does_not_leak_state_into_new_worktree(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".zed": {
+                    "inbox.json": r#"{ "inbox": [ { "id": "a", "text": "root item" } ] }"#
+                }
+            }),
+        )
+        .await;
+        fs.insert_tree(path!("/other"), json!({})).await;
+        let (project, store) = build_store(fs.clone(), cx).await;
+        store.read_with(cx, |store, _| assert_eq!(store.items().len(), 1));
+        project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree(path!("/other"), true, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        let root_id = project.read_with(cx, |project, cx| {
+            project.visible_worktrees(cx).next().unwrap().read(cx).id()
+        });
+        project.update(cx, |project, cx| project.remove_worktree(root_id, cx));
+        cx.run_until_parked();
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.items().len(),
+                0,
+                "the previous project's items must not leak into the new worktree"
+            );
+            assert!(
+                !store.can_restore(),
+                "a missing inbox.json in the new worktree must not offer the \
+                 old project's data for restore"
+            );
+        });
+        flush_saves(cx);
+        assert!(
+            !fs.is_file(Path::new(path!("/other/.zed/inbox.json"))).await,
+            "nothing may be written into the new worktree without an edit there"
+        );
     }
 }
