@@ -4,7 +4,10 @@
 use std::collections::HashMap;
 
 use editor::{Editor, EditorEvent};
-use gpui::{AnyElement, Context, Entity, FontWeight, Hsla, Render, Subscription, Window};
+use gpui::{
+    AnyElement, ClickEvent, Context, Entity, FontWeight, Hsla, Pixels, Point, Render, Subscription,
+    Window, anchored, deferred,
+};
 use ui::{Tab, TintColor, Tooltip, prelude::*};
 
 use crate::InboxPanel;
@@ -39,9 +42,10 @@ impl Render for DraggedInboxType {
 /// when it closes.
 pub(crate) struct TypeEditorState {
     rename_editors: HashMap<String, (Entity<Editor>, Subscription)>,
-    /// The key of the custom list whose delete action is pending
-    /// confirmation, if any. Only one row can be confirming at a time.
-    confirming_delete: Option<String>,
+    /// The custom list whose delete action is pending confirmation, plus the
+    /// window position of the confirm popover, if any. Only one row can be
+    /// confirming at a time.
+    confirming_delete: Option<(String, Point<Pixels>)>,
 }
 
 impl TypeEditorState {
@@ -73,7 +77,7 @@ impl TypeEditorState {
             .iter()
             .map(|inbox_type| (inbox_type.key.clone(), inbox_type.label.clone()))
             .collect();
-        if let Some(pending) = &self.confirming_delete {
+        if let Some((pending, _)) = &self.confirming_delete {
             if !types.iter().any(|(type_key, _)| type_key == pending) {
                 self.confirming_delete = None;
             }
@@ -155,78 +159,28 @@ impl InboxPanel {
         key: &str,
         color: gpui::Hsla,
         editor: Entity<Editor>,
-        confirming_delete: bool,
         reorderable: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let trailing: AnyElement = if confirming_delete {
-            h_flex()
-                .flex_none()
-                .gap_1()
-                .child(
-                    Label::new("Delete list?")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
-                .child(
-                    Button::new(
-                        SharedString::from(format!("inbox-type-delete-cancel-{key}")),
-                        "Cancel",
-                    )
-                    .style(ButtonStyle::Subtle)
-                    .size(ButtonSize::Compact)
-                    .on_click(cx.listener({
-                        let key = key.to_string();
-                        move |this, _, _, cx| {
-                            if let Some(state) = this.type_editor.as_mut() {
-                                if state.confirming_delete.as_deref() == Some(key.as_str()) {
-                                    state.confirming_delete = None;
-                                }
-                            }
-                            cx.notify();
-                        }
-                    })),
-                )
-                .child(
-                    Button::new(
-                        SharedString::from(format!("inbox-type-delete-confirm-{key}")),
-                        "Delete",
-                    )
-                    .style(ButtonStyle::Tinted(TintColor::Error))
-                    .size(ButtonSize::Compact)
-                    .on_click(cx.listener({
-                        let key = key.to_string();
-                        move |this, _, window, cx| {
-                            let store = this.store.clone();
-                            store.update(cx, |store, cx| store.delete_type(&key, cx));
-                            if let Some(state) = this.type_editor.as_mut() {
-                                state.confirming_delete = None;
-                                state.sync(&store, window, cx);
-                            }
-                            cx.notify();
-                        }
-                    })),
-                )
-                .into_any_element()
-        } else {
-            IconButton::new(
-                SharedString::from(format!("inbox-type-delete-{key}")),
-                IconName::Close,
-            )
-            .icon_size(IconSize::XSmall)
-            .icon_color(Color::Muted)
-            .tooltip(Tooltip::text("Delete list"))
-            .on_click(cx.listener({
-                let key = key.to_string();
-                move |this, _, _, cx| {
-                    if let Some(state) = this.type_editor.as_mut() {
-                        state.confirming_delete = Some(key.clone());
-                    }
-                    cx.notify();
+        // The confirm popover is anchored at the click and rendered at the
+        // overlay root (see `render_type_delete_confirmation`), matching how
+        // the list rows confirm a task deletion.
+        let trailing = IconButton::new(
+            SharedString::from(format!("inbox-type-delete-{key}")),
+            IconName::Close,
+        )
+        .icon_size(IconSize::XSmall)
+        .icon_color(Color::Muted)
+        .tooltip(Tooltip::text("Delete list"))
+        .on_click(cx.listener({
+            let key = key.to_string();
+            move |this, event: &ClickEvent, _, cx| {
+                if let Some(state) = this.type_editor.as_mut() {
+                    state.confirming_delete = Some((key.clone(), event.position()));
                 }
-            }))
-            .into_any_element()
-        };
+                cx.notify();
+            }
+        }));
 
         let label = SharedString::from(editor.read(cx).text(cx));
         h_flex()
@@ -345,9 +299,8 @@ impl InboxPanel {
             .iter()
             .filter_map(|(key, color)| {
                 let editor = state.editor(key)?.clone();
-                let confirming_delete = state.confirming_delete.as_deref() == Some(key.as_str());
                 Some(
-                    self.render_type_row(key, *color, editor, confirming_delete, reorderable, cx)
+                    self.render_type_row(key, *color, editor, reorderable, cx)
                         .into_any_element(),
                 )
             })
@@ -434,7 +387,68 @@ impl InboxPanel {
                 .bg(cx.theme().colors().panel_background)
                 .child(header)
                 .child(body)
+                .children(self.render_type_delete_confirmation(cx))
                 .into_any_element(),
+        )
+    }
+
+    /// The delete-confirmation popover for a list, anchored where the row's
+    /// trash button was clicked. Mirrors the item rows' confirmation in the
+    /// main list.
+    fn render_type_delete_confirmation(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (key, position) = self.type_editor.as_ref()?.confirming_delete.clone()?;
+        Some(
+            deferred(
+                anchored()
+                    .position(position)
+                    .anchor(gpui::Anchor::TopLeft)
+                    .child(
+                        v_flex()
+                            .occlude()
+                            .elevation_2(cx)
+                            .p_2()
+                            .gap_2()
+                            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                if let Some(state) = this.type_editor.as_mut() {
+                                    state.confirming_delete = None;
+                                }
+                                cx.notify();
+                            }))
+                            .child(Label::new("Delete list?"))
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .justify_end()
+                                    .child(
+                                        Button::new("inbox-type-delete-cancel", "Cancel")
+                                            .style(ButtonStyle::Subtle)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                if let Some(state) = this.type_editor.as_mut() {
+                                                    state.confirming_delete = None;
+                                                }
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("inbox-type-delete-confirm", "Delete")
+                                            .style(ButtonStyle::Tinted(TintColor::Error))
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                let store = this.store.clone();
+                                                store.update(cx, |store, cx| {
+                                                    store.delete_type(&key, cx)
+                                                });
+                                                if let Some(state) = this.type_editor.as_mut() {
+                                                    state.confirming_delete = None;
+                                                    state.sync(&store, window, cx);
+                                                }
+                                                cx.notify();
+                                            })),
+                                    ),
+                            ),
+                    ),
+            )
+            .with_priority(1)
+            .into_any_element(),
         )
     }
 }

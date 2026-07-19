@@ -115,15 +115,18 @@ pub enum MetaField {
     Subtasks,
     /// The captured-from file context link.
     Context,
+    /// The file attachments chip.
+    Attachments,
 }
 
 impl MetaField {
     /// All fields, in display order.
-    pub const ALL: [MetaField; 4] = [
+    pub const ALL: [MetaField; 5] = [
         MetaField::List,
         MetaField::Age,
         MetaField::Subtasks,
         MetaField::Context,
+        MetaField::Attachments,
     ];
 
     /// Stable key persisted in `hidden_fields`.
@@ -133,6 +136,7 @@ impl MetaField {
             MetaField::Age => "age",
             MetaField::Subtasks => "subtasks",
             MetaField::Context => "context",
+            MetaField::Attachments => "attachments",
         }
     }
 
@@ -143,6 +147,7 @@ impl MetaField {
             MetaField::Age => "Time",
             MetaField::Subtasks => "Subtasks",
             MetaField::Context => "Context",
+            MetaField::Attachments => "Attachments",
         }
     }
 }
@@ -178,6 +183,38 @@ impl InboxFile {
     }
 }
 
+/// A reference-only pointer to a file attached to an inbox item. Only the
+/// path is stored — never file content — so it is safe to persist verbatim to
+/// the git-committed `.zed/inbox.json`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum AttachmentRef {
+    /// A file inside the worktree. `path` is unix-style and worktree-relative,
+    /// the same convention as [`InboxItem::from`].
+    Project { path: String },
+    /// A file outside the project. `path` is an absolute, platform-native path.
+    External { path: String },
+}
+
+impl AttachmentRef {
+    /// The stored path, regardless of kind.
+    pub fn path(&self) -> &str {
+        match self {
+            AttachmentRef::Project { path } | AttachmentRef::External { path } => path,
+        }
+    }
+
+    /// The last path component, for display in a chip. Splits on both `/` and
+    /// `\` so external Windows paths render sensibly too.
+    pub fn display_name(&self) -> &str {
+        let path = self.path();
+        path.rsplit(['/', '\\'])
+            .next()
+            .filter(|component| !component.is_empty())
+            .unwrap_or(path)
+    }
+}
+
 /// A single captured inbox entry.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct InboxItem {
@@ -197,6 +234,9 @@ pub struct InboxItem {
     /// Markdown body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
+    /// Reference-only file attachments (paths only, never content).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentRef>,
     /// Unix seconds, UTC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created: Option<i64>,
@@ -332,6 +372,7 @@ mod tests {
             kind: None,
             from: None,
             body: None,
+            attachments: Vec::new(),
             created: None,
             cleared: None,
         };
@@ -395,6 +436,7 @@ mod tests {
                 kind: None,
                 from: None,
                 body: None,
+                attachments: Vec::new(),
                 created: None,
                 cleared: None,
             }],
@@ -407,6 +449,7 @@ mod tests {
         assert!(!json.contains("types"));
         assert!(!json.contains("archived"));
         assert!(!json.contains("kind"));
+        assert!(!json.contains("attachments"));
         assert!(!json.contains("sort"));
         assert!(!json.contains("hidden_fields"));
 
@@ -428,6 +471,7 @@ mod tests {
             kind: None,
             from: None,
             body: None,
+            attachments: Vec::new(),
             created: Some(created),
             cleared: None,
         };
@@ -454,6 +498,42 @@ mod tests {
         let mut za = base;
         SortMode::Za.apply(&mut za);
         assert_eq!(texts(&za), ["Cherry", "banana", "apple"]);
+    }
+
+    #[test]
+    fn test_attachment_ref_display_name() {
+        let project = AttachmentRef::Project {
+            path: "src/editor.rs".into(),
+        };
+        assert_eq!(project.path(), "src/editor.rs");
+        assert_eq!(project.display_name(), "editor.rs");
+
+        let external = AttachmentRef::External {
+            path: r"C:\Users\me\notes.txt".into(),
+        };
+        assert_eq!(external.display_name(), "notes.txt");
+
+        let unix_external = AttachmentRef::External {
+            path: "/home/me/todo.md".into(),
+        };
+        assert_eq!(unix_external.display_name(), "todo.md");
+    }
+
+    #[test]
+    fn test_attachment_ref_serde_roundtrip() {
+        let refs = vec![
+            AttachmentRef::Project {
+                path: "src/main.rs".into(),
+            },
+            AttachmentRef::External {
+                path: "/tmp/scratch.log".into(),
+            },
+        ];
+        let json = serde_json::to_string(&refs).unwrap();
+        assert!(json.contains(r#""kind":"project""#));
+        assert!(json.contains(r#""kind":"external""#));
+        let parsed: Vec<AttachmentRef> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, refs);
     }
 
     #[test]

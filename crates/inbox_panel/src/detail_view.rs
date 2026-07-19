@@ -7,28 +7,30 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use editor::{Editor, EditorElement, EditorEvent, EditorStyle, MultiBufferOffset};
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, Context, DismissEvent, Entity, EventEmitter, FocusHandle,
-    Focusable, FontStyle, FontWeight, IntoElement, MouseButton, ParentElement, Pixels, Point,
-    Render, ScrollHandle, StrikethroughStyle, Styled, Subscription, TextStyle, TextStyleRefinement,
-    UnderlineStyle, WeakEntity, Window, anchored, canvas, deferred, point,
+    AnyElement, App, Bounds, ClickEvent, Context, DismissEvent, Entity, EventEmitter, ExternalPaths,
+    FocusHandle, Focusable, FontStyle, FontWeight, IntoElement, MouseButton, ParentElement, Pixels,
+    Point, Render, ScrollHandle, StrikethroughStyle, Styled, Subscription, TextStyle,
+    TextStyleRefinement, UnderlineStyle, WeakEntity, Window, anchored, canvas, deferred, point,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownStyle};
 use settings::Settings as _;
 use theme_settings::ThemeSettings;
 use ui::{
-    Checkbox, ContextMenu, ContextMenuEntry, Divider, Tab, TintColor, ToggleState, Tooltip,
-    prelude::*,
+    Checkbox, ContextMenu, ContextMenuEntry, Divider, Tab, ToggleState, Tooltip, prelude::*,
 };
 use workspace::Workspace;
 
-use crate::block::{Block, BlockDocument, BlockId, BlockType, CaretPos, EditTarget};
-use crate::inbox_model::{InboxItem, ItemId, format_age, now_unix, type_color};
+use crate::attachment::{AttachmentCompletionProvider, OnPick, attach_external_paths};
+use crate::block::{Block, BlockDocument, BlockId, BlockType, CaretPos};
+use crate::inbox_model::{AttachmentRef, InboxItem, ItemId, format_age, now_unix};
 use crate::inbox_store::{InboxStore, InboxStoreEvent};
-use crate::open_capture_context;
+use crate::{confirmation_popover, open_attachment, open_capture_context};
 use crate::slash_menu::{self, SlashEntry, SlashMenuState};
 
 pub enum InboxDetailEvent {
@@ -51,6 +53,9 @@ pub struct InboxDetailView {
     item_id: ItemId,
     workspace: WeakEntity<Workspace>,
     title_editor: Entity<Editor>,
+    /// Whether the title editor currently renders the cleared (struck-through)
+    /// style, so [`Self::apply_title_style`] can skip redundant updates.
+    title_cleared: bool,
     /// The block model of the item's markdown body.
     document: BlockDocument,
     /// Lazily-created markdown renderers for the text blocks, keyed by block
@@ -68,7 +73,12 @@ pub struct InboxDetailView {
     grip_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     /// Window position of the delete-confirmation popover while it is open.
     confirming_delete: Option<Point<Pixels>>,
+    /// Pending confirmation before removing an attachment.
+    confirming_attachment_removal: Option<(AttachmentRef, Point<Pixels>)>,
     scroll_handle: ScrollHandle,
+    /// Scroll position of the slash menu's entry list, so keyboard navigation
+    /// can scroll the selected block type into view.
+    slash_scroll_handle: ScrollHandle,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -81,17 +91,34 @@ impl InboxDetailView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let (text, body) = store
+        let (text, body, cleared) = store
             .read(cx)
             .item(&item_id)
-            .map(|item| (item.text.clone(), item.body.clone()))
+            .map(|item| (item.text.clone(), item.body.clone(), item.is_cleared()))
             .unwrap_or_default();
 
         let title_editor = cx.new(|cx| {
             let mut editor = Editor::auto_height(1, 6, window, cx);
             editor.set_placeholder_text("Item title", window, cx);
             editor.set_text(text, window, cx);
+            editor.set_text_style_refinement(Self::title_style_refinement(cleared, cx));
             editor
+        });
+        // `@` in the title picks a project file and writes it straight to the
+        // item's attachments (the item already exists here).
+        title_editor.update(cx, |editor, _| {
+            let store = store.downgrade();
+            let item_id = item_id.clone();
+            let on_pick: OnPick = Arc::new(move |attachment, cx| {
+                store
+                    .update(cx, |store, cx| {
+                        store.add_attachment(&item_id, attachment, cx);
+                    })
+                    .ok();
+            });
+            editor.set_completion_provider(Some(std::rc::Rc::new(
+                AttachmentCompletionProvider::new(workspace.clone(), on_pick),
+            )));
         });
 
         let subscriptions = vec![
@@ -104,6 +131,7 @@ impl InboxDetailView {
             item_id,
             workspace,
             title_editor,
+            title_cleared: cleared,
             document: BlockDocument::from_markdown(body.as_deref().unwrap_or_default()),
             read_markdown: HashMap::default(),
             editing: None,
@@ -111,10 +139,49 @@ impl InboxDetailView {
             block_bounds: Rc::default(),
             grip_menu: None,
             confirming_delete: None,
+            confirming_attachment_removal: None,
             scroll_handle: ScrollHandle::new(),
+            slash_scroll_handle: ScrollHandle::new(),
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
         }
+    }
+
+    /// The title editor's style refinement: a muted strikethrough once the
+    /// item is cleared (mirroring the struck-through rows in the list),
+    /// otherwise the editor's default style.
+    fn title_style_refinement(cleared: bool, cx: &App) -> TextStyleRefinement {
+        if cleared {
+            let muted = Color::Muted.color(cx);
+            TextStyleRefinement {
+                color: Some(muted),
+                strikethrough: Some(StrikethroughStyle {
+                    thickness: px(1.),
+                    color: Some(muted),
+                }),
+                ..Default::default()
+            }
+        } else {
+            TextStyleRefinement::default()
+        }
+    }
+
+    /// Reapplies [`Self::title_style_refinement`] when the item's cleared state
+    /// has changed (e.g. after it is toggled or the file is reloaded); a no-op
+    /// otherwise, so unrelated store events don't churn the editor style.
+    fn apply_title_style(&mut self, cx: &mut Context<Self>) {
+        let cleared = self
+            .store
+            .read(cx)
+            .item(&self.item_id)
+            .is_some_and(InboxItem::is_cleared);
+        if cleared == self.title_cleared {
+            return;
+        }
+        self.title_cleared = cleared;
+        self.title_editor.update(cx, |editor, cx| {
+            editor.set_text_style_refinement(Self::title_style_refinement(cleared, cx));
+        });
     }
 
     fn handle_title_editor_event(
@@ -155,8 +222,14 @@ impl InboxDetailView {
                     cx.notify();
                 }
             }
-            InboxStoreEvent::Changed => cx.notify(),
+            InboxStoreEvent::Changed => {
+                self.apply_title_style(cx);
+                cx.notify();
+            }
             InboxStoreEvent::Reloaded => {
+                // The attachment list may be different now, so drop any pending
+                // removal confirmation rather than acting on a stale reference.
+                self.confirming_attachment_removal = None;
                 let Some(item) = self.store.read(cx).item(&self.item_id).cloned() else {
                     cx.emit(InboxDetailEvent::Closed);
                     return;
@@ -180,6 +253,7 @@ impl InboxDetailView {
                     self.title_editor
                         .update(cx, |editor, cx| editor.set_text(item.text, window, cx));
                 }
+                self.apply_title_style(cx);
                 cx.notify();
             }
         }
@@ -393,18 +467,25 @@ impl InboxDetailView {
             self.slash_menu = None;
             return;
         }
-        match &mut self.slash_menu {
-            Some(state) if state.block_id == block_id => {
+        let same_block = self
+            .slash_menu
+            .as_ref()
+            .is_some_and(|state| state.block_id == block_id);
+        if same_block {
+            if let Some(state) = self.slash_menu.as_mut() {
                 // The list may have shrunk; keep the selection valid.
                 state.selected = state.selected.min(len - 1);
             }
-            _ => {
-                self.slash_menu = Some(SlashMenuState {
-                    block_id,
-                    selected: 0,
-                });
-            }
+        } else {
+            self.slash_menu = Some(SlashMenuState {
+                block_id,
+                selected: 0,
+            });
         }
+        // Scroll the (possibly freshly reset) selection into view, dropping any
+        // stale offset left over from a previous slash session.
+        let selected = self.slash_menu.as_ref().map_or(0, |state| state.selected);
+        self.slash_scroll_handle.scroll_to_item(selected);
     }
 
     /// The currently selected entry of the open slash menu, if the menu is
@@ -438,6 +519,8 @@ impl InboxDetailView {
         if let Some(state) = self.slash_menu.as_mut() {
             let current = state.selected.min(len - 1) as isize;
             state.selected = (current + delta).clamp(0, len as isize - 1) as usize;
+            // Keep the newly selected entry in view.
+            self.slash_scroll_handle.scroll_to_item(state.selected);
         }
         cx.notify();
         true
@@ -938,13 +1021,7 @@ impl InboxDetailView {
         }
     }
 
-    fn render_header(&self, cleared: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let (toggle_icon, toggle_label, toggle_color, toggle_tooltip) = if cleared {
-            (IconName::Check, "Done", Color::Created, "Return to inbox")
-        } else {
-            (IconName::Circle, "Clear", Color::Muted, "Mark as cleared")
-        };
-
+    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .flex_none()
             .h(Tab::container_height(cx))
@@ -967,21 +1044,11 @@ impl InboxDetailView {
             )
             .child(div().flex_1())
             .child(
-                Button::new("inbox-detail-toggle-cleared", toggle_label)
-                    .style(ButtonStyle::Subtle)
-                    .label_size(LabelSize::Small)
-                    .color(toggle_color)
-                    .start_icon(
-                        Icon::new(toggle_icon)
-                            .size(IconSize::Small)
-                            .color(toggle_color),
-                    )
-                    .tooltip(Tooltip::text(toggle_tooltip))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        let item_id = this.item_id.clone();
-                        this.store
-                            .update(cx, |store, cx| store.toggle_cleared(&item_id, cx));
-                    })),
+                IconButton::new("inbox-detail-attach", IconName::Paperclip)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Attach file"))
+                    .on_click(cx.listener(|this, _, window, cx| this.pick_attachment(window, cx))),
             )
             .child(
                 IconButton::new("inbox-detail-delete", IconName::Trash)
@@ -997,27 +1064,110 @@ impl InboxDetailView {
             )
     }
 
+    /// Opens the OS file dialog and attaches the chosen files to the item.
+    fn pick_attachment(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let project = workspace.read(cx).project().clone();
+        let store = self.store.clone();
+        let item_id = self.item_id.clone();
+        let receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Attach files".into()),
+        });
+        cx.spawn(async move |_, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            let _ = cx.update(|cx| {
+                attach_external_paths(&paths, &project, cx, |attachment, cx| {
+                    store.update(cx, |store, cx| store.add_attachment(&item_id, attachment, cx));
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// Attaches dropped OS files to the item.
+    fn stage_external_attachments(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let project = workspace.read(cx).project().clone();
+        let store = self.store.clone();
+        let item_id = self.item_id.clone();
+        attach_external_paths(paths, &project, cx, |attachment, cx| {
+            store.update(cx, |store, cx| store.add_attachment(&item_id, attachment, cx));
+        });
+    }
+
+    /// The item's attachment chips, each opening the file on click and removing
+    /// it via the trailing button. `None` when the item has no attachments.
+    fn render_attachments(
+        &self,
+        item: &InboxItem,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        if item.attachments.is_empty() {
+            return None;
+        }
+        let attachments = item.attachments.clone();
+        Some(
+            h_flex()
+                .flex_wrap()
+                .gap_1()
+                .pl(px(28.))
+                .children(attachments.into_iter().enumerate().map(|(index, attachment)| {
+                    let open = attachment.clone();
+                    let remove = attachment.clone();
+                    let on_open = cx.listener(move |this, _, window, cx| {
+                        open_attachment(&this.workspace, &open, window, cx);
+                    });
+                    let on_remove = cx.listener(move |this, event: &ClickEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.confirming_attachment_removal =
+                            Some((remove.clone(), event.position()));
+                        cx.notify();
+                    });
+                    crate::removable_attachment_chip(
+                        SharedString::from(format!("inbox-detail-attachment-{index}")),
+                        ("inbox-detail-attachment-remove", index),
+                        &attachment,
+                        cx,
+                        on_open,
+                        on_remove,
+                    )
+                    .into_any_element()
+                })),
+        )
+    }
+
     fn render_title(&self, item: &InboxItem, cx: &mut Context<Self>) -> impl IntoElement {
-        let type_info: Option<(SharedString, gpui::Hsla)> = {
+        let cleared = item.is_cleared();
+        // The title editor lays out its lines at this height, so a checkbox
+        // box of the same height (centered) lines up with the first line.
+        let line_height = ThemeSettings::get_global(cx).buffer_line_height.value();
+        let type_label: Option<SharedString> = {
             let store = self.store.read(cx);
-            store.resolve_kind(item).map(|inbox_type| {
-                (
-                    SharedString::from(inbox_type.label.clone()),
-                    type_color(&inbox_type.color, cx),
-                )
-            })
+            store
+                .resolve_kind(item)
+                .map(|inbox_type| SharedString::from(inbox_type.label.clone()))
         };
 
-        let mut meta = h_flex()
-            .flex_wrap()
-            .items_center()
-            .gap_2()
-            .pl(px(16.))
-            .text_xs()
-            .font_buffer(cx)
-            .text_color(cx.theme().colors().text_placeholder);
-        if let Some((type_label, _)) = type_info.clone() {
-            meta = meta.child(type_label);
+        // Meta line segments in the UI font. They are joined with "·" only
+        // *between* segments below, so an absent leading segment never leaves a
+        // dangling separator; subtasks show only when the body has any.
+        let mut segments: Vec<AnyElement> = Vec::new();
+        if let Some(type_label) = type_label {
+            segments.push(
+                Label::new(type_label)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .into_any_element(),
+            );
         }
         if let Some(created) = item.created {
             let age = format_age(created, now_unix());
@@ -1026,14 +1176,24 @@ impl InboxDetailView {
             } else {
                 format!("captured {age} ago")
             };
-            meta = meta.child("·").child(captured);
+            segments.push(
+                Label::new(captured)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .into_any_element(),
+            );
         }
         if let Some(from) = item.from.clone() {
-            meta = meta.child("·").child(
+            segments.push(
                 h_flex()
                     .id("inbox-detail-from")
                     .gap_1()
                     .cursor_pointer()
+                    .text_xs()
+                    // The captured location is a code path, so it keeps the
+                    // buffer font while the prose segments use the UI font.
+                    .font_buffer(cx)
+                    .text_color(cx.theme().colors().text_placeholder)
                     .hover(|style| style.text_color(cx.theme().colors().text_accent))
                     .on_click(cx.listener({
                         let from = from.clone();
@@ -1046,16 +1206,33 @@ impl InboxDetailView {
                             .size(IconSize::XSmall)
                             .color(Color::Placeholder),
                     )
-                    .child(from),
+                    .child(from)
+                    .into_any_element(),
             );
         }
         let (done, total) = self.document.subtask_counts();
-        let subtasks = if total > 0 {
-            format!("{done}/{total} subtasks")
-        } else {
-            "no subtasks".to_string()
-        };
-        meta = meta.child("·").child(subtasks);
+        if total > 0 {
+            segments.push(
+                Label::new(format!("{done}/{total} subtasks"))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .into_any_element(),
+            );
+        }
+
+        // Align the meta line under the title text, past the leading checkbox
+        // (20px box + gap_2).
+        let mut meta = h_flex().flex_wrap().items_center().gap_1p5().pl(px(28.));
+        for (index, segment) in segments.into_iter().enumerate() {
+            if index > 0 {
+                meta = meta.child(
+                    Label::new("·")
+                        .size(LabelSize::Small)
+                        .color(Color::Placeholder),
+                );
+            }
+            meta = meta.child(segment);
+        }
 
         v_flex()
             .flex_none()
@@ -1067,21 +1244,40 @@ impl InboxDetailView {
             // (plain Enter is unbound in auto-height editors) and moves
             // editing into the first block of the body.
             .on_action(cx.listener(Self::handle_title_confirm))
-            .child({
-                let mut title_row = h_flex().items_start().gap_2();
-                if let Some((_, type_square_color)) = type_info {
-                    title_row = title_row.child(
-                        div()
-                            .flex_none()
-                            .mt(px(5.))
-                            .size(px(8.))
-                            .rounded_xs()
-                            .bg(type_square_color),
-                    );
-                }
-                title_row.child(div().flex_1().min_w_0().child(self.title_editor.clone()))
-            })
+            .child(
+                h_flex()
+                    .items_start()
+                    .gap_2()
+                    // The cleared checkbox sits next to the title, mirroring
+                    // the item rows in the list, vertically centered on the
+                    // title's first line.
+                    .child(
+                        h_flex().flex_none().h(rems(0.875 * line_height)).child(
+                            Checkbox::new(
+                                "inbox-detail-cleared",
+                                if cleared {
+                                    ToggleState::Selected
+                                } else {
+                                    ToggleState::Unselected
+                                },
+                            )
+                            .fill()
+                            .tooltip(Tooltip::text(if cleared {
+                                "Return to inbox"
+                            } else {
+                                "Mark as cleared"
+                            }))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let item_id = this.item_id.clone();
+                                this.store
+                                    .update(cx, |store, cx| store.toggle_cleared(&item_id, cx));
+                            })),
+                        ),
+                    )
+                    .child(div().flex_1().min_w_0().child(self.title_editor.clone())),
+            )
             .child(meta)
+            .children(self.render_attachments(item, cx))
     }
 
     fn render_code_block(&self, block: &Block, cx: &App) -> AnyElement {
@@ -1219,6 +1415,7 @@ impl InboxDetailView {
                 } else {
                     "Empty line"
                 })
+                .size(LabelSize::Small)
                 .color(Color::Placeholder)
                 .into_any_element(),
                 _ => {
@@ -1295,40 +1492,7 @@ impl InboxDetailView {
         for (index, block) in blocks.iter().enumerate() {
             body = body.child(self.render_block(block, index == last_index, window, cx));
         }
-        body.child(
-            div()
-                .id("inbox-detail-trailing")
-                .min_h(px(70.))
-                .mt_1()
-                .px_1()
-                .py_2()
-                .cursor_text()
-                .on_click(cx.listener(|this, _, window, cx| {
-                    // Reuse a trailing empty paragraph instead of stacking
-                    // new ones.
-                    let target = match this.document.blocks().last() {
-                        Some(last)
-                            if last.block_type == BlockType::Paragraph && last.text.is_empty() =>
-                        {
-                            EditTarget {
-                                block: last.id,
-                                caret: CaretPos::Start,
-                            }
-                        }
-                        _ => {
-                            let target = this.document.append_paragraph();
-                            this.save_body(cx);
-                            target
-                        }
-                    };
-                    this.start_editing(target.block, target.caret, window, cx);
-                }))
-                .child(
-                    Label::new("Click to continue — type or «/» for a block")
-                        .size(LabelSize::Small)
-                        .color(Color::Placeholder),
-                ),
-        )
+        body
     }
 
     /// The slash menu popup, anchored to the bottom-left of the edited
@@ -1354,35 +1518,16 @@ impl InboxDetailView {
 
         let selected_bg = cx.theme().colors().element_selected;
         let badge_bg = cx.theme().colors().editor_background;
-        let mut list = v_flex()
-            .id("inbox-slash-menu")
-            .occlude()
-            .elevation_2(cx)
-            .min_w(px(230.))
-            .max_h(px(290.))
+        // The header stays pinned; only the entry list scrolls, so
+        // `slash_scroll_handle.scroll_to_item(index)` maps straight to an entry
+        // index without a header offset.
+        let mut entry_list = v_flex()
+            .id("inbox-slash-entries")
+            .track_scroll(&self.slash_scroll_handle)
             .overflow_y_scroll()
-            .py_1()
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| {
-                this.slash_menu = None;
-                // If the click also moved focus away, the skipped-while-open
-                // Blurred already went by: finish the edit here.
-                if let Some(state) = &this.editing
-                    && !state.editor.focus_handle(cx).is_focused(window)
-                {
-                    this.commit_editing(cx);
-                }
-                cx.notify();
-            }))
-            .child(
-                div().px_2().py_0p5().child(
-                    Label::new("BLOCK TYPE")
-                        .size(LabelSize::XSmall)
-                        .weight(FontWeight::BOLD)
-                        .color(Color::Placeholder),
-                ),
-            );
+            .max_h(px(260.));
         for (index, entry) in entries.into_iter().enumerate() {
-            list = list.child(
+            entry_list = entry_list.child(
                 h_flex()
                     .id(("inbox-slash-entry", index))
                     .mx_1()
@@ -1435,6 +1580,33 @@ impl InboxDetailView {
             );
         }
 
+        let list = v_flex()
+            .id("inbox-slash-menu")
+            .occlude()
+            .elevation_2(cx)
+            .min_w(px(230.))
+            .py_1()
+            .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                this.slash_menu = None;
+                // If the click also moved focus away, the skipped-while-open
+                // Blurred already went by: finish the edit here.
+                if let Some(state) = &this.editing
+                    && !state.editor.focus_handle(cx).is_focused(window)
+                {
+                    this.commit_editing(cx);
+                }
+                cx.notify();
+            }))
+            .child(
+                div().px_2().py_0p5().child(
+                    Label::new("BLOCK TYPE")
+                        .size(LabelSize::XSmall)
+                        .weight(FontWeight::BOLD)
+                        .color(Color::Placeholder),
+                ),
+            )
+            .child(entry_list);
+
         Some(
             deferred(
                 anchored()
@@ -1449,55 +1621,80 @@ impl InboxDetailView {
 
     /// The delete-confirmation popover, anchored where the trash button was
     /// clicked. Mirrors the item rows' confirmation in the list panel.
+    /// Confirmation popover for removing an attachment from the item.
+    fn render_attachment_removal_confirmation(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (attachment, position) = self.confirming_attachment_removal.clone()?;
+        let entity = cx.entity().downgrade();
+        let dismiss = {
+            let entity = entity.clone();
+            Rc::new(move |_: &mut Window, cx: &mut App| {
+                entity
+                    .update(cx, |this, cx| {
+                        this.confirming_attachment_removal = None;
+                        cx.notify();
+                    })
+                    .ok();
+            }) as Rc<dyn Fn(&mut Window, &mut App)>
+        };
+        let confirm = Rc::new(move |_: &mut Window, cx: &mut App| {
+            entity
+                .update(cx, |this, cx| {
+                    this.confirming_attachment_removal = None;
+                    let item_id = this.item_id.clone();
+                    this.store.update(cx, |store, cx| {
+                        store.remove_attachment(&item_id, &attachment, cx)
+                    });
+                    cx.notify();
+                })
+                .ok();
+        }) as Rc<dyn Fn(&mut Window, &mut App)>;
+        Some(confirmation_popover(
+            "inbox-detail-attachment-remove",
+            position,
+            gpui::Anchor::TopLeft,
+            "Remove attachment?",
+            "Remove",
+            dismiss,
+            confirm,
+            cx,
+        ))
+    }
+
     fn render_delete_confirmation(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let position = self.confirming_delete?;
-        Some(
-            deferred(
-                anchored()
-                    .position(position)
-                    .anchor(gpui::Anchor::TopRight)
-                    .child(
-                        v_flex()
-                            .occlude()
-                            .elevation_2(cx)
-                            .p_2()
-                            .gap_2()
-                            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                                this.confirming_delete = None;
-                                cx.notify();
-                            }))
-                            .child(Label::new("Delete item?"))
-                            .child(
-                                h_flex()
-                                    .gap_1()
-                                    .justify_end()
-                                    .child(
-                                        Button::new("inbox-detail-delete-cancel", "Cancel")
-                                            .style(ButtonStyle::Subtle)
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.confirming_delete = None;
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("inbox-detail-delete-confirm", "Delete")
-                                            .style(ButtonStyle::Tinted(TintColor::Error))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.confirming_delete = None;
-                                                let item_id = this.item_id.clone();
-                                                // The store emits `ItemDeleted`,
-                                                // which closes this view.
-                                                this.store.update(cx, |store, cx| {
-                                                    store.delete_item(&item_id, cx)
-                                                });
-                                            })),
-                                    ),
-                            ),
-                    ),
-            )
-            .with_priority(1)
-            .into_any_element(),
-        )
+        let entity = cx.entity().downgrade();
+        let dismiss = {
+            let entity = entity.clone();
+            Rc::new(move |_: &mut Window, cx: &mut App| {
+                entity
+                    .update(cx, |this, cx| {
+                        this.confirming_delete = None;
+                        cx.notify();
+                    })
+                    .ok();
+            }) as Rc<dyn Fn(&mut Window, &mut App)>
+        };
+        let confirm = Rc::new(move |_: &mut Window, cx: &mut App| {
+            entity
+                .update(cx, |this, cx| {
+                    this.confirming_delete = None;
+                    let item_id = this.item_id.clone();
+                    // The store emits `ItemDeleted`, which closes this view.
+                    this.store
+                        .update(cx, |store, cx| store.delete_item(&item_id, cx));
+                })
+                .ok();
+        }) as Rc<dyn Fn(&mut Window, &mut App)>;
+        Some(confirmation_popover(
+            "inbox-detail-delete",
+            position,
+            gpui::Anchor::TopRight,
+            "Delete item?",
+            "Delete",
+            dismiss,
+            confirm,
+            cx,
+        ))
     }
 }
 
@@ -1519,10 +1716,13 @@ impl Render for InboxDetailView {
             }))
             .size_full()
             .bg(cx.theme().colors().panel_background)
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
+                this.stage_external_attachments(paths.paths(), cx);
+            }))
             // The item can briefly be gone while the delete event is still in
             // flight; `Closed` is already on its way in that case.
             .when_some(item, |this, item| {
-                this.child(self.render_header(item.is_cleared(), cx))
+                this.child(self.render_header(cx))
                     .child(self.render_title(&item, cx))
                     .child(self.render_body(window, cx))
             })
@@ -1537,6 +1737,7 @@ impl Render for InboxDetailView {
                 .with_priority(1)
             }))
             .children(self.render_delete_confirmation(cx))
+            .children(self.render_attachment_removal_confirmation(cx))
     }
 }
 

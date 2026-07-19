@@ -12,8 +12,8 @@ use sha2::{Digest as _, Sha256};
 use util::{ResultExt as _, rel_path::RelPath};
 
 use crate::inbox_model::{
-    InboxFile, InboxItem, InboxType, ItemId, SortMode, TYPE_COLOR_TOKENS, new_item_id, now_unix,
-    now_unix_millis,
+    AttachmentRef, InboxFile, InboxItem, InboxType, ItemId, SortMode, TYPE_COLOR_TOKENS,
+    new_item_id, now_unix, now_unix_millis,
 };
 
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(250);
@@ -505,6 +505,7 @@ impl InboxStore {
                 kind,
                 from,
                 body: None,
+                attachments: Vec::new(),
                 created: Some(now_unix()),
                 cleared: None,
             },
@@ -627,6 +628,42 @@ impl InboxStore {
 
     pub fn set_body(&mut self, id: &ItemId, body: Option<String>, cx: &mut Context<Self>) {
         self.update_item(id, cx, |item| item.body = body);
+    }
+
+    /// Replaces the item's attachment list.
+    pub fn set_attachments(
+        &mut self,
+        id: &ItemId,
+        attachments: Vec<AttachmentRef>,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_item(id, cx, |item| item.attachments = attachments);
+    }
+
+    /// Appends a reference, de-duplicated by full equality.
+    pub fn add_attachment(
+        &mut self,
+        id: &ItemId,
+        attachment: AttachmentRef,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_item(id, cx, |item| {
+            if !item.attachments.contains(&attachment) {
+                item.attachments.push(attachment);
+            }
+        });
+    }
+
+    /// Removes a reference if present.
+    pub fn remove_attachment(
+        &mut self,
+        id: &ItemId,
+        attachment: &AttachmentRef,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_item(id, cx, |item| {
+            item.attachments.retain(|existing| existing != attachment);
+        });
     }
 
     pub fn toggle_cleared(&mut self, id: &ItemId, cx: &mut Context<Self>) {

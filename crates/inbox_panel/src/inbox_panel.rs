@@ -1,3 +1,4 @@
+pub mod attachment;
 pub mod block;
 pub mod detail_view;
 pub mod inbox_model;
@@ -10,15 +11,21 @@ mod type_editor;
 pub use detail_view::{InboxDetailEvent, InboxDetailView};
 pub use inbox_store::{InboxStore, InboxStoreEvent};
 
-use std::{collections::HashSet, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    rc::Rc,
+    sync::Arc,
+    time::Duration,
+};
 
 use editor::Editor;
 use fs::Fs;
 use gpui::{
-    Action, AnyElement, App, AppContext as _, AsyncWindowContext, ClickEvent, Context, ElementId,
-    Entity, EventEmitter, FocusHandle, Focusable, FontWeight, IntoElement, ParentElement, Pixels,
-    Point, Render, ScrollHandle, Styled, Subscription, Task, WeakEntity, Window, actions, anchored,
-    deferred,
+    Action, AnyElement, App, AppContext as _, AsyncWindowContext, ClickEvent, Context, Div,
+    ElementId, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, FontWeight, IntoElement,
+    ParentElement, Pixels, Point, Render, ScrollHandle, Stateful, Styled, Subscription, Task,
+    WeakEntity, Window, actions, anchored, deferred,
 };
 use theme_settings::ThemeSettings;
 use ui::{
@@ -31,9 +38,10 @@ use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
 };
 
+use crate::attachment::{AttachmentCompletionProvider, AttachmentSet, OnPick, attach_external_paths};
 use crate::inbox_model::{
-    InboxItem, ItemId, MetaField, SortMode, format_age, now_unix, parse_context, subtask_counts,
-    type_color,
+    AttachmentRef, InboxItem, ItemId, MetaField, SortMode, format_age, now_unix, parse_context,
+    subtask_counts, type_color,
 };
 use crate::inbox_panel_settings::{DockSide, InboxPanelSettings, Settings};
 use crate::type_editor::TypeEditorState;
@@ -52,6 +60,12 @@ const INBOX_PANEL_KEY: &str = "InboxPanel";
 
 /// How often the item age labels ("2m"/"15h") are refreshed.
 const AGE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Line height (in rems) of an item row's title. Chosen to comfortably fit the
+/// 20px checkbox so it centers on the first line without over-spacing the text;
+/// independent of the editor's `buffer_line_height`, which governs body text,
+/// not this UI label.
+const ITEM_LINE_HEIGHT: f32 = 1.3;
 
 /// Whether the open items are shown as a flat list or grouped by type.
 #[derive(Clone, Copy, PartialEq)]
@@ -113,6 +127,9 @@ pub struct InboxPanel {
     focus_handle: FocusHandle,
     store: Entity<InboxStore>,
     capture_editor: Entity<Editor>,
+    /// Attachments staged for the next capture (added via `@` or the file
+    /// picker). Drained into the item when it is captured.
+    capture_attachments: Entity<AttachmentSet>,
     /// Type key preselected for the next capture. `None` means no type.
     capture_kind: Option<String>,
     view_mode: ViewMode,
@@ -125,6 +142,8 @@ pub struct InboxPanel {
     /// The detail view overlay of a single item; `Some` while it is open.
     detail: Option<(Entity<InboxDetailView>, Subscription)>,
     confirming_delete: Option<(ItemId, Point<Pixels>)>,
+    /// Pending confirmation before removing a staged capture attachment.
+    confirming_attachment_removal: Option<(AttachmentRef, Point<Pixels>)>,
     scroll_handle: ScrollHandle,
     _age_refresh: Task<()>,
     _subscriptions: Vec<Subscription>,
@@ -178,6 +197,159 @@ pub(crate) fn open_capture_context(
         .detach_and_log_err(cx);
 }
 
+/// Opens a file attachment in the workspace: a project-relative path through
+/// the project, an external absolute path directly. Shared by the capture box,
+/// item rows and the detail view.
+pub(crate) fn open_attachment(
+    workspace: &WeakEntity<Workspace>,
+    attachment: &AttachmentRef,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(workspace) = workspace.upgrade() else {
+        return;
+    };
+    match attachment {
+        AttachmentRef::Project { path } => {
+            let Some(project_path) = workspace
+                .read(cx)
+                .project()
+                .read(cx)
+                .find_project_path(Path::new(path), cx)
+            else {
+                log::warn!("inbox panel: attachment not found in project: {path}");
+                return;
+            };
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.open_path(project_path, None, true, window, cx)
+                })
+                .detach_and_log_err(cx);
+        }
+        AttachmentRef::External { path } => {
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.open_abs_path(
+                        PathBuf::from(path),
+                        workspace::OpenOptions::default(),
+                        window,
+                        cx,
+                    )
+                })
+                .detach_and_log_err(cx);
+        }
+    }
+}
+
+/// The shared visual for a file-attachment chip: a file icon and the display
+/// name. Callers add trailing controls and a click handler.
+fn attachment_chip(id: impl Into<ElementId>, attachment: &AttachmentRef, cx: &App) -> Stateful<Div> {
+    let name = attachment.display_name();
+    let name = if name.trim().is_empty() {
+        "(file)".to_string()
+    } else {
+        name.to_string()
+    };
+    // The full path is recoverable on hover, since the label truncates.
+    let full_path = SharedString::from(attachment.path().to_string());
+    h_flex()
+        .id(id)
+        .flex_none()
+        .h(px(22.))
+        // Cap the width so a long file name truncates instead of stretching
+        // the tray; `overflow_hidden` + the label's `truncate()` clip it.
+        .max_w(px(180.))
+        .gap_1()
+        .pl_1p5()
+        .pr_1()
+        .rounded_sm()
+        .bg(cx.theme().colors().element_background)
+        .overflow_hidden()
+        .tooltip(Tooltip::text(full_path))
+        .child(
+            Icon::new(IconName::File)
+                .size(IconSize::XSmall)
+                .color(Color::Muted),
+        )
+        // The `min_w_0` wrapper lets the label shrink and truncate so a
+        // trailing remove button (added by callers) always stays visible.
+        .child(
+            div().min_w_0().overflow_hidden().child(
+                Label::new(name)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .truncate(),
+            ),
+        )
+}
+
+/// An [`attachment_chip`] with a trailing remove button. `on_open` fires when
+/// the chip body is clicked; `on_remove` fires from the trailing button (which
+/// already stops propagation). Shared by the capture box and the detail view.
+fn removable_attachment_chip(
+    chip_id: impl Into<ElementId>,
+    remove_id: impl Into<ElementId>,
+    attachment: &AttachmentRef,
+    cx: &App,
+    on_open: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_remove: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    attachment_chip(chip_id, attachment, cx)
+        .child(
+            IconButton::new(remove_id, IconName::Close)
+                .icon_size(IconSize::XSmall)
+                .icon_color(Color::Muted)
+                .tooltip(Tooltip::text("Remove attachment"))
+                .on_click(on_remove),
+        )
+        .on_click(on_open)
+}
+
+/// A small "Title? [Cancel] [Confirm]" popover anchored at `position`. The
+/// `dismiss` and `confirm` callbacks own whatever state reset the caller needs
+/// (they capture a `WeakEntity`), which keeps this free of the caller's view
+/// type. Shared by every delete/remove confirmation in the panel and detail.
+pub(crate) fn confirmation_popover(
+    id: &'static str,
+    position: Point<Pixels>,
+    anchor: gpui::Anchor,
+    title: impl Into<SharedString>,
+    confirm_label: impl Into<SharedString>,
+    dismiss: Rc<dyn Fn(&mut Window, &mut App)>,
+    confirm: Rc<dyn Fn(&mut Window, &mut App)>,
+    cx: &App,
+) -> AnyElement {
+    let on_dismiss = dismiss.clone();
+    deferred(
+        anchored().position(position).anchor(anchor).child(
+            v_flex()
+                .occlude()
+                .elevation_2(cx)
+                .p_2()
+                .gap_2()
+                .on_mouse_down_out(move |_, window, cx| dismiss(window, cx))
+                .child(Label::new(title.into()))
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .justify_end()
+                        .child(
+                            Button::new(SharedString::from(format!("{id}-cancel")), "Cancel")
+                                .style(ButtonStyle::Subtle)
+                                .on_click(move |_, window, cx| on_dismiss(window, cx)),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("{id}-confirm")), confirm_label)
+                                .style(ButtonStyle::Tinted(TintColor::Error))
+                                .on_click(move |_, window, cx| confirm(window, cx)),
+                        ),
+                ),
+        ),
+    )
+    .with_priority(1)
+    .into_any_element()
+}
+
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
@@ -220,6 +392,25 @@ impl InboxPanel {
                 editor
             });
 
+            // Staging list for `@`/picker attachments added before the item
+            // exists; the `@` completion provider pushes into it.
+            let capture_attachments = cx.new(|_| AttachmentSet::default());
+            capture_editor.update(cx, |editor, _| {
+                let attachments = capture_attachments.downgrade();
+                let on_pick: OnPick = Arc::new(move |attachment, cx| {
+                    attachments
+                        .update(cx, |set, cx| {
+                            if set.add(attachment) {
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                });
+                editor.set_completion_provider(Some(Rc::new(
+                    AttachmentCompletionProvider::new(weak_workspace.clone(), on_pick),
+                )));
+            });
+
             let focus_handle = cx.focus_handle();
             let editor_focus_handle = capture_editor.focus_handle(cx);
             let subscriptions = vec![
@@ -229,6 +420,8 @@ impl InboxPanel {
                 // focus state.
                 cx.on_focus_in(&editor_focus_handle, window, |_, _, cx| cx.notify()),
                 cx.on_focus_out(&editor_focus_handle, window, |_, _, _, cx| cx.notify()),
+                // Re-render the staged attachment chips when the set changes.
+                cx.observe(&capture_attachments, |_, _, cx| cx.notify()),
             ];
 
             let age_refresh = cx.spawn(async move |this, cx| {
@@ -246,6 +439,7 @@ impl InboxPanel {
                 focus_handle,
                 store,
                 capture_editor,
+                capture_attachments,
                 capture_kind: None,
                 view_mode: ViewMode::All,
                 collapsed_groups: HashSet::default(),
@@ -253,6 +447,7 @@ impl InboxPanel {
                 type_editor: None,
                 detail: None,
                 confirming_delete: None,
+                confirming_attachment_removal: None,
                 scroll_handle: ScrollHandle::new(),
                 _age_refresh: age_refresh,
                 _subscriptions: subscriptions,
@@ -352,8 +547,13 @@ impl InboxPanel {
         }
         let kind = self.capture_kind.clone();
         let from = self.active_editor_context(window, cx);
+        let attachments = self.capture_attachments.update(cx, |set, _| set.take());
+        self.confirming_attachment_removal = None;
         self.store.update(cx, |store, cx| {
-            store.capture(text, kind, from, cx);
+            let id = store.capture(text, kind, from, cx);
+            if !attachments.is_empty() {
+                store.set_attachments(&id, attachments, cx);
+            }
         });
         self.capture_editor
             .update(cx, |editor, cx| editor.set_text("", window, cx));
@@ -380,7 +580,130 @@ impl InboxPanel {
         })
     }
 
+    /// Opens the OS file dialog and stages the chosen files as attachments for
+    /// the next capture.
+    fn pick_capture_attachment(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let project = workspace.read(cx).project().clone();
+        let set = self.capture_attachments.clone();
+        let receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Attach files".into()),
+        });
+        cx.spawn(async move |_, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            let _ = cx.update(|cx| {
+                attach_external_paths(&paths, &project, cx, |attachment, cx| {
+                    set.update(cx, |set, cx| {
+                        if set.add(attachment) {
+                            cx.notify();
+                        }
+                    });
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// Stages dropped OS files as attachments for the next capture.
+    fn stage_external_attachments(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let project = workspace.read(cx).project().clone();
+        let set = self.capture_attachments.clone();
+        attach_external_paths(paths, &project, cx, |attachment, cx| {
+            set.update(cx, |set, cx| {
+                if set.add(attachment) {
+                    cx.notify();
+                }
+            });
+        });
+    }
+
+    /// The staged-attachment chips, laid out as the flexible middle of the
+    /// capture box's control row (so files never add a second row). Also acts
+    /// as the spacer that pushes the trailing controls to the right; empty when
+    /// nothing is staged.
+    fn render_capture_attachments(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let attachments = self.capture_attachments.read(cx).list().to_vec();
+        h_flex()
+            .id("inbox-capture-attachments")
+            .flex_1()
+            .min_w_0()
+            .gap_1()
+            // One scrolling row rather than wrapping, so adding files never
+            // grows the capture box taller.
+            .overflow_x_scroll()
+            .children(attachments.into_iter().enumerate().map(|(index, attachment)| {
+                let open = attachment.clone();
+                let remove = attachment.clone();
+                let on_open = cx.listener(move |this, _, window, cx| {
+                    open_attachment(&this.workspace, &open, window, cx);
+                });
+                let on_remove = cx.listener(move |this, event: &ClickEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.confirming_attachment_removal = Some((remove.clone(), event.position()));
+                    cx.notify();
+                });
+                removable_attachment_chip(
+                    ("capture-attachment", index),
+                    ("capture-attachment-remove", index),
+                    &attachment,
+                    cx,
+                    on_open,
+                    on_remove,
+                )
+            }))
+    }
+
+    /// Confirmation popover for removing a staged capture attachment.
+    fn render_attachment_removal_confirmation(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (attachment, position) = self.confirming_attachment_removal.clone()?;
+        let entity = cx.entity().downgrade();
+        let dismiss = {
+            let entity = entity.clone();
+            Rc::new(move |_: &mut Window, cx: &mut App| {
+                entity
+                    .update(cx, |this, cx| {
+                        this.confirming_attachment_removal = None;
+                        cx.notify();
+                    })
+                    .ok();
+            }) as Rc<dyn Fn(&mut Window, &mut App)>
+        };
+        let confirm = Rc::new(move |_: &mut Window, cx: &mut App| {
+            entity
+                .update(cx, |this, cx| {
+                    this.confirming_attachment_removal = None;
+                    this.capture_attachments.update(cx, |set, cx| {
+                        set.remove(&attachment);
+                        cx.notify();
+                    });
+                    cx.notify();
+                })
+                .ok();
+        }) as Rc<dyn Fn(&mut Window, &mut App)>;
+        Some(confirmation_popover(
+            "inbox-capture-attachment-remove",
+            position,
+            gpui::Anchor::TopLeft,
+            "Remove attachment?",
+            "Remove",
+            dismiss,
+            confirm,
+            cx,
+        ))
+    }
+
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let has_worktree = self.store.read(cx).has_worktree();
         h_flex()
             .flex_none()
             .h(Tab::container_height(cx))
@@ -396,7 +719,12 @@ impl InboxPanel {
                             .size(IconSize::Small)
                             .color(Color::Muted),
                     )
-                    .child(Label::new("Inbox").weight(FontWeight::MEDIUM)),
+                    .child(Label::new("Inbox").weight(FontWeight::MEDIUM))
+                    // The list/grouped view selector lives here in the header
+                    // next to the title, not inside the scrolled list body.
+                    .when(has_worktree, |this| {
+                        this.child(self.render_view_mode_toggle(cx))
+                    }),
             )
             .child(
                 h_flex()
@@ -893,24 +1221,44 @@ impl InboxPanel {
                 // under `key_context("InboxPanel")`.
                 .key_context("InboxCapture")
                 .on_action(cx.listener(Self::capture))
+                .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
+                    this.stage_external_attachments(paths.paths(), cx);
+                }))
                 .bg(cx.theme().colors().editor_background)
                 .rounded_md()
                 .border_1()
                 .border_color(border_color)
                 .child(div().px_2().pt_1p5().child(self.capture_editor.clone()))
                 .child(
+                    // One control row: [type] · [attachment chips, scrolling] ·
+                    // [attach] [add]. Chips live here so they never add height.
                     h_flex()
                         .px_2()
                         .py_1()
-                        .when(has_types, |this| this.justify_between())
-                        .when(!has_types, |this| this.justify_end())
+                        .gap_2()
+                        .items_center()
                         .when(has_types, |this| {
                             this.child(self.render_capture_type_menu(chip_label, chip_color, cx))
                         })
+                        .child(self.render_capture_attachments(cx))
                         .child(
-                            Label::new("↵ add")
-                                .size(LabelSize::XSmall)
-                                .color(Color::Placeholder),
+                            h_flex()
+                                .flex_none()
+                                .gap_1()
+                                .child(
+                                    IconButton::new("inbox-attach", IconName::Paperclip)
+                                        .icon_size(IconSize::XSmall)
+                                        .icon_color(Color::Muted)
+                                        .tooltip(Tooltip::text("Attach file"))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.pick_capture_attachment(window, cx);
+                                        })),
+                                )
+                                .child(
+                                    Label::new("↵ add")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Placeholder),
+                                ),
                         ),
                 ),
         )
@@ -1003,21 +1351,22 @@ impl InboxPanel {
             // `Muted` (not `Disabled`) so cleared/archived text stays legible in
             // both themes, including under the hover background on dark themes.
             Label::new(item.text.clone())
-                .size(LabelSize::Large)
+                .size(LabelSize::Default)
                 .color(Color::Muted)
                 .strikethrough()
         } else {
-            Label::new(item.text.clone()).size(LabelSize::Large)
+            Label::new(item.text.clone()).size(LabelSize::Default)
         };
 
         // Per-field visibility, toggled from the header "Fields" menu.
-        let (hide_list, hide_age, hide_subtasks, hide_context) = {
+        let (hide_list, hide_age, hide_subtasks, hide_context, hide_attachments) = {
             let store = self.store.read(cx);
             (
                 store.is_field_hidden(MetaField::List.key()),
                 store.is_field_hidden(MetaField::Age.key()),
                 store.is_field_hidden(MetaField::Subtasks.key()),
                 store.is_field_hidden(MetaField::Context.key()),
+                store.is_field_hidden(MetaField::Attachments.key()),
             )
         };
 
@@ -1083,6 +1432,20 @@ impl InboxPanel {
                     )
                     .child(from),
             );
+        }
+        if !hide_attachments {
+            for (index, attachment) in item.attachments.iter().enumerate() {
+                let open = attachment.clone();
+                let chip_id =
+                    SharedString::from(format!("inbox-item-attachment-{}-{index}", item.id));
+                meta = meta.child(
+                    attachment_chip(chip_id, attachment, cx)
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            open_attachment(&this.workspace, &open, window, cx);
+                        })),
+                );
+            }
         }
 
         let delete_button_id = SharedString::from(format!("inbox-item-delete-{}", item.id));
@@ -1150,7 +1513,12 @@ impl InboxPanel {
                     }
                 }))
             })
-            .child(div().flex_none().child(checkbox))
+            .child(
+                h_flex()
+                    .flex_none()
+                    .h(rems(ITEM_LINE_HEIGHT))
+                    .child(checkbox),
+            )
             .child(
                 v_flex()
                     .flex_1()
@@ -1159,6 +1527,7 @@ impl InboxPanel {
                     .child(
                         div()
                             .id(SharedString::from(format!("inbox-item-text-{}", item.id)))
+                            .line_height(rems(ITEM_LINE_HEIGHT))
                             .cursor_pointer()
                             .on_click(cx.listener({
                                 let id = item.id.clone();
@@ -1225,7 +1594,7 @@ impl InboxPanel {
             ViewMode::Grouped => "By list",
         };
         let panel = cx.entity().downgrade();
-        h_flex().flex_none().mb_1().child(
+        h_flex().flex_none().child(
             PopoverMenu::new("inbox-view-mode-menu")
                 .trigger(
                     ButtonLike::new("inbox-view-mode-trigger")
@@ -1511,9 +1880,6 @@ impl InboxPanel {
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll_handle)
                     .p_1()
-                    .when(!open.is_empty(), |this| {
-                        this.child(self.render_view_mode_toggle(cx))
-                    })
                     .when(show_empty_state, |this| {
                         this.child(self.render_empty_state(cx))
                     })
@@ -1546,52 +1912,39 @@ impl InboxPanel {
         )
     }
 
-    fn render_delete_confirmation(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    fn render_delete_confirmation(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (id, position) = self.confirming_delete.clone()?;
-        Some(
-            deferred(
-                anchored()
-                    .position(position)
-                    .anchor(gpui::Anchor::TopLeft)
-                    .child(
-                        v_flex()
-                            .occlude()
-                            .elevation_2(cx)
-                            .p_2()
-                            .gap_2()
-                            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                                this.confirming_delete = None;
-                                cx.notify();
-                            }))
-                            .child(Label::new("Delete item?"))
-                            .child(
-                                h_flex()
-                                    .gap_1()
-                                    .justify_end()
-                                    .child(
-                                        Button::new("inbox-delete-cancel", "Cancel")
-                                            .style(ButtonStyle::Subtle)
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.confirming_delete = None;
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("inbox-delete-confirm", "Delete")
-                                            .style(ButtonStyle::Tinted(TintColor::Error))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.confirming_delete = None;
-                                                this.store.update(cx, |store, cx| {
-                                                    store.delete_item(&id, cx)
-                                                });
-                                                cx.notify();
-                                            })),
-                                    ),
-                            ),
-                    ),
-            )
-            .with_priority(1),
-        )
+        let entity = cx.entity().downgrade();
+        let dismiss = {
+            let entity = entity.clone();
+            Rc::new(move |_: &mut Window, cx: &mut App| {
+                entity
+                    .update(cx, |this, cx| {
+                        this.confirming_delete = None;
+                        cx.notify();
+                    })
+                    .ok();
+            }) as Rc<dyn Fn(&mut Window, &mut App)>
+        };
+        let confirm = Rc::new(move |_: &mut Window, cx: &mut App| {
+            entity
+                .update(cx, |this, cx| {
+                    this.confirming_delete = None;
+                    this.store.update(cx, |store, cx| store.delete_item(&id, cx));
+                    cx.notify();
+                })
+                .ok();
+        }) as Rc<dyn Fn(&mut Window, &mut App)>;
+        Some(confirmation_popover(
+            "inbox-item-delete",
+            position,
+            gpui::Anchor::TopLeft,
+            "Delete item?",
+            "Delete",
+            dismiss,
+            confirm,
+            cx,
+        ))
     }
 }
 
@@ -1685,5 +2038,6 @@ impl Render for InboxPanel {
             .children(self.render_type_editor(cx))
             .children(self.render_detail_overlay(cx))
             .children(self.render_delete_confirmation(cx))
+            .children(self.render_attachment_removal_confirmation(cx))
     }
 }
