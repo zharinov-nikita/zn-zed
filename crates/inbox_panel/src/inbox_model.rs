@@ -109,6 +109,8 @@ impl SortMode {
 pub enum MetaField {
     /// The list (type) chip.
     List,
+    /// The tag chips.
+    Tags,
     /// The captured-age label.
     Age,
     /// The subtask counter.
@@ -121,8 +123,9 @@ pub enum MetaField {
 
 impl MetaField {
     /// All fields, in display order.
-    pub const ALL: [MetaField; 5] = [
+    pub const ALL: [MetaField; 6] = [
         MetaField::List,
+        MetaField::Tags,
         MetaField::Age,
         MetaField::Subtasks,
         MetaField::Context,
@@ -133,6 +136,7 @@ impl MetaField {
     pub fn key(&self) -> &'static str {
         match self {
             MetaField::List => "list",
+            MetaField::Tags => "tags",
             MetaField::Age => "age",
             MetaField::Subtasks => "subtasks",
             MetaField::Context => "context",
@@ -144,6 +148,7 @@ impl MetaField {
     pub fn label(&self) -> &'static str {
         match self {
             MetaField::List => "List",
+            MetaField::Tags => "Tags",
             MetaField::Age => "Time",
             MetaField::Subtasks => "Subtasks",
             MetaField::Context => "Context",
@@ -161,7 +166,10 @@ pub struct InboxFile {
     pub inbox: Vec<InboxItem>,
     /// Custom item types. Empty by default (no built-in types).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub types: Vec<InboxType>,
+    pub types: Vec<CatalogEntry>,
+    /// Custom item tags. Empty by default (no built-in tags).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<CatalogEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub archived: Vec<InboxItem>,
     /// How open items are ordered. Omitted from disk when set to `Manual`.
@@ -175,11 +183,14 @@ pub struct InboxFile {
 
 impl InboxFile {
     /// Whether this state holds user data worth backing up: any open item,
-    /// archived item, or custom list. Bare settings (sort, hidden fields) do
-    /// not count, so a backup is never overwritten with an effectively empty
-    /// snapshot.
+    /// archived item, custom list or custom tag. Bare settings (sort, hidden
+    /// fields) do not count, so a backup is never overwritten with an
+    /// effectively empty snapshot.
     pub fn has_content(&self) -> bool {
-        !self.inbox.is_empty() || !self.archived.is_empty() || !self.types.is_empty()
+        !self.inbox.is_empty()
+            || !self.archived.is_empty()
+            || !self.types.is_empty()
+            || !self.tags.is_empty()
     }
 }
 
@@ -225,9 +236,13 @@ pub struct InboxItem {
     #[serde(default = "new_item_id")]
     pub id: ItemId,
     pub text: String,
-    /// Key of an [`InboxType`]. `None` means "note".
+    /// Key of a list [`CatalogEntry`]. `None` means "note".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// Keys of tag [`CatalogEntry`]s. Unknown keys are tolerated and simply
+    /// not displayed, mirroring how a stale `kind` resolves to nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     /// Capture context, e.g. `"src/editor.rs:1240"` (unix-style, relative to the worktree).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
@@ -251,23 +266,35 @@ impl InboxItem {
     }
 }
 
-/// A user-defined kind of inbox items.
+/// Which of the two entry catalogs an operation targets. Store mutations and
+/// the catalog editor are parameterized by this instead of duplicating
+/// per-catalog methods.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum CatalogKind {
+    List,
+    Tag,
+}
+
+/// A user-defined catalog entry, shared by the list catalog (`types`) and
+/// the tag catalog (`tags`). The two catalogs differ only in how items
+/// reference them: [`InboxItem::kind`] picks at most one list, while
+/// [`InboxItem::tags`] picks any number of tags.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct InboxType {
+pub struct CatalogEntry {
     pub key: String,
     pub label: String,
-    /// Name of a theme color token, see [`TYPE_COLOR_TOKENS`].
+    /// Name of a theme color token, see [`CATALOG_COLOR_TOKENS`].
     pub color: String,
 }
 
 /// Theme color tokens available for inbox types, in cycling order.
-pub const TYPE_COLOR_TOKENS: &[&str] = &[
+pub const CATALOG_COLOR_TOKENS: &[&str] = &[
     "accent", "created", "modified", "deleted", "info", "hint", "muted", "conflict",
 ];
 
 /// Resolves a color token name to a concrete theme color.
 /// Unknown tokens fall back to the muted color.
-pub fn type_color(token: &str, cx: &App) -> Hsla {
+pub fn catalog_color(token: &str, cx: &App) -> Hsla {
     match token {
         "created" => cx.theme().status().created,
         "modified" => cx.theme().status().modified,
@@ -334,9 +361,14 @@ fn format_date(unix_secs: i64) -> Option<String> {
 
 /// Renders an item as a standalone Markdown document: a title heading, a
 /// metadata line, the body, and an attachments list. Empty parts are omitted.
-/// `type_label` is the resolved list label (the caller looks it up via the
-/// store, so this function stays free of theme/store dependencies).
-pub fn item_to_markdown(item: &InboxItem, type_label: Option<&str>) -> String {
+/// `type_label` and `tag_labels` are the resolved list/tag labels (the caller
+/// looks them up via the store, so this function stays free of theme/store
+/// dependencies).
+pub fn item_to_markdown(
+    item: &InboxItem,
+    type_label: Option<&str>,
+    tag_labels: &[String],
+) -> String {
     let mut out = String::new();
 
     let title = item.text.trim();
@@ -351,6 +383,9 @@ pub fn item_to_markdown(item: &InboxItem, type_label: Option<&str>) -> String {
     let mut meta = Vec::new();
     if let Some(label) = type_label {
         meta.push(format!("**Type:** {label}"));
+    }
+    if !tag_labels.is_empty() {
+        meta.push(format!("**Tags:** {}", tag_labels.join(", ")));
     }
     if let Some(created) = item.created
         && let Some(date) = format_date(created)
@@ -414,6 +449,7 @@ mod tests {
             id: new_item_id(),
             text: "text".into(),
             kind: None,
+            tags: Vec::new(),
             from: None,
             body: None,
             attachments: Vec::new(),
@@ -430,6 +466,7 @@ mod tests {
             id: "id".into(),
             text: "Ship the release".into(),
             kind: Some("task".into()),
+            tags: Vec::new(),
             from: None,
             body: None,
             attachments: Vec::new(),
@@ -441,14 +478,14 @@ mod tests {
     #[test]
     fn test_item_to_markdown_title_only() {
         let item = sample_item();
-        assert_eq!(item_to_markdown(&item, None), "# Ship the release\n");
+        assert_eq!(item_to_markdown(&item, None, &[]), "# Ship the release\n");
     }
 
     #[test]
     fn test_item_to_markdown_empty_title_falls_back() {
         let mut item = sample_item();
         item.text = "   ".into();
-        assert_eq!(item_to_markdown(&item, None), "# (untitled)\n");
+        assert_eq!(item_to_markdown(&item, None, &[]), "# (untitled)\n");
     }
 
     #[test]
@@ -466,12 +503,15 @@ mod tests {
             },
         ];
         let expected = "# Ship the release\n\n\
-             **Type:** Task · **Created:** 1970-01-01 · **From:** src/editor.rs:1240\n\n\
+             **Type:** Task · **Tags:** Urgent, UI · **Created:** 1970-01-01 · **From:** src/editor.rs:1240\n\n\
              - [x] done\n- [ ] todo\n\n\
              **Attachments:**\n\
              - main.rs — src/main.rs\n\
              - note.txt — /tmp/note.txt\n";
-        assert_eq!(item_to_markdown(&item, Some("Task")), expected);
+        assert_eq!(
+            item_to_markdown(&item, Some("Task"), &["Urgent".into(), "UI".into()]),
+            expected
+        );
     }
 
     #[test]
@@ -480,7 +520,7 @@ mod tests {
         item.body = Some("   \n\t".into());
         item.from = Some("  ".into());
         // No type label, blank body, blank from → title only.
-        assert_eq!(item_to_markdown(&item, None), "# Ship the release\n");
+        assert_eq!(item_to_markdown(&item, None, &[]), "# Ship the release\n");
     }
 
     #[test]
@@ -520,6 +560,7 @@ mod tests {
                 id: "abc".into(),
                 text: "hello".into(),
                 kind: None,
+                tags: Vec::new(),
                 from: None,
                 body: None,
                 attachments: Vec::new(),
@@ -527,12 +568,14 @@ mod tests {
                 cleared: None,
             }],
             types: Vec::new(),
+            tags: Vec::new(),
             archived: Vec::new(),
             sort: SortMode::Manual,
             hidden_fields: Vec::new(),
         };
         let json = serde_json::to_string(&file).unwrap();
         assert!(!json.contains("types"));
+        assert!(!json.contains("tags"));
         assert!(!json.contains("archived"));
         assert!(!json.contains("kind"));
         assert!(!json.contains("attachments"));
@@ -555,6 +598,7 @@ mod tests {
             id: new_item_id(),
             text: text.to_string(),
             kind: None,
+            tags: Vec::new(),
             from: None,
             body: None,
             attachments: Vec::new(),

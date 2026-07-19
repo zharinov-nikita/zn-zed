@@ -22,7 +22,10 @@ use gpui::{
 use markdown::{Markdown, MarkdownElement, MarkdownStyle};
 use settings::Settings as _;
 use theme_settings::ThemeSettings;
-use ui::{Checkbox, ContextMenu, ContextMenuEntry, Divider, Tab, ToggleState, Tooltip, prelude::*};
+use ui::{
+    Checkbox, ContextMenu, ContextMenuEntry, Divider, PopoverMenu, Tab, ToggleState, Tooltip,
+    prelude::*,
+};
 use workspace::Workspace;
 
 use crate::attachment::{
@@ -33,8 +36,8 @@ use crate::inbox_model::{AttachmentRef, InboxItem, ItemId, format_age, now_unix}
 use crate::inbox_store::{InboxStore, InboxStoreEvent};
 use crate::slash_menu::{self, SlashEntry, SlashMenuState};
 use crate::{
-    copy_item_as_markdown, entity_confirmation_popover, open_attachment, open_capture_context,
-    send_item_to_chat,
+    InboxPanel, copy_item_as_markdown, entity_confirmation_popover, open_attachment,
+    open_capture_context, send_item_to_chat, tag_chip,
 };
 
 /// Placeholder of the last (slash-menu-advertising) block; shared verbatim
@@ -46,6 +49,10 @@ const EMPTY_BLOCK_PLACEHOLDER: &str = "Empty line";
 pub enum InboxDetailEvent {
     /// The view wants to be closed (back button, Escape, or its item is gone).
     Closed,
+    /// The user picked "Configure tags…" — the panel should close this view
+    /// and open the catalog editor. An event rather than a direct call, so
+    /// the detail view never needs a handle back to the panel.
+    OpenTagEditor,
 }
 
 impl EventEmitter<InboxDetailEvent> for InboxDetailView {}
@@ -1290,7 +1297,57 @@ impl InboxDetailView {
                     .child(div().flex_1().min_w_0().child(self.title_editor.clone())),
             )
             .child(meta)
+            .child(self.render_tags_row(item, cx))
             .children(self.render_attachments(item, cx))
+    }
+
+    /// The item's tag chips plus the trigger opening the tag-assignment
+    /// menu. Rendered as its own row under the meta line (like attachments)
+    /// because it is interactive, unlike the plain-text meta segments.
+    fn render_tags_row(&self, item: &InboxItem, cx: &mut Context<Self>) -> impl IntoElement {
+        let chips = crate::resolved_tag_chips(self.store.read(cx), item, cx);
+        h_flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .pl(px(28.))
+            .children(
+                chips
+                    .into_iter()
+                    .map(|(label, color)| tag_chip(label, color)),
+            )
+            .child(self.render_tags_menu(cx))
+    }
+
+    /// The tag-assignment menu: a persistent checkbox menu toggling the
+    /// item's tags in the store, plus "Configure tags…" (which closes this
+    /// view via [`InboxDetailEvent::OpenTagEditor`]).
+    fn render_tags_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let store = self.store.clone();
+        let item_id = self.item_id.clone();
+        let view = cx.weak_entity();
+        PopoverMenu::new("inbox-detail-tags-menu")
+            .trigger(
+                IconButton::new("inbox-detail-tags", IconName::Hash)
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Tags")),
+            )
+            .menu(move |window, cx| {
+                let view = view.clone();
+                Some(InboxPanel::build_item_tags_menu(
+                    window,
+                    cx,
+                    store.clone(),
+                    item_id.clone(),
+                    move |_, cx| {
+                        view.update(cx, |_, cx| {
+                            cx.emit(InboxDetailEvent::OpenTagEditor);
+                        })
+                        .ok();
+                    },
+                ))
+            })
     }
 
     /// The bordered code-block container chrome, shared by read mode and the
@@ -2007,6 +2064,7 @@ mod tests {
                 let closed = closed.clone();
                 move |_, event, _| match event {
                     InboxDetailEvent::Closed => closed.set(closed.get() + 1),
+                    InboxDetailEvent::OpenTagEditor => {}
                 }
             })
             .detach();

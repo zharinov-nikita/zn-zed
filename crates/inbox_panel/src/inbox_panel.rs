@@ -25,9 +25,9 @@ use editor::Editor;
 use fs::Fs;
 use gpui::{
     Action, AnyElement, App, AppContext as _, AsyncWindowContext, ClickEvent, ClipboardItem,
-    Context, Div, ElementId, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable,
-    FontWeight, IntoElement, ParentElement, Pixels, Point, Render, ScrollHandle, Stateful, Styled,
-    Subscription, Task, WeakEntity, Window, actions, anchored, deferred,
+    Context, DismissEvent, Div, ElementId, Entity, EventEmitter, ExternalPaths, FocusHandle,
+    Focusable, FontWeight, IntoElement, ParentElement, Pixels, Point, Render, ScrollHandle,
+    Stateful, Styled, Subscription, Task, WeakEntity, Window, actions, anchored, deferred,
 };
 use theme_settings::ThemeSettings;
 use ui::{
@@ -47,8 +47,8 @@ use crate::attachment::{
     AttachmentCompletionProvider, AttachmentSet, OnPick, attach_external_paths, pick_and_attach,
 };
 use crate::inbox_model::{
-    AttachmentRef, InboxItem, ItemId, MetaField, SortMode, format_age, item_to_markdown, now_unix,
-    subtask_counts, type_color,
+    AttachmentRef, InboxItem, ItemId, MetaField, SortMode, catalog_color, format_age,
+    item_to_markdown, now_unix, subtask_counts,
 };
 use crate::inbox_panel_settings::{DockSide, InboxPanelSettings, Settings};
 use crate::type_editor::TypeEditorState;
@@ -140,6 +140,12 @@ pub struct InboxPanel {
     capture_attachments: Entity<AttachmentSet>,
     /// Type key preselected for the next capture. `None` means no type.
     capture_kind: Option<String>,
+    /// Tag keys staged for the next capture, drained into the item when it is
+    /// captured (like attachments, unlike the sticky `capture_kind`).
+    capture_tags: HashSet<String>,
+    /// The header tag filter. Ephemeral view state like `view_mode` — never
+    /// persisted to the inbox file.
+    tag_filter: TagFilter,
     view_mode: ViewMode,
     /// Type keys of the groups collapsed in the grouped view.
     collapsed_groups: HashSet<String>,
@@ -170,6 +176,40 @@ struct ListRows {
     open: Vec<InboxItem>,
     cleared: Vec<InboxItem>,
     archived: Vec<InboxItem>,
+}
+
+/// Which items the header tag filter shows while any tags are selected.
+#[derive(Clone, Copy, PartialEq, Default)]
+enum TagFilterMode {
+    /// Items carrying at least one selected tag.
+    #[default]
+    Any,
+    /// Items carrying every selected tag.
+    All,
+}
+
+/// The header tag filter: the selected tag keys plus the match mode. An
+/// empty selection means "no filter" — everything matches.
+#[derive(Default)]
+struct TagFilter {
+    keys: HashSet<String>,
+    mode: TagFilterMode,
+}
+
+impl TagFilter {
+    fn is_active(&self) -> bool {
+        !self.keys.is_empty()
+    }
+
+    fn matches(&self, item_tags: &[String]) -> bool {
+        if self.keys.is_empty() {
+            return true;
+        }
+        match self.mode {
+            TagFilterMode::Any => item_tags.iter().any(|key| self.keys.contains(key)),
+            TagFilterMode::All => self.keys.iter().all(|key| item_tags.contains(key)),
+        }
+    }
 }
 
 /// Opens the `"path:row"` capture context of an item in the workspace,
@@ -272,11 +312,13 @@ pub(crate) fn open_attachment(
 /// Shared by the copy-to-clipboard and send-to-chat actions in both the list
 /// rows and the detail view.
 pub(crate) fn item_markdown(store: &Entity<InboxStore>, item: &InboxItem, cx: &App) -> String {
-    let label = store
-        .read(cx)
-        .resolve_kind(item)
-        .map(|kind| kind.label.clone());
-    item_to_markdown(item, label.as_deref())
+    let store = store.read(cx);
+    let label = store.resolve_kind(item).map(|kind| kind.label.clone());
+    let tags = store
+        .resolve_tags(item)
+        .map(|tag| tag.label.clone())
+        .collect::<Vec<_>>();
+    item_to_markdown(item, label.as_deref(), &tags)
 }
 
 /// Copies the item's Markdown to the clipboard and shows a confirmation toast.
@@ -388,6 +430,46 @@ fn attachment_chip(
                     .truncate(),
             ),
         )
+}
+
+/// The colored square marking a catalog entry (list or tag). The one owner of
+/// the swatch's size/shape, shared by chips, menu rows and drag ghosts.
+pub(crate) fn catalog_swatch(color: gpui::Hsla) -> Div {
+    div().flex_none().size(px(7.)).rounded_xs().bg(color)
+}
+
+/// The shared read-only visual for a tag chip: a colored dot and the tag
+/// label. Used on item rows and in the detail view.
+pub(crate) fn tag_chip(label: SharedString, color: gpui::Hsla) -> impl IntoElement {
+    h_flex()
+        .flex_none()
+        .px_0p5()
+        .gap_1()
+        .child(catalog_swatch(color))
+        .child(
+            Label::new(label)
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+        )
+}
+
+/// Resolves an item's tags into displayable chip data, in catalog order.
+/// Shared by the list rows and the detail view so the two surfaces can't
+/// drift in how they render the same item's tags.
+pub(crate) fn resolved_tag_chips(
+    store: &InboxStore,
+    item: &InboxItem,
+    cx: &App,
+) -> Vec<(SharedString, gpui::Hsla)> {
+    store
+        .resolve_tags(item)
+        .map(|tag| {
+            (
+                SharedString::from(tag.label.clone()),
+                catalog_color(&tag.color, cx),
+            )
+        })
+        .collect()
 }
 
 /// An [`attachment_chip`] with a trailing remove button. `on_open` fires when
@@ -590,6 +672,8 @@ impl InboxPanel {
                 capture_editor,
                 capture_attachments,
                 capture_kind: None,
+                capture_tags: HashSet::default(),
+                tag_filter: TagFilter::default(),
                 view_mode: ViewMode::All,
                 collapsed_groups: HashSet::default(),
                 show_archive: false,
@@ -647,7 +731,7 @@ impl InboxPanel {
                 cx.notify();
             }
             InboxStoreEvent::Changed => {
-                self.reconcile_capture_kind(cx);
+                self.reconcile_catalog_refs(cx);
                 cx.notify();
             }
             InboxStoreEvent::Reloaded => {
@@ -658,21 +742,29 @@ impl InboxPanel {
                 // confirmation as well.
                 self.type_editor = None;
                 self.confirming_delete = None;
-                self.reconcile_capture_kind(cx);
+                self.reconcile_catalog_refs(cx);
                 cx.notify();
             }
         }
     }
 
-    /// Drops the preselected capture type when its key no longer exists in
-    /// the store's types (e.g. the type was deleted or the file was edited
-    /// externally), falling back to "No list".
-    fn reconcile_capture_kind(&mut self, cx: &Context<Self>) {
+    /// Drops ephemeral catalog references — the preselected capture list, the
+    /// staged capture tags and the filter tags — whose keys no longer exist
+    /// in the store (e.g. the entry was deleted or the file was edited
+    /// externally). Covers both a local delete and an external reload
+    /// uniformly, since both emit store events.
+    fn reconcile_catalog_refs(&mut self, cx: &Context<Self>) {
+        let store = self.store.read(cx);
         if let Some(kind) = &self.capture_kind
-            && self.store.read(cx).type_by_key(kind).is_none()
+            && store.type_by_key(kind).is_none()
         {
             self.capture_kind = None;
         }
+        self.capture_tags
+            .retain(|key| store.tag_by_key(key).is_some());
+        self.tag_filter
+            .keys
+            .retain(|key| store.tag_by_key(key).is_some());
     }
 
     fn focus_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -700,6 +792,10 @@ impl InboxPanel {
                     this.focus_handle.focus(window, cx);
                     cx.notify();
                 }
+                InboxDetailEvent::OpenTagEditor => {
+                    this.detail = None;
+                    this.open_type_editor(window, cx);
+                }
             },
         );
         detail.focus_handle(cx).focus(window, cx);
@@ -715,11 +811,16 @@ impl InboxPanel {
         let kind = self.capture_kind.clone();
         let from = self.active_editor_context(window, cx);
         let attachments = self.capture_attachments.update(cx, |set, _| set.take());
+        let staged_tags = std::mem::take(&mut self.capture_tags);
         self.confirming_attachment_removal = None;
         self.store.update(cx, |store, cx| {
             let id = store.capture(text, kind, from, cx);
             if !attachments.is_empty() {
                 store.set_attachments(&id, attachments, cx);
+            }
+            if !staged_tags.is_empty() {
+                let tags = store.catalog_ordered_tag_keys(&staged_tags);
+                store.set_tags(&id, tags, cx);
             }
         });
         self.capture_editor
@@ -836,6 +937,7 @@ impl InboxPanel {
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let has_worktree = self.store.read(cx).has_worktree();
+        let has_tags = !self.store.read(cx).tags().is_empty();
         h_flex()
             .flex_none()
             .h(Tab::container_height(cx))
@@ -861,6 +963,7 @@ impl InboxPanel {
             .child(
                 h_flex()
                     .gap_1()
+                    .when(has_tags, |this| this.child(self.render_tag_filter_menu(cx)))
                     .child(self.render_fields_menu(cx))
                     .child(self.render_sort_menu(cx))
                     // Collapse/expand every list group at once. Only meaningful
@@ -1111,24 +1214,17 @@ impl InboxPanel {
             .into_any_element()
     }
 
-    /// A clickable colored square + label chip describing an inbox type,
-    /// suitable as a [`PopoverMenu`] trigger.
+    /// A clickable colored square + label chip describing a catalog entry,
+    /// suitable as a [`PopoverMenu`] trigger. Same visual as [`tag_chip`],
+    /// wrapped in a button.
     fn type_chip_button(
         id: impl Into<ElementId>,
         label: SharedString,
         color: gpui::Hsla,
     ) -> ButtonLike {
-        ButtonLike::new(id).size(ButtonSize::None).child(
-            h_flex()
-                .px_0p5()
-                .gap_1()
-                .child(div().flex_none().size(px(7.)).rounded_xs().bg(color))
-                .child(
-                    Label::new(label)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                ),
-        )
+        ButtonLike::new(id)
+            .size(ButtonSize::None)
+            .child(tag_chip(label, color))
     }
 
     /// A context menu item with a colored type square, a label, and a check
@@ -1144,7 +1240,7 @@ impl InboxPanel {
                 h_flex()
                     .w_full()
                     .gap_1p5()
-                    .child(div().flex_none().size(px(7.)).rounded_xs().bg(color))
+                    .child(catalog_swatch(color))
                     .child(div().flex_1().child(Label::new(label.clone())))
                     .when(selected, |this| {
                         this.child(
@@ -1160,14 +1256,100 @@ impl InboxPanel {
         )
     }
 
+    /// Appends one row per store tag (colored square + label + a check on
+    /// each selected tag) to `menu`. Unlike the radio-style type menu this is
+    /// a checkbox: rows toggle membership, so callers wrap it in a
+    /// *persistent* menu that stays open across toggles. Shared by the
+    /// capture box, the item rows, the header filter and the detail view,
+    /// which differ only in where the selection lives and what toggling does.
+    pub(crate) fn extend_tag_menu(
+        mut menu: ContextMenu,
+        store: &InboxStore,
+        is_selected: impl Fn(&str) -> bool,
+        on_toggle: impl Fn(String, &mut Window, &mut App) + Clone + 'static,
+        cx: &App,
+    ) -> ContextMenu {
+        for tag in store.tags() {
+            let selected = is_selected(&tag.key);
+            let key = tag.key.clone();
+            let on_toggle = on_toggle.clone();
+            menu = menu.item(Self::type_menu_item(
+                SharedString::from(tag.label.clone()),
+                catalog_color(&tag.color, cx),
+                selected,
+                move |window, cx| on_toggle(key.clone(), window, cx),
+            ));
+        }
+        menu
+    }
+
+    /// Snapshot of a panel-owned tag-key set plus a toggle handler over it,
+    /// shared by the capture-tags and filter menus (both stage selections in
+    /// a `HashSet` on the panel rather than in the store).
+    fn tag_set_menu_hooks(
+        panel: WeakEntity<Self>,
+        cx: &mut App,
+        field: impl Fn(&mut Self) -> &mut HashSet<String> + Clone + 'static,
+    ) -> (
+        HashSet<String>,
+        impl Fn(String, &mut Window, &mut App) + Clone + 'static,
+    ) {
+        let snapshot = panel
+            .update(cx, |this, _| field(this).clone())
+            .unwrap_or_default();
+        let on_toggle = move |key: String, _: &mut Window, cx: &mut App| {
+            panel
+                .update(cx, |this, cx| {
+                    let set = field(this);
+                    if !set.remove(&key) {
+                        set.insert(key);
+                    }
+                    cx.notify();
+                })
+                .ok();
+        };
+        (snapshot, on_toggle)
+    }
+
+    /// The trailing "Configure …" entry of a catalog menu. Dismisses `menu`
+    /// before running `on_configure`: persistent menus rebuild instead of
+    /// closing on entry click, and without the explicit dismiss the popover
+    /// would linger on top of the just-opened catalog editor overlay.
+    fn configure_entry(
+        label: &'static str,
+        menu: WeakEntity<ContextMenu>,
+        on_configure: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> ContextMenuEntry {
+        ContextMenuEntry::new(label)
+            .icon(IconName::Settings)
+            .icon_color(Color::Muted)
+            .handler(move |window, cx| {
+                menu.update(cx, |_, cx| cx.emit(DismissEvent)).ok();
+                on_configure(window, cx);
+            })
+    }
+
+    /// [`Self::configure_entry`] wired to open the panel's catalog editor —
+    /// the trailing entry of every panel-owned catalog menu.
+    fn configure_editor_entry(
+        label: &'static str,
+        menu: WeakEntity<ContextMenu>,
+        panel: WeakEntity<Self>,
+    ) -> ContextMenuEntry {
+        Self::configure_entry(label, menu, move |window, cx| {
+            panel
+                .update(cx, |this, cx| this.open_type_editor(window, cx))
+                .ok();
+        })
+    }
+
     /// Appends one row per store type (colored square + label + a check on
-    /// `current_key`) and the trailing "Configure lists…" entry to `menu`.
-    /// Shared by the capture box chip and the item row chip, which differ
-    /// only in where the current key comes from and what selecting does.
+    /// `current_key`) to `menu`. Shared by the capture box chip and the item
+    /// row chip, which differ only in where the current key comes from and
+    /// what selecting does; callers append their own trailing entries.
     fn extend_type_menu(
         mut menu: ContextMenu,
         store: &InboxStore,
-        panel: WeakEntity<Self>,
         current_key: Option<String>,
         on_select: impl Fn(String, &mut Window, &mut App) + Clone + 'static,
         cx: &App,
@@ -1178,21 +1360,210 @@ impl InboxPanel {
             let on_select = on_select.clone();
             menu = menu.item(Self::type_menu_item(
                 SharedString::from(inbox_type.label.clone()),
-                type_color(&inbox_type.color, cx),
+                catalog_color(&inbox_type.color, cx),
                 selected,
                 move |window, cx| on_select(key.clone(), window, cx),
             ));
         }
-        menu.separator().item(
-            ContextMenuEntry::new("Configure lists…")
-                .icon(IconName::Settings)
+        menu
+    }
+
+    /// The item-scoped tag menu: a persistent checkbox menu toggling the
+    /// item's tags in the store. Shared verbatim by the panel rows and the
+    /// detail view, which differ only in how "Configure tags…" opens the
+    /// catalog editor.
+    pub(crate) fn build_item_tags_menu(
+        window: &mut Window,
+        cx: &mut App,
+        store: Entity<InboxStore>,
+        item_id: ItemId,
+        on_configure: impl Fn(&mut Window, &mut App) + Clone + 'static,
+    ) -> Entity<ContextMenu> {
+        ContextMenu::build_persistent(window, cx, move |mut menu, _, cx| {
+            let current = store
+                .read(cx)
+                .item(&item_id)
+                .map(|item| item.tags.clone())
+                .unwrap_or_default();
+            menu = menu.header("Tags");
+            let on_toggle = {
+                let store = store.clone();
+                let item_id = item_id.clone();
+                move |key: String, _: &mut Window, cx: &mut App| {
+                    store.update(cx, |store, cx| {
+                        store.toggle_item_tag(&item_id, &key, cx);
+                    });
+                }
+            };
+            menu = Self::extend_tag_menu(
+                menu,
+                store.read(cx),
+                move |key| current.iter().any(|current_key| current_key == key),
+                on_toggle,
+                cx,
+            );
+            menu.separator().item(Self::configure_entry(
+                "Configure tags…",
+                cx.weak_entity(),
+                on_configure.clone(),
+            ))
+        })
+    }
+
+    /// The capture box tags chip: stages tags for the next capture.
+    fn render_capture_tags_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let store = self.store.clone();
+        let panel = cx.entity().downgrade();
+        let count = self.capture_tags.len();
+        let (label, color) = if count == 0 {
+            (SharedString::from("Tags"), Color::Muted.color(cx))
+        } else {
+            (
+                SharedString::from(format!("{count} tag{}", if count == 1 { "" } else { "s" })),
+                Color::Accent.color(cx),
+            )
+        };
+        PopoverMenu::new("inbox-capture-tags-menu")
+            .trigger(Self::type_chip_button(
+                "inbox-capture-tags-chip",
+                label,
+                color,
+            ))
+            .menu(move |window, cx| {
+                let store = store.clone();
+                let panel = panel.clone();
+                Some(ContextMenu::build_persistent(
+                    window,
+                    cx,
+                    move |mut menu, _, cx| {
+                        let (staged, on_toggle) =
+                            Self::tag_set_menu_hooks(panel.clone(), cx, |this| {
+                                &mut this.capture_tags
+                            });
+                        menu = menu.header("Tags for next capture");
+                        menu = Self::extend_tag_menu(
+                            menu,
+                            store.read(cx),
+                            move |key| staged.contains(key),
+                            on_toggle,
+                            cx,
+                        );
+                        let menu_handle = cx.weak_entity();
+                        menu.separator().item(Self::configure_editor_entry(
+                            "Configure tags…",
+                            menu_handle,
+                            panel.clone(),
+                        ))
+                    },
+                ))
+            })
+    }
+
+    /// The item row tags trigger: a hover-revealed button opening a
+    /// checkbox menu that toggles the item's tags in the store.
+    fn render_item_tags_menu(&self, item_id: ItemId, cx: &mut Context<Self>) -> impl IntoElement {
+        let store = self.store.clone();
+        let panel = cx.entity().downgrade();
+        PopoverMenu::new((ElementId::from(item_id.clone()), "tags-menu"))
+            .trigger(
+                IconButton::new(
+                    (ElementId::from(item_id.clone()), "tags-trigger"),
+                    IconName::Hash,
+                )
+                .icon_size(IconSize::XSmall)
                 .icon_color(Color::Muted)
-                .handler(move |window, cx| {
-                    panel
-                        .update(cx, |this, cx| this.open_type_editor(window, cx))
-                        .ok();
-                }),
-        )
+                .visible_on_hover("inbox-item")
+                .tooltip(Tooltip::text("Tags")),
+            )
+            .menu(move |window, cx| {
+                let panel = panel.clone();
+                Some(Self::build_item_tags_menu(
+                    window,
+                    cx,
+                    store.clone(),
+                    item_id.clone(),
+                    move |window, cx| {
+                        panel
+                            .update(cx, |this, cx| this.open_type_editor(window, cx))
+                            .ok();
+                    },
+                ))
+            })
+    }
+
+    /// The header tag-filter dropdown: a persistent checkbox menu over the
+    /// tag catalog plus the Any/All match mode and a "Clear filter" entry.
+    fn render_tag_filter_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let store = self.store.clone();
+        let panel = cx.entity().downgrade();
+        PopoverMenu::new("inbox-tag-filter-menu")
+            .trigger(
+                IconButton::new("inbox-tag-filter", IconName::Hash)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .toggle_state(self.tag_filter.is_active())
+                    .tooltip(Tooltip::text("Filter by tags")),
+            )
+            .menu(move |window, cx| {
+                let store = store.clone();
+                let panel = panel.clone();
+                Some(ContextMenu::build_persistent(
+                    window,
+                    cx,
+                    move |mut menu, _, cx| {
+                        let Some(panel_entity) = panel.upgrade() else {
+                            return menu;
+                        };
+                        let mode = panel_entity.read(cx).tag_filter.mode;
+                        let (selected, on_toggle) =
+                            Self::tag_set_menu_hooks(panel.clone(), cx, |this| {
+                                &mut this.tag_filter.keys
+                            });
+                        menu = menu.header("Filter by tags");
+                        for (label, menu_mode) in [
+                            ("Match any", TagFilterMode::Any),
+                            ("Match all", TagFilterMode::All),
+                        ] {
+                            let panel = panel.clone();
+                            menu = menu.toggleable_entry(
+                                label,
+                                mode == menu_mode,
+                                IconPosition::End,
+                                None,
+                                move |_, cx| {
+                                    panel
+                                        .update(cx, |this, cx| {
+                                            this.tag_filter.mode = menu_mode;
+                                            cx.notify();
+                                        })
+                                        .ok();
+                                },
+                            );
+                        }
+                        menu = menu.separator();
+                        let filter_active = !selected.is_empty();
+                        menu = Self::extend_tag_menu(
+                            menu,
+                            store.read(cx),
+                            move |key| selected.contains(key),
+                            on_toggle,
+                            cx,
+                        );
+                        if filter_active {
+                            let panel = panel.clone();
+                            menu = menu.separator().entry("Clear filter", None, move |_, cx| {
+                                panel
+                                    .update(cx, |this, cx| {
+                                        this.tag_filter.keys.clear();
+                                        cx.notify();
+                                    })
+                                    .ok();
+                            });
+                        }
+                        menu
+                    },
+                ))
+            })
     }
 
     /// The capture box chip: picks the type preselected for the next capture.
@@ -1244,14 +1615,14 @@ impl InboxPanel {
                                 .ok();
                         }
                     };
-                    Self::extend_type_menu(
-                        menu,
-                        store.read(cx),
-                        panel.clone(),
-                        capture_kind,
-                        on_select,
-                        cx,
-                    )
+                    menu =
+                        Self::extend_type_menu(menu, store.read(cx), capture_kind, on_select, cx);
+                    let menu_handle = cx.weak_entity();
+                    menu.separator().item(Self::configure_editor_entry(
+                        "Configure lists…",
+                        menu_handle,
+                        panel,
+                    ))
                 }))
             })
     }
@@ -1277,7 +1648,7 @@ impl InboxPanel {
                 let store = store.clone();
                 let panel = panel.clone();
                 let item_id = item_id.clone();
-                Some(ContextMenu::build(window, cx, move |menu, _, cx| {
+                Some(ContextMenu::build(window, cx, move |mut menu, _, cx| {
                     let store_ref = store.read(cx);
                     let current_key = store_ref
                         .item(&item_id)
@@ -1292,14 +1663,13 @@ impl InboxPanel {
                             });
                         }
                     };
-                    Self::extend_type_menu(
-                        menu,
-                        store_ref,
+                    menu = Self::extend_type_menu(menu, store_ref, current_key, on_select, cx);
+                    let menu_handle = cx.weak_entity();
+                    menu.separator().item(Self::configure_editor_entry(
+                        "Configure lists…",
+                        menu_handle,
                         panel.clone(),
-                        current_key,
-                        on_select,
-                        cx,
-                    )
+                    ))
                 }))
             })
     }
@@ -1316,6 +1686,7 @@ impl InboxPanel {
         };
 
         let has_types = !self.store.read(cx).types().is_empty();
+        let has_tags = !self.store.read(cx).tags().is_empty();
         let (chip_label, chip_color) = {
             let store = self.store.read(cx);
             match self
@@ -1325,7 +1696,7 @@ impl InboxPanel {
             {
                 Some(inbox_type) => (
                     SharedString::from(inbox_type.label.clone()),
-                    type_color(&inbox_type.color, cx),
+                    catalog_color(&inbox_type.color, cx),
                 ),
                 None => (SharedString::from("No list"), Color::Muted.color(cx)),
             }
@@ -1360,6 +1731,9 @@ impl InboxPanel {
                         .items_center()
                         .when(has_types, |this| {
                             this.child(self.render_capture_type_menu(chip_label, chip_color, cx))
+                        })
+                        .when(has_tags, |this| {
+                            this.child(self.render_capture_tags_menu(cx))
                         })
                         .child(self.render_capture_attachments(cx))
                         .child(
@@ -1413,6 +1787,31 @@ impl InboxPanel {
             )
     }
 
+    /// Empty state shown when the tag filter hid every row (as opposed to
+    /// the inbox genuinely being empty).
+    fn render_no_matches_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .p_4()
+            .child(
+                Icon::new(IconName::Hash)
+                    .size(IconSize::XLarge)
+                    .color(Color::Muted),
+            )
+            .child(Label::new("No items match the tag filter").color(Color::Muted))
+            .child(
+                Button::new("inbox-clear-tag-filter", "Clear filter")
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.tag_filter.keys.clear();
+                        cx.notify();
+                    })),
+            )
+    }
+
     fn render_no_worktree(&self, _cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .flex_1()
@@ -1443,7 +1842,7 @@ impl InboxPanel {
             store.resolve_kind(item).map(|inbox_type| {
                 (
                     SharedString::from(inbox_type.label.clone()),
-                    type_color(&inbox_type.color, cx),
+                    catalog_color(&inbox_type.color, cx),
                 )
             })
         };
@@ -1479,15 +1878,22 @@ impl InboxPanel {
         };
 
         // Per-field visibility, toggled from the header "Fields" menu.
-        let (hide_list, hide_age, hide_subtasks, hide_context, hide_attachments) = {
+        let (hide_list, hide_tags, hide_age, hide_subtasks, hide_context, hide_attachments) = {
             let store = self.store.read(cx);
             (
                 store.is_field_hidden(MetaField::List.key()),
+                store.is_field_hidden(MetaField::Tags.key()),
                 store.is_field_hidden(MetaField::Age.key()),
                 store.is_field_hidden(MetaField::Subtasks.key()),
                 store.is_field_hidden(MetaField::Context.key()),
                 store.is_field_hidden(MetaField::Attachments.key()),
             )
+        };
+        // Resolved in catalog order; dangling keys are silently skipped.
+        let tag_chips = if hide_tags {
+            Vec::new()
+        } else {
+            resolved_tag_chips(self.store.read(cx), item, cx)
         };
 
         let mut meta = h_flex().flex_wrap().items_center().gap_2();
@@ -1498,6 +1904,9 @@ impl InboxPanel {
                 type_chip_color,
                 cx,
             ));
+        }
+        for (label, color) in tag_chips {
+            meta = meta.child(tag_chip(label, color));
         }
         if let Some(created) = item.created.filter(|_| !hide_age) {
             meta = meta.child(
@@ -1581,9 +1990,13 @@ impl InboxPanel {
             cx.notify();
         }));
 
-        // Item-to-item drag reorder only makes sense in manual order; the other
-        // sort modes compute the order, so a manual drop would not stick.
-        let reorderable = row == ItemRow::Open && self.store.read(cx).sort_mode().is_manual();
+        // Item-to-item drag reorder only makes sense in manual order (other
+        // sort modes compute the order, so a manual drop would not stick) and
+        // with no tag filter active — reordering against a partial view would
+        // silently reposition items relative to hidden neighbors.
+        let reorderable = row == ItemRow::Open
+            && !self.tag_filter.is_active()
+            && self.store.read(cx).sort_mode().is_manual();
         h_flex()
             .id((ElementId::from(item.id.clone()), "row"))
             .group("inbox-item")
@@ -1667,6 +2080,7 @@ impl InboxPanel {
             .child(
                 h_flex()
                     .flex_none()
+                    .child(self.render_item_tags_menu(item.id.clone(), cx))
                     .child(self.render_item_actions_menu(item, cx))
                     .child(delete_button),
             )
@@ -1893,7 +2307,7 @@ impl InboxPanel {
 
     /// The `collapsed_groups` entry for the synthetic "Unassigned" group
     /// (items with no kind, or an unknown/deleted kind). Real type keys are
-    /// generated as `k{id}` by [`InboxStore::add_type`](crate::inbox_store::InboxStore::add_type),
+    /// generated as `k{id}` by [`InboxStore::add_entry`](crate::inbox_store::InboxStore::add_entry),
     /// so this cannot collide with one produced by the UI; a hand-edited
     /// `inbox.json` could in principle define a type with this exact key,
     /// but that's an accepted, self-inflicted edge case.
@@ -1905,7 +2319,7 @@ impl InboxPanel {
     /// target; this is what lets an item be dragged into an empty list.
     fn render_grouped_items(
         &self,
-        open: &[InboxItem],
+        open: &[&InboxItem],
         now: i64,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
@@ -1918,7 +2332,7 @@ impl InboxPanel {
                     (
                         inbox_type.key.clone(),
                         SharedString::from(inbox_type.label.clone()),
-                        type_color(&inbox_type.color, cx),
+                        catalog_color(&inbox_type.color, cx),
                     )
                 })
                 .collect()
@@ -1938,7 +2352,7 @@ impl InboxPanel {
                 .iter()
                 .zip(&item_keys)
                 .filter(|(_, item_key)| item_key.as_deref() == Some(key.as_str()))
-                .map(|(item, _)| item)
+                .map(|(item, _)| *item)
                 .collect();
             let collapsed = self.collapsed_groups.contains(&key);
             let mut group = v_flex()
@@ -1982,7 +2396,7 @@ impl InboxPanel {
             .iter()
             .zip(&item_keys)
             .filter(|(_, item_key)| item_key.is_none())
-            .map(|(item, _)| item)
+            .map(|(item, _)| *item)
             .collect();
         if !unassigned.is_empty() {
             let collapsed = self.collapsed_groups.contains(Self::UNASSIGNED_GROUP_KEY);
@@ -2046,30 +2460,55 @@ impl InboxPanel {
         rows
     }
 
+    /// Applies the tag filter to one section of the cached rows.
+    fn filter_rows<'a>(&self, items: &'a [InboxItem]) -> Vec<&'a InboxItem> {
+        items
+            .iter()
+            .filter(|item| self.tag_filter.matches(&item.tags))
+            .collect()
+    }
+
     fn render_list(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let rows = self.list_rows(cx);
-        let archive_count = rows.cleared.len() + rows.archived.len();
+        // The tag filter is a cheap render-time pass over the cached rows, so
+        // toggling it never has to invalidate `list_cache`. It applies
+        // uniformly to open, cleared and archived rows.
+        let open = self.filter_rows(&rows.open);
+        let cleared = self.filter_rows(&rows.cleared);
+        let archived = self.filter_rows(&rows.archived);
+        // The badge shows how many archive rows are currently visible, but
+        // the header itself is gated on the *unfiltered* count so the archive
+        // section can't silently vanish while a filter hides all its rows.
+        let archive_count = cleared.len() + archived.len();
+        let archive_exists = !rows.cleared.is_empty() || !rows.archived.is_empty();
         let now = now_unix();
 
         let open_rows = match self.view_mode {
-            ViewMode::All => rows
-                .open
+            ViewMode::All => open
                 .iter()
                 .map(|item| self.render_item(item, ItemRow::Open, now, cx))
                 .collect(),
-            ViewMode::Grouped => self.render_grouped_items(&rows.open, now, cx),
+            ViewMode::Grouped => self.render_grouped_items(&open, now, cx),
         };
         let mut archive_rows = Vec::new();
         if self.show_archive {
-            for item in &rows.cleared {
+            for item in &cleared {
                 archive_rows.push(self.render_item(item, ItemRow::ClearedInbox, now, cx));
             }
-            for item in &rows.archived {
+            for item in &archived {
                 archive_rows.push(self.render_item(item, ItemRow::Archived, now, cx));
             }
         }
 
-        let show_empty_state = rows.open.is_empty() && (archive_count == 0 || !self.show_archive);
+        let show_empty_state = open.is_empty() && (archive_count == 0 || !self.show_archive);
+        // Distinguish "the filter hid rows that would otherwise be visible"
+        // from "the inbox is genuinely empty", so the empty state offers to
+        // clear the filter only when clearing it would actually reveal rows.
+        // (Under `show_empty_state` every filtered section is empty, so "the
+        // filter hid something" reduces to "the raw section is non-empty".)
+        let filtered_out = show_empty_state
+            && self.tag_filter.is_active()
+            && (!rows.open.is_empty() || (self.show_archive && archive_exists));
 
         // Two layers: the outer container hosts the scrollbar overlay and does
         // NOT scroll, while the inner container carries `overflow_y_scroll` +
@@ -2090,10 +2529,14 @@ impl InboxPanel {
                     .track_scroll(&self.scroll_handle)
                     .p_1()
                     .when(show_empty_state, |this| {
-                        this.child(self.render_empty_state(cx))
+                        if filtered_out {
+                            this.child(self.render_no_matches_state(cx))
+                        } else {
+                            this.child(self.render_empty_state(cx))
+                        }
                     })
                     .children(open_rows)
-                    .when(archive_count > 0, |this| {
+                    .when(archive_exists, |this| {
                         this.child(self.render_archive_header(archive_count, cx))
                             .children(archive_rows)
                     }),

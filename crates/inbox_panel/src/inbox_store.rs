@@ -4,6 +4,7 @@ use std::{
     time::Duration,
 };
 
+use collections::HashSet;
 use fs::{Fs, RemoveOptions};
 use futures::StreamExt as _;
 use gpui::{App, Context, Entity, EventEmitter, Subscription, Task};
@@ -12,8 +13,8 @@ use sha2::{Digest as _, Sha256};
 use util::{ResultExt as _, rel_path::RelPath};
 
 use crate::inbox_model::{
-    AttachmentRef, InboxFile, InboxItem, InboxType, ItemId, SortMode, TYPE_COLOR_TOKENS,
-    new_item_id, now_unix, now_unix_millis,
+    AttachmentRef, CATALOG_COLOR_TOKENS, CatalogEntry, CatalogKind, InboxFile, InboxItem, ItemId,
+    SortMode, new_item_id, now_unix, now_unix_millis,
 };
 
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(250);
@@ -33,6 +34,52 @@ pub enum InboxStoreEvent {
     Changed,
     Reloaded,
     ItemDeleted(ItemId),
+}
+
+/// Where a pending recovery snapshot came from. A memory-sourced offer is a
+/// copy of the live state, so any later mutation supersedes it; a
+/// backup-sourced offer holds data that exists nowhere else in memory and
+/// must survive until the user acts on it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RestoreSource {
+    Memory,
+    Backup,
+}
+
+/// Merges `snapshot` into `state` non-destructively: items and catalog
+/// entries whose id/key `state` already has keep their current (newer)
+/// version; everything else is appended from the snapshot. Settings (sort,
+/// hidden fields) keep their current values.
+fn merge_missing(state: &mut InboxFile, snapshot: InboxFile) {
+    let ids: HashSet<ItemId> = state
+        .inbox
+        .iter()
+        .chain(state.archived.iter())
+        .map(|item| item.id.clone())
+        .collect();
+    state.inbox.extend(
+        snapshot
+            .inbox
+            .into_iter()
+            .filter(|item| !ids.contains(&item.id)),
+    );
+    state.archived.extend(
+        snapshot
+            .archived
+            .into_iter()
+            .filter(|item| !ids.contains(&item.id)),
+    );
+    for (entries, snapshot_entries) in [
+        (&mut state.types, snapshot.types),
+        (&mut state.tags, snapshot.tags),
+    ] {
+        let keys: HashSet<String> = entries.iter().map(|entry| entry.key.clone()).collect();
+        entries.extend(
+            snapshot_entries
+                .into_iter()
+                .filter(|entry| !keys.contains(&entry.key)),
+        );
+    }
 }
 
 /// Result of reading `.zed/inbox.json`, computed off the main thread so parsing
@@ -67,7 +114,7 @@ pub struct InboxStore {
     dirty: bool,
     /// Snapshot recovered from a backup when the on-disk file went missing or
     /// corrupt; `Some` while the recovery banner is offered.
-    restorable: Option<InboxFile>,
+    restorable: Option<(RestoreSource, InboxFile)>,
     /// Monotonic counter that keeps backup filenames unique within a session,
     /// even for two saves that land in the same millisecond.
     backup_seq: u64,
@@ -253,15 +300,15 @@ impl InboxStore {
                 // open); fall back to the newest backup (file gone before this
                 // session started).
                 let recovered = if self.state.has_content() {
-                    Some(self.state.clone())
+                    Some((RestoreSource::Memory, self.state.clone()))
                 } else {
-                    backup
+                    backup.map(|data| (RestoreSource::Backup, data))
                 };
                 match recovered {
-                    Some(data) => {
+                    Some(offer) => {
                         // Don't wipe memory or auto-write: offer a restore
                         // banner so an intentional deletion isn't undone.
-                        self.restorable = Some(data);
+                        self.restorable = Some(offer);
                         cx.emit(InboxStoreEvent::Changed);
                     }
                     None => {
@@ -279,11 +326,11 @@ impl InboxStore {
                 // state (freshest, when Zed was open) or the newest backup.
                 self.load_error = Some(error);
                 let recovered = if self.state.has_content() {
-                    Some(self.state.clone())
+                    Some((RestoreSource::Memory, self.state.clone()))
                 } else {
-                    backup
+                    backup.map(|data| (RestoreSource::Backup, data))
                 };
-                self.restorable = recovered.filter(InboxFile::has_content);
+                self.restorable = recovered.filter(|(_, data)| data.has_content());
                 cx.emit(InboxStoreEvent::Changed);
             }
         }
@@ -292,6 +339,15 @@ impl InboxStore {
     fn on_mutated(&mut self, cx: &mut Context<Self>) {
         self.dirty = true;
         self.load_error = None;
+        // A memory-sourced recovery offer is a snapshot of the state being
+        // mutated right now — the live data supersedes it, so retire the
+        // offer (and its banner) immediately. Otherwise a click on the stale
+        // banner's "Keep empty" would wipe a healthy in-memory state.
+        // Backup-sourced offers hold data that is nowhere else in memory and
+        // survive until the user decides.
+        if matches!(self.restorable, Some((RestoreSource::Memory, _))) {
+            self.restorable = None;
+        }
         cx.emit(InboxStoreEvent::Changed);
         self.schedule_save(cx);
     }
@@ -404,8 +460,20 @@ impl InboxStore {
             .find(|item| &item.id == id)
     }
 
-    pub fn types(&self) -> &[InboxType] {
-        &self.state.types
+    pub fn types(&self) -> &[CatalogEntry] {
+        self.catalog(CatalogKind::List)
+    }
+
+    pub fn tags(&self) -> &[CatalogEntry] {
+        self.catalog(CatalogKind::Tag)
+    }
+
+    /// The entries of one catalog, read-side twin of [`Self::catalog_mut`].
+    pub fn catalog(&self, kind: CatalogKind) -> &[CatalogEntry] {
+        match kind {
+            CatalogKind::List => &self.state.types,
+            CatalogKind::Tag => &self.state.tags,
+        }
     }
 
     /// Current ordering of open items.
@@ -434,14 +502,43 @@ impl InboxStore {
     }
 
     /// Looks up a type by its key.
-    pub fn type_by_key(&self, key: &str) -> Option<&InboxType> {
+    pub fn type_by_key(&self, key: &str) -> Option<&CatalogEntry> {
         self.types().iter().find(|inbox_type| inbox_type.key == key)
     }
 
     /// Resolves the type of an item. Returns `None` when the item has no
     /// kind, or when its kind matches no existing type.
-    pub fn resolve_kind(&self, item: &InboxItem) -> Option<&InboxType> {
+    pub fn resolve_kind(&self, item: &InboxItem) -> Option<&CatalogEntry> {
         self.type_by_key(item.kind.as_deref()?)
+    }
+
+    /// Looks up a tag by its key.
+    pub fn tag_by_key(&self, key: &str) -> Option<&CatalogEntry> {
+        self.tags().iter().find(|tag| tag.key == key)
+    }
+
+    /// Resolves the item's tags against the tag catalog, in catalog order
+    /// (stable display order regardless of assignment order). Dangling keys
+    /// are silently skipped, the same tolerance as [`Self::resolve_kind`].
+    pub fn resolve_tags<'a>(
+        &'a self,
+        item: &'a InboxItem,
+    ) -> impl Iterator<Item = &'a CatalogEntry> + 'a {
+        self.tags()
+            .iter()
+            .filter(|entry| item.tags.iter().any(|key| key == &entry.key))
+    }
+
+    /// The subset of `keys` that exists in the tag catalog, in catalog
+    /// order — the one owner of the "tags persist in catalog order" rule.
+    /// `HashSet` iteration order is random; writing it verbatim would
+    /// serialize identical selections differently across captures.
+    pub fn catalog_ordered_tag_keys(&self, keys: &HashSet<String>) -> Vec<String> {
+        self.tags()
+            .iter()
+            .filter(|tag| keys.contains(&tag.key))
+            .map(|tag| tag.key.clone())
+            .collect()
     }
 
     pub fn load_error(&self) -> Option<&str> {
@@ -465,28 +562,40 @@ impl InboxStore {
     }
 
     /// Re-persists the recovered snapshot to `.zed/inbox.json`, recreating the
-    /// file (and a fresh backup) from the ring.
+    /// file (and a fresh backup) from the ring. Edits made while the offer was
+    /// pending are kept: the snapshot only fills in what they don't cover.
     pub fn restore_from_backup(&mut self, cx: &mut Context<Self>) {
-        let Some(state) = self.restorable.take() else {
+        let Some((_, snapshot)) = self.restorable.take() else {
             return;
         };
-        self.state = state;
+        if self.state.has_content() {
+            merge_missing(&mut self.state, snapshot);
+        } else {
+            self.state = snapshot;
+        }
         self.load_error = None;
         // Marks dirty and schedules the debounced save, which rewrites the file.
         self.on_mutated(cx);
         cx.emit(InboxStoreEvent::Reloaded);
     }
 
-    /// Dismisses the recovery offer, accepting the empty state. Nothing is
-    /// written until the next real edit.
+    /// Dismisses the recovery offer. For a memory-sourced offer this accepts
+    /// the loss of the on-disk file and empties the live state; a
+    /// backup-sourced offer is simply dropped, leaving whatever the user has
+    /// built up since untouched. Nothing is written until the next real edit.
     pub fn dismiss_restore(&mut self, cx: &mut Context<Self>) {
-        if self.restorable.take().is_none() {
+        let Some((source, _)) = self.restorable.take() else {
             return;
-        }
-        self.state = InboxFile::default();
+        };
         self.load_error = None;
-        self.last_saved_content = None;
-        cx.emit(InboxStoreEvent::Reloaded);
+        match source {
+            RestoreSource::Memory => {
+                self.state = InboxFile::default();
+                self.last_saved_content = None;
+                cx.emit(InboxStoreEvent::Reloaded);
+            }
+            RestoreSource::Backup => cx.emit(InboxStoreEvent::Changed),
+        }
     }
 
     // Mutations
@@ -506,6 +615,7 @@ impl InboxStore {
                 id: id.clone(),
                 text,
                 kind,
+                tags: Vec::new(),
                 from,
                 body: None,
                 attachments: Vec::new(),
@@ -568,38 +678,6 @@ impl InboxStore {
             &mut self.state.inbox,
             |item| &item.id == id,
             |item| &item.id == target_id,
-        ) {
-            self.on_mutated(cx);
-        }
-    }
-
-    /// Reorders the lists alphabetically by label (case-insensitive).
-    pub fn sort_types_alpha(&mut self, cx: &mut Context<Self>) {
-        if self
-            .state
-            .types
-            .iter()
-            .map(|inbox_type| inbox_type.label.to_lowercase())
-            .is_sorted()
-        {
-            return;
-        }
-        self.state
-            .types
-            .sort_by_cached_key(|inbox_type| inbox_type.label.to_lowercase());
-        self.on_mutated(cx);
-    }
-
-    /// Moves the list `key` to just before `target_key`. No-op if either key is
-    /// missing, they are equal, or the order would not change.
-    pub fn move_type_before(&mut self, key: &str, target_key: &str, cx: &mut Context<Self>) {
-        if key == target_key {
-            return;
-        }
-        if move_before(
-            &mut self.state.types,
-            |inbox_type| inbox_type.key == key,
-            |inbox_type| inbox_type.key == target_key,
         ) {
             self.on_mutated(cx);
         }
@@ -671,6 +749,30 @@ impl InboxStore {
         });
     }
 
+    /// Replaces the item's tag keys.
+    pub fn set_tags(&mut self, id: &ItemId, tags: Vec<String>, cx: &mut Context<Self>) {
+        self.update_item(id, cx, |item| {
+            if item.tags == tags {
+                return false;
+            }
+            item.tags = tags;
+            true
+        });
+    }
+
+    /// Adds the tag to the item if absent, removes it if present.
+    pub fn toggle_item_tag(&mut self, id: &ItemId, tag_key: &str, cx: &mut Context<Self>) {
+        self.update_item(id, cx, |item| {
+            match item.tags.iter().position(|key| key == tag_key) {
+                Some(index) => {
+                    item.tags.remove(index);
+                }
+                None => item.tags.push(tag_key.to_string()),
+            }
+            true
+        });
+    }
+
     pub fn toggle_cleared(&mut self, id: &ItemId, cx: &mut Context<Self>) {
         self.update_item(id, cx, |item| {
             item.cleared = if item.cleared.is_some() {
@@ -705,79 +807,150 @@ impl InboxStore {
         self.on_mutated(cx);
     }
 
-    // Type mutations.
+    // Catalog (list/tag) mutations, parameterized by [`CatalogKind`]. The
+    // two catalogs share all mechanics; only deleting differs in how it
+    // cascades into items (clearing the single `kind` vs filtering `tags`).
 
-    pub fn rename_type(&mut self, key: &str, label: String, cx: &mut Context<Self>) {
-        let Some(inbox_type) = self
-            .state
-            .types
-            .iter_mut()
-            .find(|inbox_type| inbox_type.key == key)
-        else {
-            return;
-        };
-        inbox_type.label = label;
-        self.on_mutated(cx);
-    }
-
-    /// Switches the type's color to the next token in [`TYPE_COLOR_TOKENS`].
-    pub fn cycle_type_color(&mut self, key: &str, cx: &mut Context<Self>) {
-        let Some(inbox_type) = self
-            .state
-            .types
-            .iter_mut()
-            .find(|inbox_type| inbox_type.key == key)
-        else {
-            return;
-        };
-        let next = match TYPE_COLOR_TOKENS
-            .iter()
-            .position(|token| *token == inbox_type.color)
-        {
-            Some(index) => TYPE_COLOR_TOKENS[(index + 1) % TYPE_COLOR_TOKENS.len()],
-            None => TYPE_COLOR_TOKENS[0],
-        };
-        inbox_type.color = next.to_string();
-        self.on_mutated(cx);
-    }
-
-    /// Deletes a type; items of that type become unassigned. Any list can be
-    /// deleted, including the last one — lists start empty by default.
-    pub fn delete_type(&mut self, key: &str, cx: &mut Context<Self>) {
-        let Some(index) = self
-            .state
-            .types
-            .iter()
-            .position(|inbox_type| inbox_type.key == key)
-        else {
-            return;
-        };
-        self.state.types.remove(index);
-        for item in self
-            .state
+    /// All items, open and archived, for cascade cleanups.
+    fn all_items_mut(&mut self) -> impl Iterator<Item = &mut InboxItem> {
+        self.state
             .inbox
             .iter_mut()
             .chain(self.state.archived.iter_mut())
+    }
+
+    fn catalog_mut(&mut self, kind: CatalogKind) -> &mut Vec<CatalogEntry> {
+        match kind {
+            CatalogKind::List => &mut self.state.types,
+            CatalogKind::Tag => &mut self.state.tags,
+        }
+    }
+
+    /// Renames the catalog entry `key`.
+    pub fn rename_entry(
+        &mut self,
+        kind: CatalogKind,
+        key: &str,
+        label: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entry) = self
+            .catalog_mut(kind)
+            .iter_mut()
+            .find(|entry| entry.key == key)
+        else {
+            return;
+        };
+        if entry.label == label {
+            return;
+        }
+        entry.label = label;
+        self.on_mutated(cx);
+    }
+
+    /// Switches the entry's color to the next token in
+    /// [`CATALOG_COLOR_TOKENS`].
+    pub fn cycle_entry_color(&mut self, kind: CatalogKind, key: &str, cx: &mut Context<Self>) {
+        let Some(entry) = self
+            .catalog_mut(kind)
+            .iter_mut()
+            .find(|entry| entry.key == key)
+        else {
+            return;
+        };
+        let next = match CATALOG_COLOR_TOKENS
+            .iter()
+            .position(|token| *token == entry.color)
         {
-            if item.kind.as_deref() == Some(key) {
-                item.kind = None;
+            Some(index) => CATALOG_COLOR_TOKENS[(index + 1) % CATALOG_COLOR_TOKENS.len()],
+            None => CATALOG_COLOR_TOKENS[0],
+        };
+        entry.color = next.to_string();
+        self.on_mutated(cx);
+    }
+
+    /// Deletes a catalog entry. Items referencing it are cleaned up: deleting
+    /// a list unassigns its items, deleting a tag strips it from every item.
+    /// Any entry can be deleted, including the last one — both catalogs start
+    /// empty by default.
+    pub fn delete_entry(&mut self, kind: CatalogKind, key: &str, cx: &mut Context<Self>) {
+        let entries = self.catalog_mut(kind);
+        let Some(index) = entries.iter().position(|entry| entry.key == key) else {
+            return;
+        };
+        entries.remove(index);
+        match kind {
+            CatalogKind::List => {
+                for item in self.all_items_mut() {
+                    if item.kind.as_deref() == Some(key) {
+                        item.kind = None;
+                    }
+                }
+            }
+            CatalogKind::Tag => {
+                for item in self.all_items_mut() {
+                    item.tags.retain(|tag_key| tag_key != key);
+                }
             }
         }
         self.on_mutated(cx);
     }
 
-    /// Adds a new type with a generated key and the next color in the palette.
-    /// Returns the new key.
-    pub fn add_type(&mut self, cx: &mut Context<Self>) -> String {
-        let key = format!("k{}", new_item_id());
-        let color = TYPE_COLOR_TOKENS[self.state.types.len() % TYPE_COLOR_TOKENS.len()];
-        self.state.types.push(InboxType {
+    /// Adds a new catalog entry with a generated key and the next color in
+    /// the palette. Returns the new key.
+    pub fn add_entry(&mut self, kind: CatalogKind, cx: &mut Context<Self>) -> String {
+        // Distinct "k"/"t" key prefixes purely for readability when
+        // hand-inspecting inbox.json; type and tag keys live in disjoint item
+        // fields, so the namespaces never actually need to be distinct.
+        let (key_prefix, default_label) = match kind {
+            CatalogKind::List => ("k", "New list"),
+            CatalogKind::Tag => ("t", "New tag"),
+        };
+        let key = format!("{key_prefix}{}", new_item_id());
+        let entries = self.catalog_mut(kind);
+        let color = CATALOG_COLOR_TOKENS[entries.len() % CATALOG_COLOR_TOKENS.len()];
+        entries.push(CatalogEntry {
             key: key.clone(),
-            label: "New list".to_string(),
+            label: default_label.to_string(),
             color: color.to_string(),
         });
         self.on_mutated(cx);
         key
+    }
+
+    /// Reorders the catalog alphabetically by label (case-insensitive).
+    pub fn sort_entries_alpha(&mut self, kind: CatalogKind, cx: &mut Context<Self>) {
+        let entries = self.catalog_mut(kind);
+        if entries
+            .iter()
+            .map(|entry| entry.label.to_lowercase())
+            .is_sorted()
+        {
+            return;
+        }
+        entries.sort_by_cached_key(|entry| entry.label.to_lowercase());
+        self.on_mutated(cx);
+    }
+
+    /// Moves the catalog entry `key` to just before `target_key`. No-op if
+    /// either key is missing, they are equal, or the order would not change.
+    pub fn move_entry_before(
+        &mut self,
+        kind: CatalogKind,
+        key: &str,
+        target_key: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if key == target_key {
+            return;
+        }
+        if move_before(
+            self.catalog_mut(kind),
+            |entry| entry.key == key,
+            |entry| entry.key == target_key,
+        ) {
+            self.on_mutated(cx);
+        }
     }
 }
 
@@ -1203,8 +1376,8 @@ mod tests {
         );
 
         let key = store.update(cx, |store, cx| {
-            let key = store.add_type(cx);
-            store.rename_type(&key, "TODO".to_string(), cx);
+            let key = store.add_entry(CatalogKind::List, cx);
+            store.rename_entry(CatalogKind::List, &key, "TODO".to_string(), cx);
             key
         });
         flush_saves(cx);
@@ -1238,14 +1411,14 @@ mod tests {
 
         // Sorting lists alphabetically reorders types by label (case-insensitive).
         let (key_banana, key_apple) = store.update(cx, |store, cx| {
-            let key_banana = store.add_type(cx);
-            store.rename_type(&key_banana, "Banana".to_string(), cx);
-            let key_apple = store.add_type(cx);
-            store.rename_type(&key_apple, "apple".to_string(), cx);
+            let key_banana = store.add_entry(CatalogKind::List, cx);
+            store.rename_entry(CatalogKind::List, &key_banana, "Banana".to_string(), cx);
+            let key_apple = store.add_entry(CatalogKind::List, cx);
+            store.rename_entry(CatalogKind::List, &key_apple, "apple".to_string(), cx);
             (key_banana, key_apple)
         });
         store.update(cx, |store, cx| {
-            store.sort_types_alpha(cx);
+            store.sort_entries_alpha(CatalogKind::List, cx);
             let labels: Vec<_> = store.types().iter().map(|t| t.label.clone()).collect();
             assert_eq!(labels, ["apple", "Banana"]);
             assert_eq!(store.types()[0].key, key_apple);
@@ -1296,16 +1469,16 @@ mod tests {
 
         // Lists: order one, two, three; move three before one -> three, one, two.
         let (key_one, _key_two, key_three) = store.update(cx, |store, cx| {
-            let one = store.add_type(cx);
-            store.rename_type(&one, "one".to_string(), cx);
-            let two = store.add_type(cx);
-            store.rename_type(&two, "two".to_string(), cx);
-            let three = store.add_type(cx);
-            store.rename_type(&three, "three".to_string(), cx);
+            let one = store.add_entry(CatalogKind::List, cx);
+            store.rename_entry(CatalogKind::List, &one, "one".to_string(), cx);
+            let two = store.add_entry(CatalogKind::List, cx);
+            store.rename_entry(CatalogKind::List, &two, "two".to_string(), cx);
+            let three = store.add_entry(CatalogKind::List, cx);
+            store.rename_entry(CatalogKind::List, &three, "three".to_string(), cx);
             (one, two, three)
         });
         store.update(cx, |store, cx| {
-            store.move_type_before(&key_three, &key_one, cx)
+            store.move_entry_before(CatalogKind::List, &key_three, &key_one, cx)
         });
         store.read_with(cx, |store, _| {
             let labels: Vec<_> = store.types().iter().map(|t| t.label.clone()).collect();
@@ -1326,11 +1499,11 @@ mod tests {
         let (key_a, key_b) = store.update(cx, |store, cx| {
             // Adding a type appends a fresh one with the next color and a
             // default label.
-            let key_a = store.add_type(cx);
+            let key_a = store.add_entry(CatalogKind::List, cx);
             assert_eq!(store.types()[0].label, "New list");
             assert_eq!(store.types()[0].color, "accent");
 
-            let key_b = store.add_type(cx);
+            let key_b = store.add_entry(CatalogKind::List, cx);
             assert_eq!(store.types()[1].color, "created");
             (key_a, key_b)
         });
@@ -1341,11 +1514,11 @@ mod tests {
 
         store.update(cx, |store, cx| {
             // Cycling moves the color to the next token.
-            store.cycle_type_color(&key_a, cx);
+            store.cycle_entry_color(CatalogKind::List, &key_a, cx);
             assert_eq!(store.types()[0].color, "created");
 
             // Deleting a type unassigns its items (kind cleared to None).
-            store.delete_type(&key_b, cx);
+            store.delete_entry(CatalogKind::List, &key_b, cx);
             assert!(store.types().iter().all(|t| t.key != key_b));
         });
         store.read_with(cx, |store, _| {
@@ -1354,14 +1527,131 @@ mod tests {
 
         store.update(cx, |store, cx| {
             // The last remaining type can be deleted, leaving no lists.
-            store.delete_type(&key_a, cx);
+            store.delete_entry(CatalogKind::List, &key_a, cx);
             assert_eq!(store.types().len(), 0);
 
             // Adding a type appends a fresh one.
-            let key = store.add_type(cx);
+            let key = store.add_entry(CatalogKind::List, cx);
             assert_eq!(store.types().len(), 1);
             assert_eq!(store.types()[0].key, key);
             assert_eq!(store.types()[0].label, "New list");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_tag_mutations(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({})).await;
+        let (_project, store) = build_store(fs.clone(), cx).await;
+
+        // No tags exist by default.
+        store.read_with(cx, |store, _| assert!(store.tags().is_empty()));
+
+        let (key_a, key_b) = store.update(cx, |store, cx| {
+            let key_a = store.add_entry(CatalogKind::Tag, cx);
+            assert_eq!(store.tags()[0].label, "New tag");
+            assert_eq!(store.tags()[0].color, "accent");
+            let key_b = store.add_entry(CatalogKind::Tag, cx);
+            assert_eq!(store.tags()[1].color, "created");
+            (key_a, key_b)
+        });
+
+        // Toggling adds; resolve_tags yields catalog order.
+        let item_id = store.update(cx, |store, cx| {
+            let id = store.capture("tagged item".to_string(), None, None, cx);
+            store.toggle_item_tag(&id, &key_b, cx);
+            store.toggle_item_tag(&id, &key_a, cx);
+            id
+        });
+        store.read_with(cx, |store, _| {
+            let item = store.item(&item_id).unwrap();
+            assert_eq!(item.tags, vec![key_b.clone(), key_a.clone()]);
+            let resolved: Vec<_> = store
+                .resolve_tags(item)
+                .map(|tag| tag.key.clone())
+                .collect();
+            assert_eq!(
+                resolved,
+                vec![key_a.clone(), key_b.clone()],
+                "tags must resolve in catalog order, not assignment order"
+            );
+        });
+
+        store.update(cx, |store, cx| {
+            store.rename_entry(CatalogKind::Tag, &key_a, "Urgent".to_string(), cx);
+            assert_eq!(store.tag_by_key(&key_a).unwrap().label, "Urgent");
+
+            store.cycle_entry_color(CatalogKind::Tag, &key_a, cx);
+            assert_eq!(store.tag_by_key(&key_a).unwrap().color, "created");
+
+            // Toggling an assigned tag off removes it from the item.
+            store.toggle_item_tag(&item_id, &key_b, cx);
+        });
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.item(&item_id).unwrap().tags, vec![key_a.clone()]);
+        });
+
+        // Deleting a tag strips it from every item.
+        store.update(cx, |store, cx| {
+            store.delete_entry(CatalogKind::Tag, &key_a, cx)
+        });
+        store.read_with(cx, |store, _| {
+            assert!(store.tag_by_key(&key_a).is_none());
+            assert!(store.item(&item_id).unwrap().tags.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_tag_reorder_sort_and_dangling_keys(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({})).await;
+        let (_project, store) = build_store(fs.clone(), cx).await;
+
+        let (key_one, _key_two, key_three) = store.update(cx, |store, cx| {
+            let one = store.add_entry(CatalogKind::Tag, cx);
+            store.rename_entry(CatalogKind::Tag, &one, "one".to_string(), cx);
+            let two = store.add_entry(CatalogKind::Tag, cx);
+            store.rename_entry(CatalogKind::Tag, &two, "two".to_string(), cx);
+            let three = store.add_entry(CatalogKind::Tag, cx);
+            store.rename_entry(CatalogKind::Tag, &three, "three".to_string(), cx);
+            (one, two, three)
+        });
+
+        // Move three before one -> three, one, two.
+        store.update(cx, |store, cx| {
+            store.move_entry_before(CatalogKind::Tag, &key_three, &key_one, cx)
+        });
+        store.read_with(cx, |store, _| {
+            let labels: Vec<_> = store.tags().iter().map(|tag| tag.label.clone()).collect();
+            assert_eq!(labels, ["three", "one", "two"]);
+        });
+
+        // Sort alphabetically by label (case-insensitive).
+        store.update(cx, |store, cx| {
+            store.sort_entries_alpha(CatalogKind::Tag, cx)
+        });
+        store.read_with(cx, |store, _| {
+            let labels: Vec<_> = store.tags().iter().map(|tag| tag.label.clone()).collect();
+            assert_eq!(labels, ["one", "three", "two"]);
+        });
+
+        // set_tags replaces wholesale; unknown keys are kept in the item but
+        // silently skipped by resolve_tags (same tolerance as resolve_kind).
+        let item_id = store.update(cx, |store, cx| {
+            let id = store.capture("x".to_string(), None, None, cx);
+            store.set_tags(&id, vec!["missing".to_string(), key_one.clone()], cx);
+            id
+        });
+        store.read_with(cx, |store, _| {
+            let item = store.item(&item_id).unwrap();
+            assert_eq!(item.tags.len(), 2);
+            let resolved: Vec<_> = store
+                .resolve_tags(item)
+                .map(|tag| tag.key.clone())
+                .collect();
+            assert_eq!(resolved, vec![key_one.clone()]);
         });
     }
 
@@ -1672,5 +1962,138 @@ mod tests {
         let parsed: InboxFile = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed.inbox.len(), 1);
         assert_eq!(parsed.inbox[0].text, "keep me");
+    }
+
+    #[gpui::test]
+    async fn test_mutation_retires_memory_sourced_restore_offer(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".zed": {
+                    "inbox.json": r#"{ "inbox": [{ "id": "one", "text": "keep me" }] }"#
+                }
+            }),
+        )
+        .await;
+        let (_project, store) = build_store(fs.clone(), cx).await;
+
+        // The file gets corrupted out from under us → recovery banner offering
+        // the still-live in-memory state.
+        fs.save(
+            path!("/root/.zed/inbox.json").as_ref(),
+            &r#"{ "inbox": [ broken"#.into(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        flush_saves(cx);
+        store.read_with(cx, |store, _| assert!(store.can_restore()));
+
+        // The user ignores the banner and keeps editing. The live state now
+        // supersedes the snapshot, so the offer must retire immediately —
+        // before the debounced save — or a "Keep empty" click in that window
+        // would wipe healthy data.
+        store.update(cx, |store, cx| {
+            store.capture("new task".into(), None, None, cx);
+        });
+        store.read_with(cx, |store, _| {
+            assert!(
+                !store.can_restore(),
+                "a mutation must retire a memory-sourced restore offer at once"
+            );
+        });
+        store.update(cx, |store, cx| store.dismiss_restore(cx));
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.items().len(), 2, "dismiss must now be a no-op");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_backup_sourced_offer_survives_edits_and_merges_on_restore(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({})).await;
+        let (project, store) = build_store(fs.clone(), cx).await;
+
+        // First session writes data (and thus a backup), then the file is
+        // lost between sessions.
+        store.update(cx, |store, cx| {
+            store.capture("from last time".to_string(), None, None, cx);
+        });
+        flush_saves(cx);
+        drop(store);
+        fs.remove_file(path!("/root/.zed/inbox.json").as_ref(), Default::default())
+            .await
+            .unwrap();
+
+        // A fresh store (empty memory) offers the backup. The user ignores
+        // the banner and captures a new item; the offer must survive that
+        // edit — the backup's data exists nowhere else.
+        let store2 = cx.new(|cx| InboxStore::new(project, fs.clone(), cx));
+        cx.run_until_parked();
+        store2.read_with(cx, |store, _| assert!(store.can_restore()));
+        store2.update(cx, |store, cx| {
+            store.capture("typed before deciding".to_string(), None, None, cx);
+        });
+        flush_saves(cx);
+        store2.read_with(cx, |store, _| {
+            assert!(
+                store.can_restore(),
+                "an unrelated edit must not retire a backup-sourced offer"
+            );
+        });
+
+        // Restore merges the snapshot under the newer edits instead of
+        // overwriting them.
+        store2.update(cx, |store, cx| store.restore_from_backup(cx));
+        flush_saves(cx);
+        store2.read_with(cx, |store, _| {
+            assert!(!store.can_restore());
+            let texts: Vec<_> = store
+                .items()
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect();
+            assert!(texts.contains(&"typed before deciding"));
+            assert!(texts.contains(&"from last time"));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_dismissing_backup_sourced_offer_keeps_current_state(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({})).await;
+        let (project, store) = build_store(fs.clone(), cx).await;
+
+        store.update(cx, |store, cx| {
+            store.capture("from last time".to_string(), None, None, cx);
+        });
+        flush_saves(cx);
+        drop(store);
+        fs.remove_file(path!("/root/.zed/inbox.json").as_ref(), Default::default())
+            .await
+            .unwrap();
+
+        let store2 = cx.new(|cx| InboxStore::new(project, fs.clone(), cx));
+        cx.run_until_parked();
+        store2.read_with(cx, |store, _| assert!(store.can_restore()));
+        store2.update(cx, |store, cx| {
+            store.capture("typed before deciding".to_string(), None, None, cx);
+        });
+
+        // Declining a backup-sourced offer only drops the offer; it must not
+        // wipe what the user built up since the banner appeared.
+        store2.update(cx, |store, cx| store.dismiss_restore(cx));
+        flush_saves(cx);
+        store2.read_with(cx, |store, _| {
+            assert!(!store.can_restore());
+            assert_eq!(store.items().len(), 1);
+            assert_eq!(store.items()[0].text, "typed before deciding");
+        });
     }
 }

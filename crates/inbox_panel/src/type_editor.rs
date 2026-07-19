@@ -1,5 +1,7 @@
-//! The "Lists" overlay: renaming, recoloring, adding and deleting inbox
-//! types. Rendered on top of the whole panel while it is open.
+//! The "Lists & Tags" overlay: renaming, recoloring, adding and deleting
+//! inbox lists and tags. Both catalogs share the same row/section mechanics
+//! ([`CatalogKind`] picks which store methods a row dispatches to). Rendered
+//! on top of the whole panel while it is open.
 
 use collections::HashMap;
 use editor::{Editor, EditorEvent};
@@ -9,19 +11,64 @@ use gpui::{
 };
 use ui::{Tab, Tooltip, prelude::*};
 
-use crate::inbox_model::type_color;
+use crate::inbox_model::{CatalogKind, catalog_color};
 use crate::inbox_store::InboxStore;
-use crate::{InboxPanel, entity_confirmation_popover};
+use crate::{InboxPanel, catalog_swatch, entity_confirmation_popover};
 
-/// Drag payload and ghost view for reordering lists in the type editor.
+/// The overlay's per-kind UI vocabulary: element-id prefixes, section labels
+/// and confirmation strings. An inherent impl in this file (the enum's home
+/// is `inbox_model`) because it is presentation-only; kept together so
+/// adding a catalog kind updates every string in one place.
+impl CatalogKind {
+    /// Prefix for per-row element ids, so list and tag rows never collide.
+    fn id_prefix(self) -> &'static str {
+        match self {
+            CatalogKind::List => "inbox-list",
+            CatalogKind::Tag => "inbox-tag",
+        }
+    }
+
+    fn section_title(self) -> &'static str {
+        match self {
+            CatalogKind::List => "YOUR LISTS",
+            CatalogKind::Tag => "TAGS",
+        }
+    }
+
+    fn add_label(self) -> &'static str {
+        match self {
+            CatalogKind::List => "Add list",
+            CatalogKind::Tag => "Add tag",
+        }
+    }
+
+    fn delete_tooltip(self) -> &'static str {
+        match self {
+            CatalogKind::List => "Delete list",
+            CatalogKind::Tag => "Delete tag",
+        }
+    }
+
+    fn confirm_title(self) -> &'static str {
+        match self {
+            CatalogKind::List => "Delete list?",
+            CatalogKind::Tag => "Delete tag?",
+        }
+    }
+}
+
+/// Drag payload and ghost view for reordering catalog rows in the editor.
+/// Carries its [`CatalogKind`] so a tag row dropped onto a list row (or vice
+/// versa) is inert instead of corrupting the other catalog's order.
 #[derive(Clone)]
-struct DraggedInboxType {
+struct DraggedCatalogEntry {
+    kind: CatalogKind,
     key: String,
     label: SharedString,
     color: Hsla,
 }
 
-impl Render for DraggedInboxType {
+impl Render for DraggedCatalogEntry {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .gap_1()
@@ -31,20 +78,20 @@ impl Render for DraggedInboxType {
             .border_1()
             .border_color(cx.theme().colors().border)
             .bg(cx.theme().colors().element_selected)
-            .child(div().flex_none().size(px(7.)).rounded_xs().bg(self.color))
+            .child(catalog_swatch(self.color))
             .child(Label::new(self.label.clone()).size(LabelSize::Small))
     }
 }
 
-/// Editor state of the type editor overlay: one single-line rename editor per
-/// type, keyed by the type key. Created when the overlay opens and dropped
-/// when it closes.
+/// Editor state of the catalog editor overlay: one single-line rename editor
+/// per list and per tag, keyed by catalog kind + entry key. Created when the
+/// overlay opens and dropped when it closes.
 pub(crate) struct TypeEditorState {
-    rename_editors: HashMap<String, (Entity<Editor>, Subscription)>,
-    /// The custom list whose delete action is pending confirmation, plus the
-    /// window position of the confirm popover, if any. Only one row can be
-    /// confirming at a time.
-    confirming_delete: Option<(String, Point<Pixels>)>,
+    rename_editors: HashMap<(CatalogKind, String), (Entity<Editor>, Subscription)>,
+    /// The catalog entry whose delete action is pending confirmation, plus
+    /// the window position of the confirm popover, if any. Only one row (of
+    /// either catalog) can be confirming at a time.
+    confirming_delete: Option<(CatalogKind, String, Point<Pixels>)>,
 }
 
 impl TypeEditorState {
@@ -61,30 +108,41 @@ impl TypeEditorState {
         this
     }
 
-    /// Creates rename editors for types that don't have one yet and drops the
-    /// editors of deleted types. Editors of surviving types keep their text,
-    /// so in-progress edits are not clobbered.
+    /// Creates rename editors for entries that don't have one yet and drops
+    /// the editors of deleted entries, in both catalogs. Editors of surviving
+    /// entries keep their text, so in-progress edits are not clobbered.
     pub(crate) fn sync(
         &mut self,
         store: &Entity<InboxStore>,
         window: &mut Window,
         cx: &mut Context<InboxPanel>,
     ) {
-        let types: Vec<(String, String)> = store
-            .read(cx)
-            .types()
-            .iter()
-            .map(|inbox_type| (inbox_type.key.clone(), inbox_type.label.clone()))
-            .collect();
-        if let Some((pending, _)) = &self.confirming_delete {
-            if !types.iter().any(|(type_key, _)| type_key == pending) {
-                self.confirming_delete = None;
-            }
+        let entries: Vec<(CatalogKind, String, String)> = {
+            let store = store.read(cx);
+            [CatalogKind::List, CatalogKind::Tag]
+                .into_iter()
+                .flat_map(|kind| {
+                    store
+                        .catalog(kind)
+                        .iter()
+                        .map(move |entry| (kind, entry.key.clone(), entry.label.clone()))
+                })
+                .collect()
+        };
+        if let Some((kind, pending, _)) = &self.confirming_delete
+            && !entries
+                .iter()
+                .any(|(entry_kind, key, _)| entry_kind == kind && key == pending)
+        {
+            self.confirming_delete = None;
         }
-        self.rename_editors
-            .retain(|key, _| types.iter().any(|(type_key, _)| type_key == key));
-        for (key, label) in types {
-            if self.rename_editors.contains_key(&key) {
+        self.rename_editors.retain(|(kind, key), _| {
+            entries
+                .iter()
+                .any(|(entry_kind, entry_key, _)| entry_kind == kind && entry_key == key)
+        });
+        for (kind, key, label) in entries {
+            if self.rename_editors.contains_key(&(kind, key.clone())) {
                 continue;
             }
             let editor = cx.new(|cx| {
@@ -98,16 +156,19 @@ impl TypeEditorState {
                     if let EditorEvent::BufferEdited = event {
                         let label = editor.read(cx).text(cx);
                         this.store
-                            .update(cx, |store, cx| store.rename_type(&key, label, cx));
+                            .update(cx, |store, cx| store.rename_entry(kind, &key, label, cx));
                     }
                 }
             });
-            self.rename_editors.insert(key, (editor, subscription));
+            self.rename_editors
+                .insert((kind, key), (editor, subscription));
         }
     }
 
-    fn editor(&self, key: &str) -> Option<&Entity<Editor>> {
-        self.rename_editors.get(key).map(|(editor, _)| editor)
+    fn editor(&self, kind: CatalogKind, key: &str) -> Option<&Entity<Editor>> {
+        self.rename_editors
+            .get(&(kind, key.to_string()))
+            .map(|(editor, _)| editor)
     }
 }
 
@@ -153,29 +214,31 @@ impl InboxPanel {
             )
     }
 
-    fn render_type_row(
+    fn render_catalog_row(
         &self,
+        kind: CatalogKind,
         key: &str,
         color: gpui::Hsla,
         editor: Entity<Editor>,
         reorderable: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let prefix = kind.id_prefix();
         // The confirm popover is anchored at the click and rendered at the
-        // overlay root (see `render_type_delete_confirmation`), matching how
-        // the list rows confirm a task deletion.
+        // overlay root (see `render_catalog_delete_confirmation`), matching
+        // how the list rows confirm a task deletion.
         let trailing = IconButton::new(
-            SharedString::from(format!("inbox-type-delete-{key}")),
+            SharedString::from(format!("{prefix}-delete-{key}")),
             IconName::Close,
         )
         .icon_size(IconSize::XSmall)
         .icon_color(Color::Muted)
-        .tooltip(Tooltip::text("Delete list"))
+        .tooltip(Tooltip::text(kind.delete_tooltip()))
         .on_click(cx.listener({
             let key = key.to_string();
             move |this, event: &ClickEvent, _, cx| {
                 if let Some(state) = this.type_editor.as_mut() {
-                    state.confirming_delete = Some((key.clone(), event.position()));
+                    state.confirming_delete = Some((kind, key.clone(), event.position()));
                 }
                 cx.notify();
             }
@@ -183,20 +246,30 @@ impl InboxPanel {
 
         let label = SharedString::from(editor.read(cx).text(cx));
         h_flex()
-            .id(SharedString::from(format!("inbox-type-row-{key}")))
+            .id(SharedString::from(format!("{prefix}-row-{key}")))
             .gap_2()
             .px_1()
             .py_0p5()
             .when(reorderable, |this| {
-                this.drag_over::<DraggedInboxType>(|style, _, _, cx| {
-                    style.bg(cx.theme().colors().drop_target_background)
+                // Both the highlight and the drop are gated on the drag
+                // coming from this row's own catalog, so a tag dragged over
+                // a list row (or vice versa) shows no false affordance.
+                this.drag_over::<DraggedCatalogEntry>(move |style, drag, _, cx| {
+                    if drag.kind == kind {
+                        style.bg(cx.theme().colors().drop_target_background)
+                    } else {
+                        style
+                    }
                 })
                 .on_drop(cx.listener({
                     let target_key = key.to_string();
-                    move |this, drag: &DraggedInboxType, window, cx| {
+                    move |this, drag: &DraggedCatalogEntry, window, cx| {
+                        if drag.kind != kind {
+                            return;
+                        }
                         let store = this.store.clone();
                         store.update(cx, |store, cx| {
-                            store.move_type_before(&drag.key, &target_key, cx)
+                            store.move_entry_before(kind, &drag.key, &target_key, cx)
                         });
                         if let Some(state) = this.type_editor.as_mut() {
                             state.sync(&store, window, cx);
@@ -208,11 +281,12 @@ impl InboxPanel {
             .when(reorderable, |this| {
                 this.child(
                     div()
-                        .id(SharedString::from(format!("inbox-type-grip-{key}")))
+                        .id(SharedString::from(format!("{prefix}-grip-{key}")))
                         .flex_none()
                         .cursor_pointer()
                         .on_drag(
-                            DraggedInboxType {
+                            DraggedCatalogEntry {
+                                kind,
                                 key: key.to_string(),
                                 label: label.clone(),
                                 color,
@@ -228,7 +302,7 @@ impl InboxPanel {
             })
             .child(
                 div()
-                    .id(SharedString::from(format!("inbox-type-swatch-{key}")))
+                    .id(SharedString::from(format!("{prefix}-swatch-{key}")))
                     .flex_none()
                     .size(px(16.))
                     .rounded_sm()
@@ -238,7 +312,7 @@ impl InboxPanel {
                         let key = key.to_string();
                         move |this, _, _, cx| {
                             this.store
-                                .update(cx, |store, cx| store.cycle_type_color(&key, cx));
+                                .update(cx, |store, cx| store.cycle_entry_color(kind, &key, cx));
                         }
                     })),
             )
@@ -257,16 +331,112 @@ impl InboxPanel {
             .child(trailing)
     }
 
-    /// The full-panel type editor overlay, or `None` while it is closed.
+    /// One catalog section of the overlay: a header row (title + optional
+    /// "Sort A–Z"), the entry rows, and a trailing "Add …" row. Shared by the
+    /// lists and tags sections, which differ only in which store mutations
+    /// the controls dispatch to.
+    fn render_catalog_section(
+        &self,
+        kind: CatalogKind,
+        show_sort: bool,
+        rows: Vec<AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let prefix = kind.id_prefix();
+        v_flex()
+            .gap_1()
+            .child(
+                h_flex()
+                    .px_1()
+                    .items_center()
+                    .justify_between()
+                    .child(section_label(kind.section_title()))
+                    .when(show_sort, |this| {
+                        this.child(
+                            Button::new(SharedString::from(format!("{prefix}-sort")), "Sort A–Z")
+                                .style(ButtonStyle::Subtle)
+                                .size(ButtonSize::Compact)
+                                .label_size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    let store = this.store.clone();
+                                    store
+                                        .update(cx, |store, cx| store.sort_entries_alpha(kind, cx));
+                                    if let Some(state) = this.type_editor.as_mut() {
+                                        state.sync(&store, window, cx);
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            )
+            .children(rows)
+            .child(
+                h_flex()
+                    .id(SharedString::from(format!("{prefix}-add")))
+                    .gap_2()
+                    .px_1()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(cx.theme().colors().element_hover))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        let store = this.store.clone();
+                        store.update(cx, |store, cx| {
+                            store.add_entry(kind, cx);
+                        });
+                        if let Some(state) = this.type_editor.as_mut() {
+                            state.sync(&store, window, cx);
+                        }
+                        cx.notify();
+                    }))
+                    .child(
+                        Icon::new(IconName::Plus)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(kind.add_label())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            )
+    }
+
+    /// One catalog's entry rows. Reordering by drag only makes sense with
+    /// more than one entry.
+    fn catalog_rows(
+        &self,
+        state: &TypeEditorState,
+        kind: CatalogKind,
+        entries: &[(String, gpui::Hsla)],
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let reorderable = entries.len() >= 2;
+        entries
+            .iter()
+            .filter_map(|(key, color)| {
+                let editor = state.editor(kind, key)?.clone();
+                Some(
+                    self.render_catalog_row(kind, key, *color, editor, reorderable, cx)
+                        .into_any_element(),
+                )
+            })
+            .collect()
+    }
+
+    /// The full-panel catalog editor overlay, or `None` while it is closed.
     pub(crate) fn render_type_editor(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let state = self.type_editor.as_ref()?;
-        let types: Vec<(String, gpui::Hsla)> = {
-            let store = self.store.read(cx);
-            store
-                .types()
+        let entries = |entries: &[crate::inbox_model::CatalogEntry]| -> Vec<(String, gpui::Hsla)> {
+            entries
                 .iter()
-                .map(|inbox_type| (inbox_type.key.clone(), type_color(&inbox_type.color, cx)))
+                .map(|entry| (entry.key.clone(), catalog_color(&entry.color, cx)))
                 .collect()
+        };
+        let (lists, tags) = {
+            let store = self.store.read(cx);
+            (entries(store.types()), entries(store.tags()))
         };
 
         let header = h_flex()
@@ -289,22 +459,14 @@ impl InboxPanel {
             .child(
                 div()
                     .flex_1()
-                    .child(Label::new("Lists").weight(FontWeight::MEDIUM)),
+                    .child(Label::new("Lists & Tags").weight(FontWeight::MEDIUM)),
             );
 
-        // Reordering by drag only makes sense with more than one list.
-        let reorderable = types.len() >= 2;
-        let type_rows: Vec<AnyElement> = types
-            .iter()
-            .filter_map(|(key, color)| {
-                let editor = state.editor(key)?.clone();
-                Some(
-                    self.render_type_row(key, *color, editor, reorderable, cx)
-                        .into_any_element(),
-                )
-            })
-            .collect();
+        let list_rows = self.catalog_rows(state, CatalogKind::List, &lists, cx);
+        let tag_rows = self.catalog_rows(state, CatalogKind::Tag, &tags, cx);
 
+        let border_variant = cx.theme().colors().border_variant;
+        let divider = move || div().my_1().border_t_1().border_color(border_variant);
         let body = v_flex()
             .id("inbox-type-editor-body")
             .flex_1()
@@ -315,67 +477,10 @@ impl InboxPanel {
             .child(div().px_1().child(section_label("SYSTEM · READ-ONLY")))
             .child(self.render_system_type_row("All", Color::Accent.color(cx), cx))
             .child(self.render_system_type_row("Archive", Color::Muted.color(cx), cx))
-            .child(
-                div()
-                    .my_1()
-                    .border_t_1()
-                    .border_color(cx.theme().colors().border_variant),
-            )
-            .child(
-                h_flex()
-                    .px_1()
-                    .items_center()
-                    .justify_between()
-                    .child(section_label("YOUR LISTS"))
-                    .when(types.len() >= 2, |this| {
-                        this.child(
-                            Button::new("inbox-sort-lists", "Sort A–Z")
-                                .style(ButtonStyle::Subtle)
-                                .size(ButtonSize::Compact)
-                                .label_size(LabelSize::XSmall)
-                                .color(Color::Muted)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    let store = this.store.clone();
-                                    store.update(cx, |store, cx| store.sort_types_alpha(cx));
-                                    if let Some(state) = this.type_editor.as_mut() {
-                                        state.sync(&store, window, cx);
-                                    }
-                                    cx.notify();
-                                })),
-                        )
-                    }),
-            )
-            .children(type_rows)
-            .child(
-                h_flex()
-                    .id("inbox-add-type")
-                    .gap_2()
-                    .px_1()
-                    .py_1()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .hover(|style| style.bg(cx.theme().colors().element_hover))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        let store = this.store.clone();
-                        store.update(cx, |store, cx| {
-                            store.add_type(cx);
-                        });
-                        if let Some(state) = this.type_editor.as_mut() {
-                            state.sync(&store, window, cx);
-                        }
-                        cx.notify();
-                    }))
-                    .child(
-                        Icon::new(IconName::Plus)
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        Label::new("Add list")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    ),
-            );
+            .child(divider())
+            .child(self.render_catalog_section(CatalogKind::List, lists.len() >= 2, list_rows, cx))
+            .child(divider())
+            .child(self.render_catalog_section(CatalogKind::Tag, tags.len() >= 2, tag_rows, cx));
 
         Some(
             v_flex()
@@ -386,22 +491,22 @@ impl InboxPanel {
                 .bg(cx.theme().colors().panel_background)
                 .child(header)
                 .child(body)
-                .children(self.render_type_delete_confirmation(cx))
+                .children(self.render_catalog_delete_confirmation(cx))
                 .into_any_element(),
         )
     }
 
-    /// The delete-confirmation popover for a list, anchored where the row's
-    /// trash button was clicked. Mirrors the item rows' confirmation in the
-    /// main list.
-    fn render_type_delete_confirmation(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (key, position) = self.type_editor.as_ref()?.confirming_delete.clone()?;
+    /// The delete-confirmation popover for a catalog entry, anchored where
+    /// the row's delete button was clicked. Mirrors the item rows'
+    /// confirmation in the main list.
+    fn render_catalog_delete_confirmation(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (kind, key, position) = self.type_editor.as_ref()?.confirming_delete.clone()?;
         Some(entity_confirmation_popover(
             cx.entity().downgrade(),
-            "inbox-type-delete",
+            "inbox-catalog-delete",
             position,
             gpui::Anchor::TopLeft,
-            "Delete list?",
+            kind.confirm_title(),
             "Delete",
             |this, _| {
                 if let Some(state) = this.type_editor.as_mut() {
@@ -410,7 +515,7 @@ impl InboxPanel {
             },
             move |this, window, cx| {
                 let store = this.store.clone();
-                store.update(cx, |store, cx| store.delete_type(&key, cx));
+                store.update(cx, |store, cx| store.delete_entry(kind, &key, cx));
                 if let Some(state) = this.type_editor.as_mut() {
                     state.sync(&store, window, cx);
                 }
