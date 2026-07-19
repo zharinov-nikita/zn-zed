@@ -222,6 +222,8 @@ pub struct SettingsContent {
     /// Default: on_typing_and_action
     pub hide_mouse: Option<HideMouseMode>,
 
+    pub inbox_panel: Option<InboxPanelSettingsContent>,
+
     pub journal: Option<JournalSettingsContent>,
 
     /// A map of log scopes to the desired log level.
@@ -1137,6 +1139,24 @@ pub struct OutlinePanelSettingsContent {
     ///
     /// Default: 100
     pub expand_outlines_with_depth: Option<usize>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, PartialEq)]
+pub struct InboxPanelSettingsContent {
+    /// Whether to show the inbox panel button in the status bar.
+    ///
+    /// Default: true
+    pub button: Option<bool>,
+    /// Customize default width (in pixels) taken by inbox panel
+    ///
+    /// Default: 300
+    #[serde(serialize_with = "crate::serialize_optional_f32_with_two_decimal_places")]
+    pub default_width: Option<f32>,
+    /// The position of inbox panel
+    ///
+    /// Default: left
+    pub dock: Option<DockSide>,
 }
 
 #[derive(

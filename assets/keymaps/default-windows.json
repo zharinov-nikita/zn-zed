@@ -686,6 +686,7 @@
       "ctrl-shift-b": "outline_panel::ToggleFocus",
       "ctrl-shift-g": "git_panel::ToggleFocus",
       "ctrl-shift-d": "debug_panel::ToggleFocus",
+      "ctrl-alt-n": "inbox_panel::ToggleFocus",
       "ctrl-shift-/": "agent::ToggleFocus",
       "ctrl-k s": "workspace::SaveAll",
       "ctrl-k n": "encoding_selector::Toggle",
@@ -1042,6 +1043,13 @@
       "ctrl-enter": "git::Commit",
       "ctrl-shift-enter": "git::Amend",
       "alt-l": "git::GenerateCommitMessage",
+    },
+  },
+  {
+    "context": "InboxCapture > Editor",
+    "use_key_equivalents": true,
+    "bindings": {
+      "enter": "inbox_panel::Capture",
     },
   },
   {

@@ -96,8 +96,8 @@ use ui::{
 };
 use util::ResultExt as _;
 use workspace::{
-    CollaboratorId, DraggedSelection, DraggedTab, MultiWorkspace, PathList, SerializedPathList,
-    ToggleWorkspaceSidebar, ToggleZoom, ToolbarItemView, Workspace, WorkspaceId,
+    CollaboratorId, DraggedSelection, DraggedTab, DraggedText, MultiWorkspace, PathList,
+    SerializedPathList, ToggleWorkspaceSidebar, ToggleZoom, ToolbarItemView, Workspace, WorkspaceId,
     dock::{DockPosition, Panel, PanelEvent},
     item::{ItemEvent, ItemHandle},
 };
@@ -3974,6 +3974,39 @@ impl AgentPanel {
         }
     }
 
+    /// Inserts `text` into the active thread's message editor as a draft and
+    /// focuses it. Used by external callers (e.g. the inbox panel) to hand a
+    /// task off to the agent. Deferred so it runs after the panel has finished
+    /// activating.
+    pub fn insert_prompt_text(&self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        cx.defer_in(window, move |panel, window, cx| {
+            let Some(conversation_view) = panel.active_conversation_view().cloned() else {
+                // The panel is showing something other than a chat thread (a
+                // terminal, onboarding, …), so there is no message editor to
+                // insert into. Tell the user instead of silently dropping it.
+                struct InsertPromptTextToast;
+                if let Some(workspace) = panel.workspace.upgrade() {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.show_toast(
+                            workspace::Toast::new(
+                                workspace::notifications::NotificationId::unique::<
+                                    InsertPromptTextToast,
+                                >(),
+                                "Open a chat thread to add this text",
+                            )
+                            .autohide(),
+                            cx,
+                        );
+                    });
+                }
+                return;
+            };
+            conversation_view.update(cx, |conversation_view, cx| {
+                conversation_view.insert_prompt_text(text, window, cx);
+            });
+        });
+    }
+
     pub(crate) fn visible_conversation_view(&self) -> Option<&Entity<ConversationView>> {
         match self.visible_surface() {
             VisibleSurface::AgentThread(conversation_view) => Some(conversation_view),
@@ -6287,6 +6320,7 @@ impl AgentPanel {
             .bg(cx.theme().colors().drop_target_background)
             .drag_over::<DraggedTab>(|this, _, _, _| this.visible())
             .drag_over::<DraggedSelection>(|this, _, _, _| this.visible())
+            .drag_over::<DraggedText>(|this, _, _, _| this.visible())
             .when(is_local, |this| {
                 this.drag_over::<ExternalPaths>(|this, _, _, _| this.visible())
             })
@@ -6309,6 +6343,9 @@ impl AgentPanel {
             )
             .on_drop(cx.listener(move |this, paths: &ExternalPaths, window, cx| {
                 this.handle_external_paths_drop(paths, window, cx);
+            }))
+            .on_drop(cx.listener(move |this, dragged: &DraggedText, window, cx| {
+                this.insert_prompt_text(dragged.text.to_string(), window, cx);
             }))
     }
 

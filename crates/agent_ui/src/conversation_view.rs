@@ -3119,6 +3119,30 @@ impl ConversationView {
         }
     }
 
+    /// Inserts plain `text` into the active message editor as a draft and
+    /// focuses it. Unlike [`insert_selection`], this adds no context mention —
+    /// it is a raw text hand-off (used by the inbox panel).
+    ///
+    /// [`insert_selection`]: Self::insert_selection
+    pub(crate) fn insert_prompt_text(&self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(active_thread) = self.active_thread() {
+            active_thread.update(cx, |thread, cx| {
+                let editor = thread.active_editor(cx);
+                editor.update(cx, |editor, cx| {
+                    // Separate from any draft already in the composer so the
+                    // handed-off text doesn't run into it on the same line.
+                    let text = if editor.is_empty(cx) {
+                        text
+                    } else {
+                        format!("\n{text}")
+                    };
+                    editor.insert_text(&text, window, cx);
+                    editor.focus_handle(cx).focus(window, cx);
+                });
+            });
+        }
+    }
+
     /// Inserts the selected text into the message editor or the message being
     /// edited, if any.
     pub(crate) fn insert_selection(
