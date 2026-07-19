@@ -40,10 +40,9 @@ pub enum InboxStoreEvent {
 enum ReloadOutcome {
     /// The file does not exist.
     Missing,
-    /// The file exists but could not be read.
-    Unreadable(String),
-    /// The file was read but is not valid JSON for our schema.
-    Corrupt(String),
+    /// The file exists but could not be read, or was read but is not valid
+    /// JSON for our schema; the error text carries the distinction.
+    Failed(String),
     /// The file parsed successfully. Boxed to keep the enum small.
     Loaded { text: String, state: Box<InboxFile> },
 }
@@ -193,13 +192,13 @@ impl InboxStore {
             };
             let outcome = match raw {
                 None => ReloadOutcome::Missing,
-                Some(Err(error)) => ReloadOutcome::Unreadable(format!("{error:#}")),
+                Some(Err(error)) => ReloadOutcome::Failed(format!("{error:#}")),
                 Some(Ok(text)) => match serde_json::from_str::<InboxFile>(&text) {
                     Ok(state) => ReloadOutcome::Loaded {
                         text,
                         state: Box::new(state),
                     },
-                    Err(error) => ReloadOutcome::Corrupt(error.to_string()),
+                    Err(error) => ReloadOutcome::Failed(error.to_string()),
                 },
             };
             // Only reach for a backup when the live file didn't yield usable
@@ -274,7 +273,7 @@ impl InboxStore {
                     }
                 }
             }
-            ReloadOutcome::Unreadable(error) | ReloadOutcome::Corrupt(error) => {
+            ReloadOutcome::Failed(error) => {
                 // Keep the last good in-memory state and surface the error.
                 // Offer to restore from whatever holds data: the in-memory
                 // state (freshest, when Zed was open) or the newest backup.
@@ -434,11 +433,15 @@ impl InboxStore {
         self.on_mutated(cx);
     }
 
+    /// Looks up a type by its key.
+    pub fn type_by_key(&self, key: &str) -> Option<&InboxType> {
+        self.types().iter().find(|inbox_type| inbox_type.key == key)
+    }
+
     /// Resolves the type of an item. Returns `None` when the item has no
     /// kind, or when its kind matches no existing type.
     pub fn resolve_kind(&self, item: &InboxItem) -> Option<&InboxType> {
-        let key = item.kind.as_deref()?;
-        self.types().iter().find(|inbox_type| inbox_type.key == key)
+        self.type_by_key(item.kind.as_deref()?)
     }
 
     pub fn load_error(&self) -> Option<&str> {
@@ -515,13 +518,13 @@ impl InboxStore {
     }
 
     /// Applies `f` to the item with the given id, searching both the inbox and
-    /// the archive. When `f` leaves the item unchanged, nothing is marked
-    /// dirty, no event is emitted and no save is scheduled.
+    /// the archive. `f` returns whether it changed the item; when it didn't,
+    /// nothing is marked dirty, no event is emitted and no save is scheduled.
     pub fn update_item(
         &mut self,
         id: &ItemId,
         cx: &mut Context<Self>,
-        f: impl FnOnce(&mut InboxItem),
+        f: impl FnOnce(&mut InboxItem) -> bool,
     ) {
         let Some(item) = self
             .state
@@ -532,16 +535,19 @@ impl InboxStore {
         else {
             return;
         };
-        let before = item.clone();
-        f(item);
-        if *item == before {
-            return;
+        if f(item) {
+            self.on_mutated(cx);
         }
-        self.on_mutated(cx);
     }
 
     pub fn set_kind(&mut self, id: &ItemId, kind: Option<String>, cx: &mut Context<Self>) {
-        self.update_item(id, cx, |item| item.kind = kind);
+        self.update_item(id, cx, |item| {
+            if item.kind == kind {
+                return false;
+            }
+            item.kind = kind;
+            true
+        });
     }
 
     /// Sets how open items are ordered.
@@ -558,44 +564,30 @@ impl InboxStore {
         if id == target_id {
             return;
         }
-        let before: Vec<ItemId> = self
-            .state
-            .inbox
-            .iter()
-            .map(|item| item.id.clone())
-            .collect();
-        let Some(from) = self.state.inbox.iter().position(|item| &item.id == id) else {
-            return;
-        };
-        let item = self.state.inbox.remove(from);
-        let insert_at = self
-            .state
-            .inbox
-            .iter()
-            .position(|item| &item.id == target_id)
-            .unwrap_or_else(|| from.min(self.state.inbox.len()));
-        self.state.inbox.insert(insert_at, item);
-        let after: Vec<ItemId> = self
-            .state
-            .inbox
-            .iter()
-            .map(|item| item.id.clone())
-            .collect();
-        if before != after {
+        if move_before(
+            &mut self.state.inbox,
+            |item| &item.id == id,
+            |item| &item.id == target_id,
+        ) {
             self.on_mutated(cx);
         }
     }
 
     /// Reorders the lists alphabetically by label (case-insensitive).
     pub fn sort_types_alpha(&mut self, cx: &mut Context<Self>) {
-        let before: Vec<String> = self.state.types.iter().map(|t| t.key.clone()).collect();
+        if self
+            .state
+            .types
+            .iter()
+            .map(|inbox_type| inbox_type.label.to_lowercase())
+            .is_sorted()
+        {
+            return;
+        }
         self.state
             .types
-            .sort_by_key(|inbox_type| inbox_type.label.to_lowercase());
-        let after: Vec<String> = self.state.types.iter().map(|t| t.key.clone()).collect();
-        if before != after {
-            self.on_mutated(cx);
-        }
+            .sort_by_cached_key(|inbox_type| inbox_type.label.to_lowercase());
+        self.on_mutated(cx);
     }
 
     /// Moves the list `key` to just before `target_key`. No-op if either key is
@@ -604,30 +596,33 @@ impl InboxStore {
         if key == target_key {
             return;
         }
-        let before: Vec<String> = self.state.types.iter().map(|t| t.key.clone()).collect();
-        let Some(from) = self.state.types.iter().position(|t| t.key == key) else {
-            return;
-        };
-        let inbox_type = self.state.types.remove(from);
-        let insert_at = self
-            .state
-            .types
-            .iter()
-            .position(|t| t.key == target_key)
-            .unwrap_or_else(|| from.min(self.state.types.len()));
-        self.state.types.insert(insert_at, inbox_type);
-        let after: Vec<String> = self.state.types.iter().map(|t| t.key.clone()).collect();
-        if before != after {
+        if move_before(
+            &mut self.state.types,
+            |inbox_type| inbox_type.key == key,
+            |inbox_type| inbox_type.key == target_key,
+        ) {
             self.on_mutated(cx);
         }
     }
 
     pub fn set_text(&mut self, id: &ItemId, text: String, cx: &mut Context<Self>) {
-        self.update_item(id, cx, |item| item.text = text);
+        self.update_item(id, cx, |item| {
+            if item.text == text {
+                return false;
+            }
+            item.text = text;
+            true
+        });
     }
 
     pub fn set_body(&mut self, id: &ItemId, body: Option<String>, cx: &mut Context<Self>) {
-        self.update_item(id, cx, |item| item.body = body);
+        self.update_item(id, cx, |item| {
+            if item.body == body {
+                return false;
+            }
+            item.body = body;
+            true
+        });
     }
 
     /// Replaces the item's attachment list.
@@ -637,7 +632,13 @@ impl InboxStore {
         attachments: Vec<AttachmentRef>,
         cx: &mut Context<Self>,
     ) {
-        self.update_item(id, cx, |item| item.attachments = attachments);
+        self.update_item(id, cx, |item| {
+            if item.attachments == attachments {
+                return false;
+            }
+            item.attachments = attachments;
+            true
+        });
     }
 
     /// Appends a reference, de-duplicated by full equality.
@@ -648,9 +649,11 @@ impl InboxStore {
         cx: &mut Context<Self>,
     ) {
         self.update_item(id, cx, |item| {
-            if !item.attachments.contains(&attachment) {
-                item.attachments.push(attachment);
+            if item.attachments.contains(&attachment) {
+                return false;
             }
+            item.attachments.push(attachment);
+            true
         });
     }
 
@@ -662,7 +665,9 @@ impl InboxStore {
         cx: &mut Context<Self>,
     ) {
         self.update_item(id, cx, |item| {
+            let len = item.attachments.len();
             item.attachments.retain(|existing| existing != attachment);
+            item.attachments.len() != len
         });
     }
 
@@ -673,6 +678,7 @@ impl InboxStore {
             } else {
                 Some(now_unix())
             };
+            true
         });
     }
 
@@ -773,6 +779,28 @@ impl InboxStore {
         self.on_mutated(cx);
         key
     }
+}
+
+/// Moves the element matching `is_source` to just before the element matching
+/// `is_target` (or back to its place when the target is missing). Returns
+/// whether the order actually changed. Shared by item and type reordering.
+fn move_before<T>(
+    items: &mut Vec<T>,
+    is_source: impl Fn(&T) -> bool,
+    is_target: impl Fn(&T) -> bool,
+) -> bool {
+    let Some(from) = items.iter().position(is_source) else {
+        return false;
+    };
+    let item = items.remove(from);
+    // Removing and re-inserting at the same index restores the original
+    // order, so `insert_at == from` is exactly the no-op case.
+    let insert_at = items
+        .iter()
+        .position(is_target)
+        .unwrap_or_else(|| from.min(items.len()));
+    items.insert(insert_at, item);
+    insert_at != from
 }
 
 /// Sort key for a backup file: its `<timestamp>-<seq>` stem. `None` for any
@@ -1482,12 +1510,9 @@ mod tests {
         );
 
         // Delete the file out from under us (as `git clean` or an `rm` would).
-        fs.remove_file(
-            path!("/root/.zed/inbox.json").as_ref(),
-            Default::default(),
-        )
-        .await
-        .unwrap();
+        fs.remove_file(path!("/root/.zed/inbox.json").as_ref(), Default::default())
+            .await
+            .unwrap();
         flush_saves(cx);
 
         // Data isn't silently dropped: the store offers to restore, and the
@@ -1525,12 +1550,9 @@ mod tests {
         });
         flush_saves(cx);
         drop(store);
-        fs.remove_file(
-            path!("/root/.zed/inbox.json").as_ref(),
-            Default::default(),
-        )
-        .await
-        .unwrap();
+        fs.remove_file(path!("/root/.zed/inbox.json").as_ref(), Default::default())
+            .await
+            .unwrap();
 
         // A brand-new store (empty memory) over the same project finds no file
         // but recovers the data from the backup ring.

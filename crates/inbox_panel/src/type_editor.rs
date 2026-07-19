@@ -1,18 +1,17 @@
 //! The "Lists" overlay: renaming, recoloring, adding and deleting inbox
 //! types. Rendered on top of the whole panel while it is open.
 
-use std::collections::HashMap;
-
+use collections::HashMap;
 use editor::{Editor, EditorEvent};
 use gpui::{
     AnyElement, ClickEvent, Context, Entity, FontWeight, Hsla, Pixels, Point, Render, Subscription,
-    Window, anchored, deferred,
+    Window,
 };
-use ui::{Tab, TintColor, Tooltip, prelude::*};
+use ui::{Tab, Tooltip, prelude::*};
 
-use crate::InboxPanel;
 use crate::inbox_model::type_color;
 use crate::inbox_store::InboxStore;
+use crate::{InboxPanel, entity_confirmation_popover};
 
 /// Drag payload and ghost view for reordering lists in the type editor.
 #[derive(Clone)]
@@ -397,58 +396,26 @@ impl InboxPanel {
     /// main list.
     fn render_type_delete_confirmation(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (key, position) = self.type_editor.as_ref()?.confirming_delete.clone()?;
-        Some(
-            deferred(
-                anchored()
-                    .position(position)
-                    .anchor(gpui::Anchor::TopLeft)
-                    .child(
-                        v_flex()
-                            .occlude()
-                            .elevation_2(cx)
-                            .p_2()
-                            .gap_2()
-                            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                                if let Some(state) = this.type_editor.as_mut() {
-                                    state.confirming_delete = None;
-                                }
-                                cx.notify();
-                            }))
-                            .child(Label::new("Delete list?"))
-                            .child(
-                                h_flex()
-                                    .gap_1()
-                                    .justify_end()
-                                    .child(
-                                        Button::new("inbox-type-delete-cancel", "Cancel")
-                                            .style(ButtonStyle::Subtle)
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                if let Some(state) = this.type_editor.as_mut() {
-                                                    state.confirming_delete = None;
-                                                }
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("inbox-type-delete-confirm", "Delete")
-                                            .style(ButtonStyle::Tinted(TintColor::Error))
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                let store = this.store.clone();
-                                                store.update(cx, |store, cx| {
-                                                    store.delete_type(&key, cx)
-                                                });
-                                                if let Some(state) = this.type_editor.as_mut() {
-                                                    state.confirming_delete = None;
-                                                    state.sync(&store, window, cx);
-                                                }
-                                                cx.notify();
-                                            })),
-                                    ),
-                            ),
-                    ),
-            )
-            .with_priority(1)
-            .into_any_element(),
-        )
+        Some(entity_confirmation_popover(
+            cx.entity().downgrade(),
+            "inbox-type-delete",
+            position,
+            gpui::Anchor::TopLeft,
+            "Delete list?",
+            "Delete",
+            |this, _| {
+                if let Some(state) = this.type_editor.as_mut() {
+                    state.confirming_delete = None;
+                }
+            },
+            move |this, window, cx| {
+                let store = this.store.clone();
+                store.update(cx, |store, cx| store.delete_type(&key, cx));
+                if let Some(state) = this.type_editor.as_mut() {
+                    state.sync(&store, window, cx);
+                }
+            },
+            cx,
+        ))
     }
 }

@@ -19,7 +19,7 @@ pub fn new_item_id() -> ItemId {
     to_base36(hasher.finish()).into()
 }
 
-/// Returns the current unix timestamp in seconds (UTC).
+/// Returns the current unix timestamp in milliseconds (UTC).
 pub fn now_unix_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -96,8 +96,8 @@ impl SortMode {
             SortMode::Manual => {}
             SortMode::Newest => items.sort_by_key(|item| Reverse(item.created)),
             SortMode::Oldest => items.sort_by_key(|item| item.created),
-            SortMode::Az => items.sort_by_key(|item| item.text.to_lowercase()),
-            SortMode::Za => items.sort_by_key(|item| Reverse(item.text.to_lowercase())),
+            SortMode::Az => items.sort_by_cached_key(|item| item.text.to_lowercase()),
+            SortMode::Za => items.sort_by_cached_key(|item| Reverse(item.text.to_lowercase())),
         }
     }
 }
@@ -301,30 +301,20 @@ pub fn format_age(created_unix: i64, now_unix: i64) -> String {
     }
 }
 
-/// Counts markdown checkboxes (`- [ ]` / `- [x]`) in a body.
-/// Returns `(done, total)`, or `None` if the body contains no checkboxes.
+/// Counts markdown checkboxes (`- [ ]` / `- [x]`) in a body, tolerating
+/// leading indentation. Returns `(done, total)`, or `None` if the body
+/// contains no checkboxes. Delegates the line matching to the markdown
+/// codec's todo matcher so this counter and the detail view's block-based
+/// counter can never disagree.
 pub fn subtask_counts(body: &str) -> Option<(usize, usize)> {
     let mut done = 0;
     let mut total = 0;
     for line in body.lines() {
-        let trimmed = line.trim_start();
-        let Some(rest) = trimmed
-            .strip_prefix("- [")
-            .or_else(|| trimmed.strip_prefix("* ["))
-        else {
-            continue;
-        };
-        let mut chars = rest.chars();
-        let (Some(state), Some(']')) = (chars.next(), chars.next()) else {
-            continue;
-        };
-        match state {
-            ' ' => total += 1,
-            'x' | 'X' => {
+        if let Some((checked, _)) = crate::markdown_codec::parse_todo(line.trim_start()) {
+            total += 1;
+            if checked {
                 done += 1;
-                total += 1;
             }
-            _ => {}
         }
     }
     if total == 0 {
@@ -332,22 +322,6 @@ pub fn subtask_counts(body: &str) -> Option<(usize, usize)> {
     } else {
         Some((done, total))
     }
-}
-
-/// Parses a capture context like `"src/editor.rs:1240"` into a path and an
-/// optional 1-based line number.
-pub fn parse_context(from: &str) -> Option<(String, Option<u32>)> {
-    let from = from.trim();
-    if from.is_empty() {
-        return None;
-    }
-    if let Some((path, line)) = from.rsplit_once(':')
-        && !path.is_empty()
-        && let Ok(line) = line.parse::<u32>()
-    {
-        return Some((path.to_string(), Some(line)));
-    }
-    Some((from.to_string(), None))
 }
 
 /// Formats a unix-seconds timestamp as an ISO date (`YYYY-MM-DD`, UTC).
@@ -367,7 +341,11 @@ pub fn item_to_markdown(item: &InboxItem, type_label: Option<&str>) -> String {
 
     let title = item.text.trim();
     out.push_str("# ");
-    out.push_str(if title.is_empty() { "(untitled)" } else { title });
+    out.push_str(if title.is_empty() {
+        "(untitled)"
+    } else {
+        title
+    });
 
     // Metadata line: only the fields that are present.
     let mut meta = Vec::new();
@@ -532,22 +510,6 @@ mod tests {
             subtask_counts("intro\n- [x] done\n  * [ ] nested\n- [x] more\ntail"),
             Some((2, 3))
         );
-    }
-
-    #[test]
-    fn test_parse_context() {
-        assert_eq!(parse_context(""), None);
-        assert_eq!(parse_context("   "), None);
-        assert_eq!(
-            parse_context("src/editor.rs:1240"),
-            Some(("src/editor.rs".to_string(), Some(1240)))
-        );
-        assert_eq!(
-            parse_context("src/editor.rs"),
-            Some(("src/editor.rs".to_string(), None))
-        );
-        assert_eq!(parse_context("a:b:12"), Some(("a:b".to_string(), Some(12))));
-        assert_eq!(parse_context("notes:"), Some(("notes:".to_string(), None)));
     }
 
     #[test]

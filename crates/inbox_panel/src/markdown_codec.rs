@@ -14,9 +14,10 @@
 use crate::block::{Block, BlockId, BlockType};
 
 /// Parses `src` into a sequence of [`Block`]s, allocating ids from
-/// `next_id` (monotonically increasing, matching [`BlockDocument::new_id`]).
+/// `next_id` (monotonically increasing, matching the id allocation inside
+/// [`BlockDocument`]).
 ///
-/// [`BlockDocument::new_id`]: crate::block::BlockDocument::new_id
+/// [`BlockDocument`]: crate::block::BlockDocument
 pub fn parse_blocks(src: &str, next_id: &mut u64) -> Vec<Block> {
     let mut alloc = || {
         let id = BlockId(*next_id);
@@ -28,7 +29,7 @@ pub fn parse_blocks(src: &str, next_id: &mut u64) -> Vec<Block> {
     let mut lines = src.lines();
 
     while let Some(line) = lines.next() {
-        if let Some(rest) = line.strip_prefix("```") {
+        let (block_type, text, checked) = if let Some(rest) = line.strip_prefix("```") {
             // Fence: collect until a closing ``` or end of input. The
             // (optional) language tag right after the opening fence is
             // discarded.
@@ -40,85 +41,30 @@ pub fn parse_blocks(src: &str, next_id: &mut u64) -> Vec<Block> {
                 }
                 code_lines.push(code_line);
             }
-            blocks.push(Block {
-                id: alloc(),
-                block_type: BlockType::Code,
-                text: code_lines.join("\n"),
-                checked: false,
-            });
-            continue;
-        }
-
-        if is_divider(line) {
-            blocks.push(Block {
-                id: alloc(),
-                block_type: BlockType::Divider,
-                text: String::new(),
-                checked: false,
-            });
-            continue;
-        }
-
-        if let Some(rest) = line.strip_prefix("# ") {
-            blocks.push(Block {
-                id: alloc(),
-                block_type: BlockType::H1,
-                text: rest.to_string(),
-                checked: false,
-            });
-            continue;
-        }
-
-        if let Some(rest) = line.strip_prefix("## ") {
-            blocks.push(Block {
-                id: alloc(),
-                block_type: BlockType::H2,
-                text: rest.to_string(),
-                checked: false,
-            });
-            continue;
-        }
-
-        if let Some((checked, rest)) = parse_todo(line) {
-            blocks.push(Block {
-                id: alloc(),
-                block_type: BlockType::Todo,
-                text: rest.to_string(),
-                checked,
-            });
-            continue;
-        }
-
-        if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
-            blocks.push(Block {
-                id: alloc(),
-                block_type: BlockType::Bullet,
-                text: rest.to_string(),
-                checked: false,
-            });
-            continue;
-        }
-
-        if let Some(rest) = line.strip_prefix('>') {
+            (BlockType::Code, code_lines.join("\n"), false)
+        } else if is_divider(line) {
+            (BlockType::Divider, String::new(), false)
+        } else if let Some(rest) = line.strip_prefix("# ") {
+            (BlockType::H1, rest.to_string(), false)
+        } else if let Some(rest) = line.strip_prefix("## ") {
+            (BlockType::H2, rest.to_string(), false)
+        } else if let Some((checked, rest)) = parse_todo(line) {
+            (BlockType::Todo, rest.to_string(), checked)
+        } else if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+            (BlockType::Bullet, rest.to_string(), false)
+        } else if let Some(rest) = line.strip_prefix('>') {
             let rest = rest.strip_prefix(' ').unwrap_or(rest);
-            blocks.push(Block {
-                id: alloc(),
-                block_type: BlockType::Quote,
-                text: rest.to_string(),
-                checked: false,
-            });
+            (BlockType::Quote, rest.to_string(), false)
+        } else if line.trim().is_empty() {
             continue;
-        }
-
-        if line.trim().is_empty() {
-            continue;
-        }
-
+        } else {
+            (BlockType::Paragraph, line.to_string(), false)
+        };
         blocks.push(Block {
             id: alloc(),
-            block_type: BlockType::Paragraph,
-            text: line.to_string(),
-            checked: false,
+            block_type,
+            text,
+            checked,
         });
     }
 
@@ -174,8 +120,11 @@ fn is_divider(line: &str) -> bool {
     trimmed.len() >= 3 && trimmed.chars().all(|c| c == '-')
 }
 
-/// Matches `^[-*] \[( |x|X)\] ` and returns `(checked, rest)`.
-fn parse_todo(line: &str) -> Option<(bool, &str)> {
+/// Matches `^[-*] \[( |x|X)\] ` and returns `(checked, rest)`. The one todo
+/// matcher in the crate: the list rows' subtask counter
+/// ([`crate::inbox_model::subtask_counts`]) delegates here too, so the row
+/// badge and the detail view can never disagree on what counts as a todo.
+pub(crate) fn parse_todo(line: &str) -> Option<(bool, &str)> {
     let rest = line
         .strip_prefix("- ")
         .or_else(|| line.strip_prefix("* "))?;

@@ -13,7 +13,6 @@ pub use inbox_store::{InboxStore, InboxStoreEvent};
 
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
@@ -21,6 +20,7 @@ use std::{
 };
 
 use agent_ui::AgentPanel;
+use collections::{HashMap, HashSet};
 use editor::Editor;
 use fs::Fs;
 use gpui::{
@@ -41,10 +41,14 @@ use workspace::{
     notifications::NotificationId,
 };
 
-use crate::attachment::{AttachmentCompletionProvider, AttachmentSet, OnPick, attach_external_paths};
+use util::paths::PathWithPosition;
+
+use crate::attachment::{
+    AttachmentCompletionProvider, AttachmentSet, OnPick, attach_external_paths, pick_and_attach,
+};
 use crate::inbox_model::{
     AttachmentRef, InboxItem, ItemId, MetaField, SortMode, format_age, item_to_markdown, now_unix,
-    parse_context, subtask_counts, type_color,
+    subtask_counts, type_color,
 };
 use crate::inbox_panel_settings::{DockSide, InboxPanelSettings, Settings};
 use crate::type_editor::TypeEditorState;
@@ -152,8 +156,20 @@ pub struct InboxPanel {
     /// Per-item Markdown cache for the drag payload, so the eager `on_drag`
     /// value isn't rebuilt on every panel render. Cleared on any store change.
     markdown_cache: RefCell<HashMap<ItemId, SharedString>>,
+    /// The partitioned and sorted rows of the list, cached across frames so
+    /// the per-frame render doesn't re-clone and re-sort the whole inbox.
+    /// Cleared on any store change.
+    list_cache: RefCell<Option<Rc<ListRows>>>,
     _age_refresh: Task<()>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// Open (sorted), cleared and archived rows in display order; the cached
+/// value behind [`InboxPanel::list_rows`].
+struct ListRows {
+    open: Vec<InboxItem>,
+    cleared: Vec<InboxItem>,
+    archived: Vec<InboxItem>,
 }
 
 /// Opens the `"path:row"` capture context of an item in the workspace,
@@ -165,9 +181,10 @@ pub(crate) fn open_capture_context(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let Some((path, row)) = parse_context(from) else {
+    if from.trim().is_empty() {
         return;
-    };
+    }
+    let PathWithPosition { path, row, .. } = PathWithPosition::parse_str(from);
     let Some(workspace) = workspace.upgrade() else {
         return;
     };
@@ -175,9 +192,12 @@ pub(crate) fn open_capture_context(
         .read(cx)
         .project()
         .read(cx)
-        .find_project_path(Path::new(&path), cx)
+        .find_project_path(&path, cx)
     else {
-        log::warn!("inbox panel: capture context not found in project: {path}");
+        log::warn!(
+            "inbox panel: capture context not found in project: {}",
+            path.display()
+        );
         return;
     };
     let open_task = workspace.update(cx, |workspace, cx| {
@@ -268,7 +288,12 @@ pub(crate) fn copy_item_as_markdown(
 ) {
     let markdown = item_markdown(store, item, cx);
     cx.write_to_clipboard(ClipboardItem::new_string(markdown));
-    show_inbox_toast(workspace, "inbox-copy-markdown", "Copied task as Markdown", cx);
+    show_inbox_toast(
+        workspace,
+        "inbox-copy-markdown",
+        "Copied task as Markdown",
+        cx,
+    );
 }
 
 /// Opens the Zed agent panel and drops the item's Markdown into the message
@@ -321,7 +346,11 @@ fn show_inbox_toast(
 
 /// The shared visual for a file-attachment chip: a file icon and the display
 /// name. Callers add trailing controls and a click handler.
-fn attachment_chip(id: impl Into<ElementId>, attachment: &AttachmentRef, cx: &App) -> Stateful<Div> {
+fn attachment_chip(
+    id: impl Into<ElementId>,
+    attachment: &AttachmentRef,
+    cx: &App,
+) -> Stateful<Div> {
     let name = attachment.display_name();
     let name = if name.trim().is_empty() {
         "(file)".to_string()
@@ -428,6 +457,56 @@ pub(crate) fn confirmation_popover(
     .into_any_element()
 }
 
+/// A [`confirmation_popover`] wired to a view entity, absorbing the
+/// `WeakEntity` + `Rc<dyn Fn>` plumbing every call site would otherwise
+/// repeat: both buttons run `reset` (clearing the caller's
+/// pending-confirmation state) and notify; the confirm button additionally
+/// runs `on_confirm`.
+pub(crate) fn entity_confirmation_popover<V: 'static>(
+    entity: WeakEntity<V>,
+    id: &'static str,
+    position: Point<Pixels>,
+    anchor: gpui::Anchor,
+    title: impl Into<SharedString>,
+    confirm_label: impl Into<SharedString>,
+    reset: impl Fn(&mut V, &mut Context<V>) + 'static,
+    on_confirm: impl Fn(&mut V, &mut Window, &mut Context<V>) + 'static,
+    cx: &App,
+) -> AnyElement {
+    let reset = Rc::new(reset);
+    let dismiss = {
+        let entity = entity.clone();
+        let reset = reset.clone();
+        Rc::new(move |_: &mut Window, cx: &mut App| {
+            entity
+                .update(cx, |this, cx| {
+                    reset(this, cx);
+                    cx.notify();
+                })
+                .ok();
+        }) as Rc<dyn Fn(&mut Window, &mut App)>
+    };
+    let confirm = Rc::new(move |window: &mut Window, cx: &mut App| {
+        entity
+            .update(cx, |this, cx| {
+                reset(this, cx);
+                on_confirm(this, window, cx);
+                cx.notify();
+            })
+            .ok();
+    }) as Rc<dyn Fn(&mut Window, &mut App)>;
+    confirmation_popover(
+        id,
+        position,
+        anchor,
+        title,
+        confirm_label,
+        dismiss,
+        confirm,
+        cx,
+    )
+}
+
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
@@ -474,19 +553,11 @@ impl InboxPanel {
             // exists; the `@` completion provider pushes into it.
             let capture_attachments = cx.new(|_| AttachmentSet::default());
             capture_editor.update(cx, |editor, _| {
-                let attachments = capture_attachments.downgrade();
-                let on_pick: OnPick = Arc::new(move |attachment, cx| {
-                    attachments
-                        .update(cx, |set, cx| {
-                            if set.add(attachment) {
-                                cx.notify();
-                            }
-                        })
-                        .ok();
-                });
-                editor.set_completion_provider(Some(Rc::new(
-                    AttachmentCompletionProvider::new(weak_workspace.clone(), on_pick),
-                )));
+                let on_pick: OnPick = Arc::new(Self::capture_sink(&capture_attachments));
+                editor.set_completion_provider(Some(Rc::new(AttachmentCompletionProvider::new(
+                    weak_workspace.clone(),
+                    on_pick,
+                ))));
             });
 
             let focus_handle = cx.focus_handle();
@@ -527,11 +598,28 @@ impl InboxPanel {
                 confirming_delete: None,
                 confirming_attachment_removal: None,
                 scroll_handle: ScrollHandle::new(),
-                markdown_cache: RefCell::new(HashMap::new()),
+                markdown_cache: RefCell::new(HashMap::default()),
+                list_cache: RefCell::new(None),
                 _age_refresh: age_refresh,
                 _subscriptions: subscriptions,
             }
         })
+    }
+
+    /// Sink appending a picked attachment to the staged capture set. Shared
+    /// by the `@` completion, the OS file dialog and drag & drop.
+    fn capture_sink(
+        set: &Entity<AttachmentSet>,
+    ) -> impl Fn(AttachmentRef, &mut App) + Send + Sync + 'static {
+        let set = set.downgrade();
+        move |attachment, cx| {
+            set.update(cx, |set, cx| {
+                if set.add(attachment) {
+                    cx.notify();
+                }
+            })
+            .ok();
+        }
     }
 
     fn handle_store_event(
@@ -541,8 +629,10 @@ impl InboxPanel {
         cx: &mut Context<Self>,
     ) {
         // Any store change can affect an item's rendered Markdown (body, kind,
-        // type labels), so drop the drag cache wholesale.
+        // type labels) and the cached row order, so drop both caches
+        // wholesale.
         self.markdown_cache.borrow_mut().clear();
+        self.list_cache.borrow_mut().take();
         match event {
             InboxStoreEvent::ItemDeleted(id) => {
                 if self
@@ -579,12 +669,7 @@ impl InboxPanel {
     /// externally), falling back to "No list".
     fn reconcile_capture_kind(&mut self, cx: &Context<Self>) {
         if let Some(kind) = &self.capture_kind
-            && !self
-                .store
-                .read(cx)
-                .types()
-                .iter()
-                .any(|inbox_type| &inbox_type.key == kind)
+            && self.store.read(cx).type_by_key(kind).is_none()
         {
             self.capture_kind = None;
         }
@@ -669,28 +754,7 @@ impl InboxPanel {
             return;
         };
         let project = workspace.read(cx).project().clone();
-        let set = self.capture_attachments.clone();
-        let receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: true,
-            prompt: Some("Attach files".into()),
-        });
-        cx.spawn(async move |_, cx| {
-            let Ok(Ok(Some(paths))) = receiver.await else {
-                return;
-            };
-            let _ = cx.update(|cx| {
-                attach_external_paths(&paths, &project, cx, |attachment, cx| {
-                    set.update(cx, |set, cx| {
-                        if set.add(attachment) {
-                            cx.notify();
-                        }
-                    });
-                });
-            });
-        })
-        .detach();
+        pick_and_attach(project, cx, Self::capture_sink(&self.capture_attachments));
     }
 
     /// Stages dropped OS files as attachments for the next capture.
@@ -699,14 +763,12 @@ impl InboxPanel {
             return;
         };
         let project = workspace.read(cx).project().clone();
-        let set = self.capture_attachments.clone();
-        attach_external_paths(paths, &project, cx, |attachment, cx| {
-            set.update(cx, |set, cx| {
-                if set.add(attachment) {
-                    cx.notify();
-                }
-            });
-        });
+        attach_external_paths(
+            paths,
+            &project,
+            cx,
+            Self::capture_sink(&self.capture_attachments),
+        );
     }
 
     /// The staged-attachment chips, laid out as the flexible middle of the
@@ -723,63 +785,51 @@ impl InboxPanel {
             // One scrolling row rather than wrapping, so adding files never
             // grows the capture box taller.
             .overflow_x_scroll()
-            .children(attachments.into_iter().enumerate().map(|(index, attachment)| {
-                let open = attachment.clone();
-                let remove = attachment.clone();
-                let on_open = cx.listener(move |this, _, window, cx| {
-                    open_attachment(&this.workspace, &open, window, cx);
-                });
-                let on_remove = cx.listener(move |this, event: &ClickEvent, _, cx| {
-                    cx.stop_propagation();
-                    this.confirming_attachment_removal = Some((remove.clone(), event.position()));
-                    cx.notify();
-                });
-                removable_attachment_chip(
-                    ("capture-attachment", index),
-                    ("capture-attachment-remove", index),
-                    &attachment,
-                    cx,
-                    on_open,
-                    on_remove,
-                )
-            }))
+            .children(
+                attachments
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, attachment)| {
+                        let open = attachment.clone();
+                        let remove = attachment.clone();
+                        let on_open = cx.listener(move |this, _, window, cx| {
+                            open_attachment(&this.workspace, &open, window, cx);
+                        });
+                        let on_remove = cx.listener(move |this, event: &ClickEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.confirming_attachment_removal =
+                                Some((remove.clone(), event.position()));
+                            cx.notify();
+                        });
+                        removable_attachment_chip(
+                            ("capture-attachment", index),
+                            ("capture-attachment-remove", index),
+                            &attachment,
+                            cx,
+                            on_open,
+                            on_remove,
+                        )
+                    }),
+            )
     }
 
     /// Confirmation popover for removing a staged capture attachment.
     fn render_attachment_removal_confirmation(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (attachment, position) = self.confirming_attachment_removal.clone()?;
-        let entity = cx.entity().downgrade();
-        let dismiss = {
-            let entity = entity.clone();
-            Rc::new(move |_: &mut Window, cx: &mut App| {
-                entity
-                    .update(cx, |this, cx| {
-                        this.confirming_attachment_removal = None;
-                        cx.notify();
-                    })
-                    .ok();
-            }) as Rc<dyn Fn(&mut Window, &mut App)>
-        };
-        let confirm = Rc::new(move |_: &mut Window, cx: &mut App| {
-            entity
-                .update(cx, |this, cx| {
-                    this.confirming_attachment_removal = None;
-                    this.capture_attachments.update(cx, |set, cx| {
-                        set.remove(&attachment);
-                        cx.notify();
-                    });
-                    cx.notify();
-                })
-                .ok();
-        }) as Rc<dyn Fn(&mut Window, &mut App)>;
-        Some(confirmation_popover(
+        Some(entity_confirmation_popover(
+            cx.entity().downgrade(),
             "inbox-capture-attachment-remove",
             position,
             gpui::Anchor::TopLeft,
             "Remove attachment?",
             "Remove",
-            dismiss,
-            confirm,
+            |this, _| this.confirming_attachment_removal = None,
+            move |this, _, cx| {
+                this.capture_attachments.update(cx, |set, cx| {
+                    set.remove(&attachment);
+                    cx.notify();
+                });
+            },
             cx,
         ))
     }
@@ -1110,6 +1160,41 @@ impl InboxPanel {
         )
     }
 
+    /// Appends one row per store type (colored square + label + a check on
+    /// `current_key`) and the trailing "Configure lists…" entry to `menu`.
+    /// Shared by the capture box chip and the item row chip, which differ
+    /// only in where the current key comes from and what selecting does.
+    fn extend_type_menu(
+        mut menu: ContextMenu,
+        store: &InboxStore,
+        panel: WeakEntity<Self>,
+        current_key: Option<String>,
+        on_select: impl Fn(String, &mut Window, &mut App) + Clone + 'static,
+        cx: &App,
+    ) -> ContextMenu {
+        for inbox_type in store.types() {
+            let selected = current_key.as_deref() == Some(inbox_type.key.as_str());
+            let key = inbox_type.key.clone();
+            let on_select = on_select.clone();
+            menu = menu.item(Self::type_menu_item(
+                SharedString::from(inbox_type.label.clone()),
+                type_color(&inbox_type.color, cx),
+                selected,
+                move |window, cx| on_select(key.clone(), window, cx),
+            ));
+        }
+        menu.separator().item(
+            ContextMenuEntry::new("Configure lists…")
+                .icon(IconName::Settings)
+                .icon_color(Color::Muted)
+                .handler(move |window, cx| {
+                    panel
+                        .update(cx, |this, cx| this.open_type_editor(window, cx))
+                        .ok();
+                }),
+        )
+    }
+
     /// The capture box chip: picks the type preselected for the next capture.
     fn render_capture_type_menu(
         &self,
@@ -1132,18 +1217,6 @@ impl InboxPanel {
                     let capture_kind = panel
                         .upgrade()
                         .and_then(|panel| panel.read(cx).capture_kind.clone());
-                    let types: Vec<(String, SharedString, gpui::Hsla)> = store
-                        .read(cx)
-                        .types()
-                        .iter()
-                        .map(|inbox_type| {
-                            (
-                                inbox_type.key.clone(),
-                                SharedString::from(inbox_type.label.clone()),
-                                type_color(&inbox_type.color, cx),
-                            )
-                        })
-                        .collect();
                     menu = menu.header("Add to list").item(Self::type_menu_item(
                         SharedString::from("No list"),
                         Color::Muted.color(cx),
@@ -1160,33 +1233,24 @@ impl InboxPanel {
                             }
                         },
                     ));
-                    for (key, label, color) in types {
-                        let selected = capture_kind.as_deref() == Some(key.as_str());
+                    let on_select = {
                         let panel = panel.clone();
-                        menu = menu.item(Self::type_menu_item(
-                            label,
-                            color,
-                            selected,
-                            move |_, cx| {
-                                let key = key.clone();
-                                panel
-                                    .update(cx, |this, cx| {
-                                        this.capture_kind = Some(key);
-                                        cx.notify();
-                                    })
-                                    .ok();
-                            },
-                        ));
-                    }
-                    menu.separator().item(
-                        ContextMenuEntry::new("Configure lists…")
-                            .icon(IconName::Settings)
-                            .icon_color(Color::Muted)
-                            .handler(move |window, cx| {
-                                panel
-                                    .update(cx, |this, cx| this.open_type_editor(window, cx))
-                                    .ok();
-                            }),
+                        move |key: String, _: &mut Window, cx: &mut App| {
+                            panel
+                                .update(cx, |this, cx| {
+                                    this.capture_kind = Some(key);
+                                    cx.notify();
+                                })
+                                .ok();
+                        }
+                    };
+                    Self::extend_type_menu(
+                        menu,
+                        store.read(cx),
+                        panel.clone(),
+                        capture_kind,
+                        on_select,
+                        cx,
                     )
                 }))
             })
@@ -1203,65 +1267,41 @@ impl InboxPanel {
     ) -> impl IntoElement {
         let store = self.store.clone();
         let panel = cx.entity().downgrade();
-        PopoverMenu::new(SharedString::from(format!(
-            "inbox-item-type-menu-{item_id}"
-        )))
-        .trigger(Self::type_chip_button(
-            SharedString::from(format!("inbox-item-type-chip-{item_id}")),
-            chip_label,
-            chip_color,
-        ))
-        .menu(move |window, cx| {
-            let store = store.clone();
-            let panel = panel.clone();
-            let item_id = item_id.clone();
-            Some(ContextMenu::build(window, cx, move |mut menu, _, cx| {
-                let (current_key, types) = {
+        PopoverMenu::new((ElementId::from(item_id.clone()), "type-menu"))
+            .trigger(Self::type_chip_button(
+                (ElementId::from(item_id.clone()), "type-chip"),
+                chip_label,
+                chip_color,
+            ))
+            .menu(move |window, cx| {
+                let store = store.clone();
+                let panel = panel.clone();
+                let item_id = item_id.clone();
+                Some(ContextMenu::build(window, cx, move |menu, _, cx| {
                     let store_ref = store.read(cx);
                     let current_key = store_ref
                         .item(&item_id)
                         .and_then(|item| store_ref.resolve_kind(item))
                         .map(|inbox_type| inbox_type.key.clone());
-                    let types: Vec<(String, SharedString, gpui::Hsla)> = store_ref
-                        .types()
-                        .iter()
-                        .map(|inbox_type| {
-                            (
-                                inbox_type.key.clone(),
-                                SharedString::from(inbox_type.label.clone()),
-                                type_color(&inbox_type.color, cx),
-                            )
-                        })
-                        .collect();
-                    (current_key, types)
-                };
-                for (key, label, color) in types {
-                    let selected = current_key.as_deref() == Some(key.as_str());
-                    let store = store.clone();
-                    let item_id = item_id.clone();
-                    menu = menu.item(Self::type_menu_item(
-                        label,
-                        color,
-                        selected,
-                        move |_, cx| {
+                    let on_select = {
+                        let store = store.clone();
+                        let item_id = item_id.clone();
+                        move |key: String, _: &mut Window, cx: &mut App| {
                             store.update(cx, |store, cx| {
-                                store.set_kind(&item_id, Some(key.clone()), cx);
+                                store.set_kind(&item_id, Some(key), cx);
                             });
-                        },
-                    ));
-                }
-                menu.separator().item(
-                    ContextMenuEntry::new("Configure lists…")
-                        .icon(IconName::Settings)
-                        .icon_color(Color::Muted)
-                        .handler(move |window, cx| {
-                            panel
-                                .update(cx, |this, cx| this.open_type_editor(window, cx))
-                                .ok();
-                        }),
-                )
-            }))
-        })
+                        }
+                    };
+                    Self::extend_type_menu(
+                        menu,
+                        store_ref,
+                        panel.clone(),
+                        current_key,
+                        on_select,
+                        cx,
+                    )
+                }))
+            })
     }
 
     fn render_capture_box(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1278,12 +1318,11 @@ impl InboxPanel {
         let has_types = !self.store.read(cx).types().is_empty();
         let (chip_label, chip_color) = {
             let store = self.store.read(cx);
-            match self.capture_kind.as_deref().and_then(|key| {
-                store
-                    .types()
-                    .iter()
-                    .find(|inbox_type| inbox_type.key == key)
-            }) {
+            match self
+                .capture_kind
+                .as_deref()
+                .and_then(|key| store.type_by_key(key))
+            {
                 Some(inbox_type) => (
                     SharedString::from(inbox_type.label.clone()),
                     type_color(&inbox_type.color, cx),
@@ -1409,9 +1448,8 @@ impl InboxPanel {
             })
         };
 
-        let checkbox_id = SharedString::from(format!("inbox-checkbox-{}", item.id));
         let checkbox = Checkbox::new(
-            checkbox_id,
+            (ElementId::from(item.id.clone()), "checkbox"),
             if is_archive_row {
                 ToggleState::Selected
             } else {
@@ -1494,7 +1532,7 @@ impl InboxPanel {
         if let Some(from) = item.from.clone().filter(|_| !hide_context) {
             meta = meta.child(
                 h_flex()
-                    .id(SharedString::from(format!("inbox-item-from-{}", item.id)))
+                    .id((ElementId::from(item.id.clone()), "from"))
                     .gap_1()
                     .cursor_pointer()
                     .text_xs()
@@ -1530,22 +1568,24 @@ impl InboxPanel {
             }
         }
 
-        let delete_button_id = SharedString::from(format!("inbox-item-delete-{}", item.id));
-        let delete_button = IconButton::new(delete_button_id, IconName::Close)
-            .icon_size(IconSize::XSmall)
-            .icon_color(Color::Muted)
-            .visible_on_hover("inbox-item")
-            .tooltip(Tooltip::text("Delete"))
-            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                this.confirming_delete = Some((id.clone(), event.position()));
-                cx.notify();
-            }));
+        let delete_button = IconButton::new(
+            (ElementId::from(item.id.clone()), "delete"),
+            IconName::Close,
+        )
+        .icon_size(IconSize::XSmall)
+        .icon_color(Color::Muted)
+        .visible_on_hover("inbox-item")
+        .tooltip(Tooltip::text("Delete"))
+        .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+            this.confirming_delete = Some((id.clone(), event.position()));
+            cx.notify();
+        }));
 
         // Item-to-item drag reorder only makes sense in manual order; the other
         // sort modes compute the order, so a manual drop would not stick.
         let reorderable = row == ItemRow::Open && self.store.read(cx).sort_mode().is_manual();
         h_flex()
-            .id(SharedString::from(format!("inbox-item-{}", item.id)))
+            .id((ElementId::from(item.id.clone()), "row"))
             .group("inbox-item")
             .items_start()
             .gap_2()
@@ -1611,7 +1651,7 @@ impl InboxPanel {
                     .gap_0p5()
                     .child(
                         div()
-                            .id(SharedString::from(format!("inbox-item-text-{}", item.id)))
+                            .id((ElementId::from(item.id.clone()), "text"))
                             .line_height(rems(ITEM_LINE_HEIGHT))
                             .cursor_pointer()
                             .on_click(cx.listener({
@@ -1655,15 +1695,16 @@ impl InboxPanel {
     ) -> impl IntoElement {
         let panel = cx.entity().downgrade();
         let item = item.clone();
-        let menu_id = SharedString::from(format!("inbox-item-actions-{}", item.id));
-        let trigger_id = SharedString::from(format!("inbox-item-actions-trigger-{}", item.id));
-        PopoverMenu::new(menu_id)
+        PopoverMenu::new((ElementId::from(item.id.clone()), "actions"))
             .trigger(
-                IconButton::new(trigger_id, IconName::Ellipsis)
-                    .icon_size(IconSize::XSmall)
-                    .icon_color(Color::Muted)
-                    .visible_on_hover("inbox-item")
-                    .tooltip(Tooltip::text("More actions")),
+                IconButton::new(
+                    (ElementId::from(item.id.clone()), "actions-trigger"),
+                    IconName::Ellipsis,
+                )
+                .icon_size(IconSize::XSmall)
+                .icon_color(Color::Muted)
+                .visible_on_hover("inbox-item")
+                .tooltip(Tooltip::text("More actions")),
             )
             .menu(move |window, cx| {
                 let panel = panel.clone();
@@ -1674,12 +1715,7 @@ impl InboxPanel {
                     menu.entry("Copy as Markdown", None, move |_window, cx| {
                         copy_panel
                             .update(cx, |this, cx| {
-                                copy_item_as_markdown(
-                                    &this.workspace,
-                                    &this.store,
-                                    &copy_item,
-                                    cx,
-                                );
+                                copy_item_as_markdown(&this.workspace, &this.store, &copy_item, cx);
                             })
                             .ok();
                     })
@@ -1986,40 +2022,54 @@ impl InboxPanel {
         elements
     }
 
-    fn render_list(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (mut open, cleared, archived, sort_mode) = {
-            let store = self.store.read(cx);
-            let (cleared, open): (Vec<_>, Vec<_>) = store
-                .items()
-                .iter()
-                .cloned()
-                .partition(InboxItem::is_cleared);
-            (open, cleared, store.archived().to_vec(), store.sort_mode())
-        };
+    /// The partitioned and sorted rows of the list, cached across frames and
+    /// invalidated on any store event in [`Self::handle_store_event`].
+    fn list_rows(&self, cx: &App) -> Rc<ListRows> {
+        if let Some(rows) = self.list_cache.borrow().as_ref() {
+            return rows.clone();
+        }
+        let store = self.store.read(cx);
+        let (cleared, mut open): (Vec<_>, Vec<_>) = store
+            .items()
+            .iter()
+            .cloned()
+            .partition(InboxItem::is_cleared);
         // Sorting the flat list also orders items within each "By list" group,
         // since the groups keep the flat order.
-        sort_mode.apply(&mut open);
-        let archive_count = cleared.len() + archived.len();
+        store.sort_mode().apply(&mut open);
+        let rows = Rc::new(ListRows {
+            open,
+            cleared,
+            archived: store.archived().to_vec(),
+        });
+        *self.list_cache.borrow_mut() = Some(rows.clone());
+        rows
+    }
+
+    fn render_list(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let rows = self.list_rows(cx);
+        let archive_count = rows.cleared.len() + rows.archived.len();
         let now = now_unix();
 
         let open_rows = match self.view_mode {
-            ViewMode::All => open
+            ViewMode::All => rows
+                .open
                 .iter()
                 .map(|item| self.render_item(item, ItemRow::Open, now, cx))
                 .collect(),
-            ViewMode::Grouped => self.render_grouped_items(&open, now, cx),
+            ViewMode::Grouped => self.render_grouped_items(&rows.open, now, cx),
         };
         let mut archive_rows = Vec::new();
         if self.show_archive {
-            for item in &cleared {
+            for item in &rows.cleared {
                 archive_rows.push(self.render_item(item, ItemRow::ClearedInbox, now, cx));
             }
-            for item in &archived {
+            for item in &rows.archived {
                 archive_rows.push(self.render_item(item, ItemRow::Archived, now, cx));
             }
         }
 
-        let show_empty_state = open.is_empty() && (archive_count == 0 || !self.show_archive);
+        let show_empty_state = rows.open.is_empty() && (archive_count == 0 || !self.show_archive);
 
         // Two layers: the outer container hosts the scrollbar overlay and does
         // NOT scroll, while the inner container carries `overflow_y_scroll` +
@@ -2073,35 +2123,18 @@ impl InboxPanel {
 
     fn render_delete_confirmation(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (id, position) = self.confirming_delete.clone()?;
-        let entity = cx.entity().downgrade();
-        let dismiss = {
-            let entity = entity.clone();
-            Rc::new(move |_: &mut Window, cx: &mut App| {
-                entity
-                    .update(cx, |this, cx| {
-                        this.confirming_delete = None;
-                        cx.notify();
-                    })
-                    .ok();
-            }) as Rc<dyn Fn(&mut Window, &mut App)>
-        };
-        let confirm = Rc::new(move |_: &mut Window, cx: &mut App| {
-            entity
-                .update(cx, |this, cx| {
-                    this.confirming_delete = None;
-                    this.store.update(cx, |store, cx| store.delete_item(&id, cx));
-                    cx.notify();
-                })
-                .ok();
-        }) as Rc<dyn Fn(&mut Window, &mut App)>;
-        Some(confirmation_popover(
+        Some(entity_confirmation_popover(
+            cx.entity().downgrade(),
             "inbox-item-delete",
             position,
             gpui::Anchor::TopLeft,
             "Delete item?",
             "Delete",
-            dismiss,
-            confirm,
+            |this, _| this.confirming_delete = None,
+            move |this, _, cx| {
+                this.store
+                    .update(cx, |store, cx| store.delete_item(&id, cx));
+            },
             cx,
         ))
     }

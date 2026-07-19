@@ -105,13 +105,6 @@ impl BlockDocument {
         serialize_blocks(&self.blocks)
     }
 
-    /// Allocates a new monotonically-increasing [`BlockId`].
-    pub fn new_id(&mut self) -> BlockId {
-        let id = BlockId(self.next_id);
-        self.next_id += 1;
-        id
-    }
-
     fn new_block(next_id: &mut u64, block_type: BlockType, text: String, checked: bool) -> Block {
         let id = BlockId(*next_id);
         *next_id += 1;
@@ -138,13 +131,26 @@ impl BlockDocument {
         self.blocks.iter().position(|block| block.id == id)
     }
 
+    /// Inserts a fresh empty `Paragraph` at `index` and returns the edit
+    /// target focusing it.
+    fn insert_empty_paragraph(&mut self, index: usize) -> EditTarget {
+        let new_block = Self::new_block(
+            &mut self.next_id,
+            BlockType::Paragraph,
+            String::new(),
+            false,
+        );
+        let new_id = new_block.id;
+        self.blocks.insert(index, new_block);
+        EditTarget {
+            block: new_id,
+            caret: CaretPos::Start,
+        }
+    }
+
     /// Number of blocks in the document.
     pub fn len(&self) -> usize {
         self.blocks.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.blocks.is_empty()
     }
 
     /// Counts `(checked, total)` across all `Todo` blocks.
@@ -193,7 +199,11 @@ impl BlockDocument {
             });
         }
 
-        let offset = floor_char_boundary(&self.blocks[index].text, caret_byte_offset);
+        // Round down to a char boundary so slicing never panics even if the
+        // caller passes an offset inside a multi-byte character.
+        let offset = self.blocks[index]
+            .text
+            .floor_char_boundary(caret_byte_offset);
         let text = self.blocks[index].text.clone();
         let (before, after) = text.split_at(offset);
         let before = before.to_string();
@@ -292,18 +302,7 @@ impl BlockDocument {
 
         if block_type == BlockType::Divider {
             self.blocks[index].text.clear();
-            let new_block = Self::new_block(
-                &mut self.next_id,
-                BlockType::Paragraph,
-                String::new(),
-                false,
-            );
-            let new_id = new_block.id;
-            self.blocks.insert(index + 1, new_block);
-            return Some(EditTarget {
-                block: new_id,
-                caret: CaretPos::Start,
-            });
+            return Some(self.insert_empty_paragraph(index + 1));
         }
 
         Some(EditTarget {
@@ -380,34 +379,7 @@ impl BlockDocument {
         let index = self
             .index_of(id)
             .unwrap_or(self.blocks.len().saturating_sub(1));
-        let new_block = Self::new_block(
-            &mut self.next_id,
-            BlockType::Paragraph,
-            String::new(),
-            false,
-        );
-        let new_id = new_block.id;
-        self.blocks.insert(index + 1, new_block);
-        EditTarget {
-            block: new_id,
-            caret: CaretPos::Start,
-        }
-    }
-
-    /// Appends a new empty `Paragraph` at the end of the document.
-    pub fn append_paragraph(&mut self) -> EditTarget {
-        let new_block = Self::new_block(
-            &mut self.next_id,
-            BlockType::Paragraph,
-            String::new(),
-            false,
-        );
-        let new_id = new_block.id;
-        self.blocks.push(new_block);
-        EditTarget {
-            block: new_id,
-            caret: CaretPos::Start,
-        }
+        self.insert_empty_paragraph(index + 1)
     }
 
     /// Duplicates block `id`, inserting the copy (with a new id) right
@@ -452,18 +424,7 @@ impl BlockDocument {
         self.blocks.remove(index);
 
         if self.blocks.is_empty() {
-            let new_block = Self::new_block(
-                &mut self.next_id,
-                BlockType::Paragraph,
-                String::new(),
-                false,
-            );
-            let new_id = new_block.id;
-            self.blocks.push(new_block);
-            return Some(EditTarget {
-                block: new_id,
-                caret: CaretPos::Start,
-            });
+            return Some(self.insert_empty_paragraph(0));
         }
 
         let prev_index = index.saturating_sub(1);
@@ -479,20 +440,6 @@ impl Default for BlockDocument {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Rounds `offset` down to the nearest char boundary in `s`, so slicing
-/// never panics even if the caller passes an offset that lands in the
-/// middle of a multi-byte character.
-fn floor_char_boundary(s: &str, offset: usize) -> usize {
-    if offset >= s.len() {
-        return s.len();
-    }
-    let mut offset = offset;
-    while offset > 0 && !s.is_char_boundary(offset) {
-        offset -= 1;
-    }
-    offset
 }
 
 #[cfg(test)]
@@ -1030,7 +977,7 @@ mod tests {
         assert_eq!(doc.subtask_counts(), (0, 0));
     }
 
-    // --- set_text / toggle_checked / insert_after / append_paragraph ---
+    // --- set_text / toggle_checked / insert_after ---
 
     #[test]
     fn test_set_text_and_toggle_checked() {
@@ -1045,17 +992,13 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_after_and_append_paragraph() {
+    fn test_insert_after() {
         let mut doc = doc_from(vec![(BlockType::Paragraph, "first", false)]);
         let id = doc.blocks()[0].id;
         let target = doc.insert_after(id);
         assert_eq!(doc.len(), 2);
         assert_eq!(target.block, doc.blocks()[1].id);
         assert_eq!(doc.blocks()[1].text, "");
-
-        let target = doc.append_paragraph();
-        assert_eq!(doc.len(), 3);
-        assert_eq!(target.block, doc.blocks()[2].id);
     }
 
     // --- invariant ---

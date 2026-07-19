@@ -6,35 +6,42 @@
 //! opens the block actions menu.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use collections::HashMap;
 use editor::{Editor, EditorElement, EditorEvent, EditorStyle, MultiBufferOffset};
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, Context, DismissEvent, Entity, EventEmitter, ExternalPaths,
-    FocusHandle, Focusable, FontStyle, FontWeight, IntoElement, MouseButton, ParentElement, Pixels,
-    Point, Render, ScrollHandle, StrikethroughStyle, Styled, Subscription, TextStyle,
-    TextStyleRefinement, UnderlineStyle, WeakEntity, Window, anchored, canvas, deferred, point,
+    AnyElement, App, Bounds, ClickEvent, Context, DismissEvent, Div, Entity, EventEmitter,
+    ExternalPaths, FocusHandle, Focusable, FontStyle, FontWeight, IntoElement, MouseButton,
+    ParentElement, Pixels, Point, Render, ScrollHandle, StrikethroughStyle, Styled, Subscription,
+    TextStyle, TextStyleRefinement, UnderlineStyle, WeakEntity, Window, anchored, canvas, deferred,
+    point,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownStyle};
 use settings::Settings as _;
 use theme_settings::ThemeSettings;
-use ui::{
-    Checkbox, ContextMenu, ContextMenuEntry, Divider, Tab, ToggleState, Tooltip, prelude::*,
-};
+use ui::{Checkbox, ContextMenu, ContextMenuEntry, Divider, Tab, ToggleState, Tooltip, prelude::*};
 use workspace::Workspace;
 
-use crate::attachment::{AttachmentCompletionProvider, OnPick, attach_external_paths};
+use crate::attachment::{
+    AttachmentCompletionProvider, OnPick, attach_external_paths, pick_and_attach,
+};
 use crate::block::{Block, BlockDocument, BlockId, BlockType, CaretPos};
 use crate::inbox_model::{AttachmentRef, InboxItem, ItemId, format_age, now_unix};
 use crate::inbox_store::{InboxStore, InboxStoreEvent};
+use crate::slash_menu::{self, SlashEntry, SlashMenuState};
 use crate::{
-    confirmation_popover, copy_item_as_markdown, open_attachment, open_capture_context,
+    copy_item_as_markdown, entity_confirmation_popover, open_attachment, open_capture_context,
     send_item_to_chat,
 };
-use crate::slash_menu::{self, SlashEntry, SlashMenuState};
+
+/// Placeholder of the last (slash-menu-advertising) block; shared verbatim
+/// between the live editor and the read-mode label so they can't drift.
+const LAST_BLOCK_PLACEHOLDER: &str = "Type, or «/» for a block";
+/// Placeholder of any other empty block.
+const EMPTY_BLOCK_PLACEHOLDER: &str = "Empty line";
 
 pub enum InboxDetailEvent {
     /// The view wants to be closed (back button, Escape, or its item is gone).
@@ -62,8 +69,9 @@ pub struct InboxDetailView {
     /// The block model of the item's markdown body.
     document: BlockDocument,
     /// Lazily-created markdown renderers for the text blocks, keyed by block
-    /// id and kept in sync with the block text.
-    read_markdown: HashMap<BlockId, Entity<Markdown>>,
+    /// id and kept in sync with the block text. In a `RefCell` so the render
+    /// path can fill it while iterating the blocks by reference.
+    read_markdown: RefCell<HashMap<BlockId, Entity<Markdown>>>,
     /// The block currently being edited, if any.
     editing: Option<EditingState>,
     /// The open slash menu, if any. Invariant: only ever open for the block
@@ -110,15 +118,7 @@ impl InboxDetailView {
         // `@` in the title picks a project file and writes it straight to the
         // item's attachments (the item already exists here).
         title_editor.update(cx, |editor, _| {
-            let store = store.downgrade();
-            let item_id = item_id.clone();
-            let on_pick: OnPick = Arc::new(move |attachment, cx| {
-                store
-                    .update(cx, |store, cx| {
-                        store.add_attachment(&item_id, attachment, cx);
-                    })
-                    .ok();
-            });
+            let on_pick: OnPick = Arc::new(Self::attachment_sink(&store, &item_id));
             editor.set_completion_provider(Some(std::rc::Rc::new(
                 AttachmentCompletionProvider::new(workspace.clone(), on_pick),
             )));
@@ -136,7 +136,7 @@ impl InboxDetailView {
             title_editor,
             title_cleared: cleared,
             document: BlockDocument::from_markdown(body.as_deref().unwrap_or_default()),
-            read_markdown: HashMap::default(),
+            read_markdown: RefCell::default(),
             editing: None,
             slash_menu: None,
             block_bounds: Rc::default(),
@@ -147,6 +147,23 @@ impl InboxDetailView {
             slash_scroll_handle: ScrollHandle::new(),
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
+        }
+    }
+
+    /// Sink writing a picked attachment straight to the item in the store.
+    /// Shared by the `@` completion, the OS file dialog and drag & drop.
+    fn attachment_sink(
+        store: &Entity<InboxStore>,
+        item_id: &ItemId,
+    ) -> impl Fn(AttachmentRef, &mut App) + Send + Sync + 'static {
+        let store = store.downgrade();
+        let item_id = item_id.clone();
+        move |attachment, cx| {
+            store
+                .update(cx, |store, cx| {
+                    store.add_attachment(&item_id, attachment, cx);
+                })
+                .ok();
         }
     }
 
@@ -249,7 +266,7 @@ impl InboxDetailView {
                         BlockDocument::from_markdown(item.body.as_deref().unwrap_or_default());
                     if new_document.to_markdown() != self.document.to_markdown() {
                         self.document = new_document;
-                        self.read_markdown.clear();
+                        self.read_markdown.borrow_mut().clear();
                     }
                 }
                 if self.title_editor.read(cx).text(cx) != item.text {
@@ -331,9 +348,9 @@ impl InboxDetailView {
             };
             editor.set_placeholder_text(
                 if is_last {
-                    "Type, or «/» for a block"
+                    LAST_BLOCK_PLACEHOLDER
                 } else {
-                    "Empty line"
+                    EMPTY_BLOCK_PLACEHOLDER
                 },
                 window,
                 cx,
@@ -395,6 +412,29 @@ impl InboxDetailView {
         });
     }
 
+    /// Syncs live editor text into the document. When multiline text slipped
+    /// in (paste, shift-enter), the document was restructured: the first line
+    /// stays in the block and the rest became new blocks. In that case the
+    /// editor — which still holds the multiline text — is dropped without the
+    /// commit-time resync and editing continues at the end of the inserted
+    /// blocks. Returns whether that restructure happened.
+    fn restructure_if_multiline(
+        &mut self,
+        block_id: BlockId,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(target) = self.document.apply_text(block_id, text) else {
+            return false;
+        };
+        self.slash_menu = None;
+        self.editing = None;
+        self.save_body(cx);
+        self.start_editing(target.block, target.caret, window, cx);
+        true
+    }
+
     fn handle_block_editor_event(
         &mut self,
         editor: &Entity<Editor>,
@@ -424,17 +464,8 @@ impl InboxDetailView {
                 {
                     return;
                 }
-                let target = self.document.apply_text(block_id, &text);
-                self.save_body(cx);
-                if let Some(target) = target {
-                    // Multiline text (paste, shift-enter) was split off into
-                    // new blocks. The editor still holds the multiline text,
-                    // so drop it without the commit-time resync and continue
-                    // editing at the end of the inserted blocks.
-                    self.slash_menu = None;
-                    self.editing = None;
-                    self.start_editing(target.block, target.caret, window, cx);
-                } else {
+                if !self.restructure_if_multiline(block_id, &text, window, cx) {
+                    self.save_body(cx);
                     self.update_slash_menu(block_id, &text);
                 }
                 cx.notify();
@@ -491,37 +522,38 @@ impl InboxDetailView {
         self.slash_scroll_handle.scroll_to_item(selected);
     }
 
-    /// The currently selected entry of the open slash menu, if the menu is
-    /// open for the block being edited and has any matches.
-    fn selected_slash_entry(&self) -> Option<&'static SlashEntry> {
+    /// The open slash menu's block, filtered entries and clamped selection,
+    /// or `None` when the menu is closed or has no matches. The one place
+    /// the query → entries → clamp rule lives.
+    fn slash_entries(&self) -> Option<(BlockId, Vec<&'static SlashEntry>, usize)> {
         let state = self.slash_menu.as_ref()?;
-        if self.editing.as_ref().map(|editing| editing.block_id) != Some(state.block_id) {
-            return None;
-        }
         let block = self.document.block(state.block_id)?;
         let query = block.text.strip_prefix('/').unwrap_or("");
         let entries = slash_menu::filtered(query);
         let last = entries.len().checked_sub(1)?;
-        entries.get(state.selected.min(last)).copied()
+        let selected = state.selected.min(last);
+        Some((state.block_id, entries, selected))
+    }
+
+    /// The currently selected entry of the open slash menu, if the menu is
+    /// open for the block being edited and has any matches.
+    fn selected_slash_entry(&self) -> Option<&'static SlashEntry> {
+        let (block_id, entries, selected) = self.slash_entries()?;
+        if self.editing.as_ref().map(|editing| editing.block_id) != Some(block_id) {
+            return None;
+        }
+        entries.get(selected).copied()
     }
 
     /// Moves the slash menu selection by `delta`, clamped to the filtered
     /// list. Returns `false` (untouched) when the menu is not open.
     fn step_slash_selection(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
-        let Some(state) = self.slash_menu.as_ref() else {
+        let Some((_, entries, selected)) = self.slash_entries() else {
             return false;
         };
-        let Some(block) = self.document.block(state.block_id) else {
-            return false;
-        };
-        let query = block.text.strip_prefix('/').unwrap_or("");
-        let len = slash_menu::filtered(query).len();
-        if len == 0 {
-            return false;
-        }
+        let len = entries.len();
         if let Some(state) = self.slash_menu.as_mut() {
-            let current = state.selected.min(len - 1) as isize;
-            state.selected = (current + delta).clamp(0, len as isize - 1) as usize;
+            state.selected = (selected as isize + delta).clamp(0, len as isize - 1) as usize;
             // Keep the newly selected entry in view.
             self.slash_scroll_handle.scroll_to_item(state.selected);
         }
@@ -655,11 +687,8 @@ impl InboxDetailView {
         // The document is synced on `BufferEdited`, but sync from the editor
         // text directly so this does not depend on event delivery order.
         let text = editor.read(cx).text(cx);
-        if let Some(target) = self.document.apply_text(block_id, &text) {
+        if self.restructure_if_multiline(block_id, &text, window, cx) {
             // Multiline text slipped in: restructure instead of splitting.
-            self.editing = None;
-            self.save_body(cx);
-            self.start_editing(target.block, target.caret, window, cx);
             return;
         }
         if let Some(target) = self.document.split(block_id, head) {
@@ -701,17 +730,8 @@ impl InboxDetailView {
         // confirm), so the merge below doesn't depend on `BufferEdited`
         // delivery order.
         let text = editor.read(cx).text(cx);
-        if self
-            .document
-            .block(block_id)
-            .is_some_and(|block| block.text != text)
-            && let Some(target) = self.document.apply_text(block_id, &text)
-        {
+        if self.restructure_if_multiline(block_id, &text, window, cx) {
             // Multiline text slipped in: restructure instead of merging.
-            self.slash_menu = None;
-            self.editing = None;
-            self.save_body(cx);
-            self.start_editing(target.block, target.caret, window, cx);
             cx.stop_propagation();
             return;
         }
@@ -772,6 +792,26 @@ impl InboxDetailView {
         self.slash_menu = None;
         let view = cx.weak_entity();
         let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
+            // "Duplicate"/"Move up"/"Move down" share the same handler shell:
+            // run a document mutation and, if it changed anything, save.
+            let doc_entry =
+                |label: &'static str,
+                 icon: IconName,
+                 mutate: fn(&mut BlockDocument, BlockId) -> bool| {
+                    let view = view.clone();
+                    ContextMenuEntry::new(label)
+                        .icon(icon)
+                        .icon_color(Color::Muted)
+                        .handler(move |_, cx| {
+                            view.update(cx, |this, cx| {
+                                if mutate(&mut this.document, id) {
+                                    this.save_body(cx);
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
+                        })
+                };
             menu.item(
                 ContextMenuEntry::new("Add below")
                     .icon(IconName::Plus)
@@ -788,57 +828,17 @@ impl InboxDetailView {
                         }
                     }),
             )
-            .item(
-                ContextMenuEntry::new("Duplicate")
-                    .icon(IconName::Copy)
-                    .icon_color(Color::Muted)
-                    .handler({
-                        let view = view.clone();
-                        move |_, cx| {
-                            view.update(cx, |this, cx| {
-                                if this.document.duplicate(id).is_some() {
-                                    this.save_body(cx);
-                                    cx.notify();
-                                }
-                            })
-                            .ok();
-                        }
-                    }),
-            )
-            .item(
-                ContextMenuEntry::new("Move up")
-                    .icon(IconName::ArrowUp)
-                    .icon_color(Color::Muted)
-                    .handler({
-                        let view = view.clone();
-                        move |_, cx| {
-                            view.update(cx, |this, cx| {
-                                if this.document.move_block(id, -1) {
-                                    this.save_body(cx);
-                                    cx.notify();
-                                }
-                            })
-                            .ok();
-                        }
-                    }),
-            )
-            .item(
-                ContextMenuEntry::new("Move down")
-                    .icon(IconName::ArrowDown)
-                    .icon_color(Color::Muted)
-                    .handler({
-                        let view = view.clone();
-                        move |_, cx| {
-                            view.update(cx, |this, cx| {
-                                if this.document.move_block(id, 1) {
-                                    this.save_body(cx);
-                                    cx.notify();
-                                }
-                            })
-                            .ok();
-                        }
-                    }),
-            )
+            .item(doc_entry("Duplicate", IconName::Copy, |document, id| {
+                document.duplicate(id).is_some()
+            }))
+            .item(doc_entry("Move up", IconName::ArrowUp, |document, id| {
+                document.move_block(id, -1)
+            }))
+            .item(doc_entry(
+                "Move down",
+                IconName::ArrowDown,
+                |document, id| document.move_block(id, 1),
+            ))
             .separator()
             .item(
                 ContextMenuEntry::new("Delete block")
@@ -907,9 +907,10 @@ impl InboxDetailView {
 
     /// Returns the markdown renderer of a text block, creating it on first
     /// use and re-parsing it when the block text has changed.
-    fn read_markdown_entity(&mut self, block: &Block, cx: &mut Context<Self>) -> Entity<Markdown> {
+    fn read_markdown_entity(&self, block: &Block, cx: &mut Context<Self>) -> Entity<Markdown> {
         let entity = self
             .read_markdown
+            .borrow_mut()
             .entry(block.id)
             .or_insert_with(|| {
                 let text = SharedString::from(block.text.clone());
@@ -1095,25 +1096,11 @@ impl InboxDetailView {
             return;
         };
         let project = workspace.read(cx).project().clone();
-        let store = self.store.clone();
-        let item_id = self.item_id.clone();
-        let receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: true,
-            prompt: Some("Attach files".into()),
-        });
-        cx.spawn(async move |_, cx| {
-            let Ok(Ok(Some(paths))) = receiver.await else {
-                return;
-            };
-            let _ = cx.update(|cx| {
-                attach_external_paths(&paths, &project, cx, |attachment, cx| {
-                    store.update(cx, |store, cx| store.add_attachment(&item_id, attachment, cx));
-                });
-            });
-        })
-        .detach();
+        pick_and_attach(
+            project,
+            cx,
+            Self::attachment_sink(&self.store, &self.item_id),
+        );
     }
 
     /// Attaches dropped OS files to the item.
@@ -1122,11 +1109,12 @@ impl InboxDetailView {
             return;
         };
         let project = workspace.read(cx).project().clone();
-        let store = self.store.clone();
-        let item_id = self.item_id.clone();
-        attach_external_paths(paths, &project, cx, |attachment, cx| {
-            store.update(cx, |store, cx| store.add_attachment(&item_id, attachment, cx));
-        });
+        attach_external_paths(
+            paths,
+            &project,
+            cx,
+            Self::attachment_sink(&self.store, &self.item_id),
+        );
     }
 
     /// The item's attachment chips, each opening the file on click and removing
@@ -1139,34 +1127,34 @@ impl InboxDetailView {
         if item.attachments.is_empty() {
             return None;
         }
-        let attachments = item.attachments.clone();
         Some(
-            h_flex()
-                .flex_wrap()
-                .gap_1()
-                .pl(px(28.))
-                .children(attachments.into_iter().enumerate().map(|(index, attachment)| {
-                    let open = attachment.clone();
-                    let remove = attachment.clone();
-                    let on_open = cx.listener(move |this, _, window, cx| {
-                        open_attachment(&this.workspace, &open, window, cx);
-                    });
-                    let on_remove = cx.listener(move |this, event: &ClickEvent, _, cx| {
-                        cx.stop_propagation();
-                        this.confirming_attachment_removal =
-                            Some((remove.clone(), event.position()));
-                        cx.notify();
-                    });
-                    crate::removable_attachment_chip(
-                        SharedString::from(format!("inbox-detail-attachment-{index}")),
-                        ("inbox-detail-attachment-remove", index),
-                        &attachment,
-                        cx,
-                        on_open,
-                        on_remove,
-                    )
-                    .into_any_element()
-                })),
+            h_flex().flex_wrap().gap_1().pl(px(28.)).children(
+                item.attachments
+                    .iter()
+                    .enumerate()
+                    .map(|(index, attachment)| {
+                        let open = attachment.clone();
+                        let remove = attachment.clone();
+                        let on_open = cx.listener(move |this, _, window, cx| {
+                            open_attachment(&this.workspace, &open, window, cx);
+                        });
+                        let on_remove = cx.listener(move |this, event: &ClickEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.confirming_attachment_removal =
+                                Some((remove.clone(), event.position()));
+                            cx.notify();
+                        });
+                        crate::removable_attachment_chip(
+                            ("inbox-detail-attachment", index),
+                            ("inbox-detail-attachment-remove", index),
+                            attachment,
+                            cx,
+                            on_open,
+                            on_remove,
+                        )
+                        .into_any_element()
+                    }),
+            ),
         )
     }
 
@@ -1305,8 +1293,10 @@ impl InboxDetailView {
             .children(self.render_attachments(item, cx))
     }
 
-    fn render_code_block(&self, block: &Block, cx: &App) -> AnyElement {
-        let mut container = v_flex()
+    /// The bordered code-block container chrome, shared by read mode and the
+    /// live editor.
+    fn code_container(cx: &App) -> Div {
+        v_flex()
             .w_full()
             .my_1()
             .px_2()
@@ -1315,8 +1305,10 @@ impl InboxDetailView {
             .border_1()
             .border_color(cx.theme().colors().border_variant)
             .bg(cx.theme().colors().editor_background)
-            .font_buffer(cx)
-            .text_sm();
+    }
+
+    fn render_code_block(&self, block: &Block, cx: &App) -> AnyElement {
+        let mut container = Self::code_container(cx).font_buffer(cx).text_sm();
         for line in block.text.split('\n') {
             let line = if line.is_empty() {
                 SharedString::from("\u{00a0}")
@@ -1329,7 +1321,7 @@ impl InboxDetailView {
     }
 
     fn render_block(
-        &mut self,
+        &self,
         block: &Block,
         is_last: bool,
         window: &Window,
@@ -1413,17 +1405,7 @@ impl InboxDetailView {
         let content = if let Some(editor) = editing_editor.as_ref() {
             let element = EditorElement::new(editor, Self::editor_style(block, window, cx));
             if block.block_type == BlockType::Code {
-                v_flex()
-                    .w_full()
-                    .my_1()
-                    .px_2()
-                    .py_1p5()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(cx.theme().colors().border_variant)
-                    .bg(cx.theme().colors().editor_background)
-                    .child(element)
-                    .into_any_element()
+                Self::code_container(cx).child(element).into_any_element()
             } else {
                 div().w_full().child(element).into_any_element()
             }
@@ -1436,9 +1418,9 @@ impl InboxDetailView {
                     .into_any_element(),
                 BlockType::Code => self.render_code_block(block, cx),
                 _ if block.text.is_empty() => Label::new(if is_last {
-                    "Type, or «/» for a block"
+                    LAST_BLOCK_PLACEHOLDER
                 } else {
-                    "Empty line"
+                    EMPTY_BLOCK_PLACEHOLDER
                 })
                 .size(LabelSize::Small)
                 .color(Color::Placeholder)
@@ -1500,9 +1482,8 @@ impl InboxDetailView {
             .into_any_element()
     }
 
-    fn render_body(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let blocks = self.document.blocks().to_vec();
-        let last_index = blocks.len().saturating_sub(1);
+    fn render_body(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let last_index = self.document.blocks().len().saturating_sub(1);
 
         let mut body = v_flex()
             .id("inbox-detail-body")
@@ -1514,7 +1495,8 @@ impl InboxDetailView {
             .border_color(cx.theme().colors().border_variant)
             .px_2()
             .py_3();
-        for (index, block) in blocks.iter().enumerate() {
+        for index in 0..self.document.blocks().len() {
+            let block = &self.document.blocks()[index];
             body = body.child(self.render_block(block, index == last_index, window, cx));
         }
         body
@@ -1524,20 +1506,7 @@ impl InboxDetailView {
     /// block's row. `None` while the menu is closed (or the block's bounds
     /// have not been recorded yet).
     fn render_slash_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let state = self.slash_menu.as_ref()?;
-        let block_id = state.block_id;
-        let query = self
-            .document
-            .block(block_id)?
-            .text
-            .strip_prefix('/')
-            .unwrap_or("")
-            .to_string();
-        let entries = slash_menu::filtered(&query);
-        if entries.is_empty() {
-            return None;
-        }
-        let selected = state.selected.min(entries.len() - 1);
+        let (block_id, entries, selected) = self.slash_entries()?;
         let bounds = *self.block_bounds.borrow().get(&block_id)?;
         let position = bounds.origin + point(px(24.), bounds.size.height);
 
@@ -1644,80 +1613,46 @@ impl InboxDetailView {
         )
     }
 
-    /// The delete-confirmation popover, anchored where the trash button was
-    /// clicked. Mirrors the item rows' confirmation in the list panel.
-    /// Confirmation popover for removing an attachment from the item.
+    /// Confirmation popover for removing an attachment from the item,
+    /// anchored where the chip's remove button was clicked.
     fn render_attachment_removal_confirmation(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (attachment, position) = self.confirming_attachment_removal.clone()?;
-        let entity = cx.entity().downgrade();
-        let dismiss = {
-            let entity = entity.clone();
-            Rc::new(move |_: &mut Window, cx: &mut App| {
-                entity
-                    .update(cx, |this, cx| {
-                        this.confirming_attachment_removal = None;
-                        cx.notify();
-                    })
-                    .ok();
-            }) as Rc<dyn Fn(&mut Window, &mut App)>
-        };
-        let confirm = Rc::new(move |_: &mut Window, cx: &mut App| {
-            entity
-                .update(cx, |this, cx| {
-                    this.confirming_attachment_removal = None;
-                    let item_id = this.item_id.clone();
-                    this.store.update(cx, |store, cx| {
-                        store.remove_attachment(&item_id, &attachment, cx)
-                    });
-                    cx.notify();
-                })
-                .ok();
-        }) as Rc<dyn Fn(&mut Window, &mut App)>;
-        Some(confirmation_popover(
+        Some(entity_confirmation_popover(
+            cx.entity().downgrade(),
             "inbox-detail-attachment-remove",
             position,
             gpui::Anchor::TopLeft,
             "Remove attachment?",
             "Remove",
-            dismiss,
-            confirm,
+            |this, _| this.confirming_attachment_removal = None,
+            move |this, _, cx| {
+                let item_id = this.item_id.clone();
+                this.store.update(cx, |store, cx| {
+                    store.remove_attachment(&item_id, &attachment, cx)
+                });
+            },
             cx,
         ))
     }
 
+    /// The delete-confirmation popover, anchored where the trash button was
+    /// clicked. Mirrors the item rows' confirmation in the list panel.
     fn render_delete_confirmation(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let position = self.confirming_delete?;
-        let entity = cx.entity().downgrade();
-        let dismiss = {
-            let entity = entity.clone();
-            Rc::new(move |_: &mut Window, cx: &mut App| {
-                entity
-                    .update(cx, |this, cx| {
-                        this.confirming_delete = None;
-                        cx.notify();
-                    })
-                    .ok();
-            }) as Rc<dyn Fn(&mut Window, &mut App)>
-        };
-        let confirm = Rc::new(move |_: &mut Window, cx: &mut App| {
-            entity
-                .update(cx, |this, cx| {
-                    this.confirming_delete = None;
-                    let item_id = this.item_id.clone();
-                    // The store emits `ItemDeleted`, which closes this view.
-                    this.store
-                        .update(cx, |store, cx| store.delete_item(&item_id, cx));
-                })
-                .ok();
-        }) as Rc<dyn Fn(&mut Window, &mut App)>;
-        Some(confirmation_popover(
+        Some(entity_confirmation_popover(
+            cx.entity().downgrade(),
             "inbox-detail-delete",
             position,
             gpui::Anchor::TopRight,
             "Delete item?",
             "Delete",
-            dismiss,
-            confirm,
+            |this, _| this.confirming_delete = None,
+            |this, _, cx| {
+                let item_id = this.item_id.clone();
+                // The store emits `ItemDeleted`, which closes this view.
+                this.store
+                    .update(cx, |store, cx| store.delete_item(&item_id, cx));
+            },
             cx,
         ))
     }

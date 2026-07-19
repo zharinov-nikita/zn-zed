@@ -68,7 +68,10 @@ pub(crate) fn classify_attachment(
     abs_path: &Path,
     cx: &App,
 ) -> AttachmentRef {
-    match project.read(cx).project_path_for_absolute_path(abs_path, cx) {
+    match project
+        .read(cx)
+        .project_path_for_absolute_path(abs_path, cx)
+    {
         Some(project_path) => AttachmentRef::Project {
             path: project_path.path.as_unix_str().to_string(),
         },
@@ -76,6 +79,30 @@ pub(crate) fn classify_attachment(
             path: abs_path.to_string_lossy().into_owned(),
         },
     }
+}
+
+/// Opens the OS file dialog and hands each picked file to `sink` as an
+/// attachment. Shared by the capture box and the detail view, so the prompt
+/// options and the unwrap dance live in one place.
+pub(crate) fn pick_and_attach(
+    project: Entity<Project>,
+    cx: &mut App,
+    sink: impl FnMut(AttachmentRef, &mut App) + 'static,
+) {
+    let receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
+        files: true,
+        directories: false,
+        multiple: true,
+        prompt: Some("Attach files".into()),
+    });
+    let mut sink = sink;
+    cx.spawn(async move |cx| {
+        let Ok(Ok(Some(paths))) = receiver.await else {
+            return;
+        };
+        cx.update(|cx| attach_external_paths(&paths, &project, cx, &mut sink));
+    })
+    .detach();
 }
 
 /// Classifies picked or dropped absolute paths into attachments and hands each
@@ -179,9 +206,7 @@ impl CompletionProvider for AttachmentCompletionProvider {
                 let worktree = worktree.read(cx);
                 PathMatchCandidateSet {
                     snapshot: worktree.snapshot(),
-                    include_ignored: worktree
-                        .root_entry()
-                        .is_some_and(|entry| entry.is_ignored),
+                    include_ignored: worktree.root_entry().is_some_and(|entry| entry.is_ignored),
                     include_root_name: false,
                     candidates: Candidates::Entries,
                 }
@@ -207,8 +232,12 @@ impl CompletionProvider for AttachmentCompletionProvider {
                 .into_iter()
                 .filter(|mat| !mat.is_dir && !mat.path.as_unix_str().is_empty())
                 .map(|mat| {
+                    let name = mat
+                        .path
+                        .file_name()
+                        .unwrap_or_else(|| mat.path.as_unix_str())
+                        .to_string();
                     let path = mat.path.as_unix_str().to_string();
-                    let name = path.rsplit('/').next().unwrap_or(path.as_str()).to_string();
                     let attachment = AttachmentRef::Project { path };
                     let on_pick = on_pick.clone();
                     Completion {
