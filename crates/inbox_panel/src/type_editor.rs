@@ -6,10 +6,10 @@
 use collections::HashMap;
 use editor::{Editor, EditorEvent};
 use gpui::{
-    AnyElement, ClickEvent, Context, Entity, FontWeight, Hsla, Pixels, Point, Render, Subscription,
-    Window,
+    AnyElement, ClickEvent, Context, Entity, FontWeight, Hsla, Pixels, Point, Render, ScrollHandle,
+    Subscription, Window,
 };
-use ui::{Tab, Tooltip, prelude::*};
+use ui::{ScrollAxes, Scrollbars, Tab, Tooltip, WithScrollbar, prelude::*};
 
 use crate::inbox_model::{CatalogKind, catalog_color};
 use crate::inbox_store::InboxStore;
@@ -92,6 +92,8 @@ pub(crate) struct TypeEditorState {
     /// the window position of the confirm popover, if any. Only one row (of
     /// either catalog) can be confirming at a time.
     confirming_delete: Option<(CatalogKind, String, Point<Pixels>)>,
+    /// Scroll position of the overlay body, shared with its scrollbar.
+    scroll_handle: ScrollHandle,
 }
 
 impl TypeEditorState {
@@ -103,6 +105,7 @@ impl TypeEditorState {
         let mut this = Self {
             rename_editors: HashMap::default(),
             confirming_delete: None,
+            scroll_handle: ScrollHandle::new(),
         };
         this.sync(store, window, cx);
         this
@@ -263,18 +266,13 @@ impl InboxPanel {
                 })
                 .on_drop(cx.listener({
                     let target_key = key.to_string();
-                    move |this, drag: &DraggedCatalogEntry, window, cx| {
+                    move |this, drag: &DraggedCatalogEntry, _, cx| {
                         if drag.kind != kind {
                             return;
                         }
-                        let store = this.store.clone();
-                        store.update(cx, |store, cx| {
+                        this.store.update(cx, |store, cx| {
                             store.move_entry_before(kind, &drag.key, &target_key, cx)
                         });
-                        if let Some(state) = this.type_editor.as_mut() {
-                            state.sync(&store, window, cx);
-                        }
-                        cx.notify();
                     }
                 }))
             })
@@ -358,14 +356,9 @@ impl InboxPanel {
                                 .size(ButtonSize::Compact)
                                 .label_size(LabelSize::XSmall)
                                 .color(Color::Muted)
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    let store = this.store.clone();
-                                    store
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.store
                                         .update(cx, |store, cx| store.sort_entries_alpha(kind, cx));
-                                    if let Some(state) = this.type_editor.as_mut() {
-                                        state.sync(&store, window, cx);
-                                    }
-                                    cx.notify();
                                 })),
                         )
                     }),
@@ -380,15 +373,10 @@ impl InboxPanel {
                     .rounded_md()
                     .cursor_pointer()
                     .hover(|style| style.bg(cx.theme().colors().element_hover))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        let store = this.store.clone();
-                        store.update(cx, |store, cx| {
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.store.update(cx, |store, cx| {
                             store.add_entry(kind, cx);
                         });
-                        if let Some(state) = this.type_editor.as_mut() {
-                            state.sync(&store, window, cx);
-                        }
-                        cx.notify();
                     }))
                     .child(
                         Icon::new(IconName::Plus)
@@ -426,8 +414,13 @@ impl InboxPanel {
     }
 
     /// The full-panel catalog editor overlay, or `None` while it is closed.
-    pub(crate) fn render_type_editor(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(crate) fn render_type_editor(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let state = self.type_editor.as_ref()?;
+        let scroll_handle = state.scroll_handle.clone();
         let entries = |entries: &[crate::inbox_model::CatalogEntry]| -> Vec<(String, gpui::Hsla)> {
             entries
                 .iter()
@@ -469,9 +462,9 @@ impl InboxPanel {
         let divider = move || div().my_1().border_t_1().border_color(border_variant);
         let body = v_flex()
             .id("inbox-type-editor-body")
-            .flex_1()
-            .min_h_0()
+            .size_full()
             .overflow_y_scroll()
+            .track_scroll(&scroll_handle)
             .p_2()
             .gap_1()
             .child(div().px_1().child(section_label("SYSTEM · READ-ONLY")))
@@ -490,7 +483,22 @@ impl InboxPanel {
                 .inset_0()
                 .bg(cx.theme().colors().panel_background)
                 .child(header)
-                .child(body)
+                // Two layers, as in the panel's list: the outer container
+                // hosts the scrollbar overlay and does not scroll itself.
+                .child(
+                    v_flex()
+                        .id("inbox-type-editor-scroll")
+                        .flex_1()
+                        .min_h_0()
+                        .child(body)
+                        .custom_scrollbars(
+                            Scrollbars::new(ScrollAxes::Vertical)
+                                .tracked_scroll_handle(&scroll_handle)
+                                .tracked_entity(cx.entity_id()),
+                            window,
+                            cx,
+                        ),
+                )
                 .children(self.render_catalog_delete_confirmation(cx))
                 .into_any_element(),
         )
@@ -513,12 +521,9 @@ impl InboxPanel {
                     state.confirming_delete = None;
                 }
             },
-            move |this, window, cx| {
-                let store = this.store.clone();
-                store.update(cx, |store, cx| store.delete_entry(kind, &key, cx));
-                if let Some(state) = this.type_editor.as_mut() {
-                    state.sync(&store, window, cx);
-                }
+            move |this, _, cx| {
+                this.store
+                    .update(cx, |store, cx| store.delete_entry(kind, &key, cx));
             },
             cx,
         ))

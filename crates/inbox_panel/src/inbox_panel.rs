@@ -645,7 +645,7 @@ impl InboxPanel {
             let focus_handle = cx.focus_handle();
             let editor_focus_handle = capture_editor.focus_handle(cx);
             let subscriptions = vec![
-                cx.subscribe(&store, Self::handle_store_event),
+                cx.subscribe_in(&store, window, Self::handle_store_event),
                 cx.on_focus(&focus_handle, window, Self::focus_in),
                 // Re-render so the capture box border reflects the editor's
                 // focus state.
@@ -708,8 +708,9 @@ impl InboxPanel {
 
     fn handle_store_event(
         &mut self,
-        _: Entity<InboxStore>,
+        _: &Entity<InboxStore>,
         event: &InboxStoreEvent,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // Any store change can affect an item's rendered Markdown (body, kind,
@@ -732,6 +733,13 @@ impl InboxPanel {
             }
             InboxStoreEvent::Changed => {
                 self.reconcile_catalog_refs(cx);
+                // Reconcile the catalog editor's rename editors here, next to
+                // the panel's own catalog-derived state, so no catalog
+                // mutation site has to remember to sync them by hand.
+                let store = self.store.clone();
+                if let Some(state) = self.type_editor.as_mut() {
+                    state.sync(&store, window, cx);
+                }
                 cx.notify();
             }
             InboxStoreEvent::Reloaded => {
@@ -2150,32 +2158,30 @@ impl InboxPanel {
             })
     }
 
-    fn render_archive_header(&self, count: usize, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Shared chrome of the collapsible section headers (archive and "By
+    /// list" groups): disclosure, catalog swatch, bold uppercase label and a
+    /// count badge.
+    fn render_section_header(
+        &self,
+        id: SharedString,
+        expanded: bool,
+        swatch_color: gpui::Hsla,
+        label: SharedString,
+        count: usize,
+        on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         h_flex()
-            .id("inbox-archive-header")
+            .id(id)
             .cursor_pointer()
             .px_2()
             .py_1()
             .gap_1()
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.show_archive = !this.show_archive;
-                cx.notify();
-            }))
-            .child(Disclosure::new(
-                "inbox-archive-disclosure",
-                self.show_archive,
-            ))
-            // Muted color swatch mirroring the list group headers, so the
-            // archive section lines up visually with the "By list" groups.
+            .on_click(on_toggle)
+            .child(Disclosure::new("inbox-section-disclosure", expanded))
+            .child(catalog_swatch(swatch_color))
             .child(
-                div()
-                    .flex_none()
-                    .size(px(7.))
-                    .rounded_xs()
-                    .bg(Color::Muted.color(cx)),
-            )
-            .child(
-                Label::new("ARCHIVE")
+                Label::new(label)
                     .size(LabelSize::XSmall)
                     .weight(FontWeight::BOLD)
                     .color(Color::Muted),
@@ -2191,6 +2197,25 @@ impl InboxPanel {
                             .color(Color::Muted),
                     ),
             )
+    }
+
+    fn render_archive_header(&self, count: usize, cx: &mut Context<Self>) -> impl IntoElement {
+        // Muted swatch so the archive section lines up visually with the
+        // "By list" group headers.
+        let swatch_color = Color::Muted.color(cx);
+        let on_toggle = cx.listener(|this: &mut Self, _, _, cx| {
+            this.show_archive = !this.show_archive;
+            cx.notify();
+        });
+        self.render_section_header(
+            "inbox-archive-header".into(),
+            self.show_archive,
+            swatch_color,
+            "ARCHIVE".into(),
+            count,
+            on_toggle,
+            cx,
+        )
     }
 
     /// A minimalist dropdown that switches between "All" and "By list": a
@@ -2272,37 +2297,22 @@ impl InboxPanel {
         collapsed: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        h_flex()
-            .id(SharedString::from(format!("inbox-group-header-{key}")))
-            .cursor_pointer()
-            .px_2()
-            .py_1()
-            .gap_1()
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if !this.collapsed_groups.remove(&key) {
-                    this.collapsed_groups.insert(key.clone());
-                }
-                cx.notify();
-            }))
-            .child(Disclosure::new("inbox-group-disclosure", !collapsed))
-            .child(div().flex_none().size(px(7.)).rounded_xs().bg(color))
-            .child(
-                Label::new(label.to_uppercase())
-                    .size(LabelSize::XSmall)
-                    .weight(FontWeight::BOLD)
-                    .color(Color::Muted),
-            )
-            .child(
-                div()
-                    .px_1()
-                    .rounded_sm()
-                    .bg(cx.theme().colors().element_background)
-                    .child(
-                        Label::new(count.to_string())
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    ),
-            )
+        let id = SharedString::from(format!("inbox-group-header-{key}"));
+        let on_toggle = cx.listener(move |this: &mut Self, _, _, cx| {
+            if !this.collapsed_groups.remove(&key) {
+                this.collapsed_groups.insert(key.clone());
+            }
+            cx.notify();
+        });
+        self.render_section_header(
+            id,
+            !collapsed,
+            color,
+            SharedString::from(label.to_uppercase()),
+            count,
+            on_toggle,
+            cx,
+        )
     }
 
     /// The `collapsed_groups` entry for the synthetic "Unassigned" group
@@ -2337,103 +2347,83 @@ impl InboxPanel {
                 })
                 .collect()
         };
-        // Group by the resolved kind. Items with no kind, or an unknown/deleted
-        // kind, resolve to `None` and land in the "Unassigned" group below.
-        let item_keys: Vec<Option<String>> = {
+        // Bucket by the resolved kind in one pass. Items with no kind, or an
+        // unknown/deleted kind, resolve to `None` and land in the
+        // "Unassigned" group below.
+        let mut buckets: HashMap<Option<String>, Vec<&InboxItem>> = HashMap::default();
+        {
             let store = self.store.read(cx);
-            open.iter()
-                .map(|item| store.resolve_kind(item).map(|t| t.key.clone()))
-                .collect()
-        };
+            for &item in open {
+                buckets
+                    .entry(store.resolve_kind(item).map(|t| t.key.clone()))
+                    .or_default()
+                    .push(item);
+            }
+        }
 
         let mut elements = Vec::new();
         for (key, label, color) in groups {
-            let items: Vec<&InboxItem> = open
-                .iter()
-                .zip(&item_keys)
-                .filter(|(_, item_key)| item_key.as_deref() == Some(key.as_str()))
-                .map(|(item, _)| *item)
-                .collect();
-            let collapsed = self.collapsed_groups.contains(&key);
-            let mut group = v_flex()
-                .id(SharedString::from(format!("inbox-group-{key}")))
-                .rounded_md()
-                .drag_over::<DraggedText>(|style, _, _, cx| {
-                    style.bg(cx.theme().colors().drop_target_background)
-                })
-                .on_drop(cx.listener({
-                    let key = key.clone();
-                    move |this, drag: &DraggedText, _, cx| {
-                        let drag_id: ItemId = drag.id.as_ref().into();
-                        this.store.update(cx, |store, cx| {
-                            let already_there = store.item(&drag_id).is_some_and(|item| {
-                                store.resolve_kind(item).map(|t| t.key.as_str())
-                                    == Some(key.as_str())
-                            });
-                            if !already_there {
-                                store.set_kind(&drag_id, Some(key.clone()), cx);
-                            }
-                        });
-                    }
-                }))
-                .child(self.render_group_header(
-                    key.clone(),
-                    label,
-                    color,
-                    items.len(),
-                    collapsed,
-                    cx,
-                ));
-            if !collapsed {
-                for item in items {
-                    group = group.child(self.render_item(item, ItemRow::Open, now, cx));
-                }
-            }
-            elements.push(group.into_any_element());
+            let items = buckets.remove(&Some(key.clone())).unwrap_or_default();
+            elements.push(self.render_type_group(Some(key), label, color, items, now, cx));
         }
-
-        let unassigned: Vec<&InboxItem> = open
-            .iter()
-            .zip(&item_keys)
-            .filter(|(_, item_key)| item_key.is_none())
-            .map(|(item, _)| *item)
-            .collect();
+        let unassigned = buckets.remove(&None).unwrap_or_default();
         if !unassigned.is_empty() {
-            let collapsed = self.collapsed_groups.contains(Self::UNASSIGNED_GROUP_KEY);
-            let mut group = v_flex()
-                .id("inbox-group-unassigned")
-                .rounded_md()
-                .drag_over::<DraggedText>(|style, _, _, cx| {
-                    style.bg(cx.theme().colors().drop_target_background)
-                })
-                .on_drop(cx.listener(|this, drag: &DraggedText, _, cx| {
+            elements.push(self.render_type_group(
+                None,
+                SharedString::from("Unassigned"),
+                cx.theme().colors().border_variant,
+                unassigned,
+                now,
+                cx,
+            ));
+        }
+        elements
+    }
+
+    /// One droppable "By list" group: header plus, when expanded, the
+    /// group's item rows. `key` is `None` for the synthetic "Unassigned"
+    /// group (items whose kind resolves to no existing type); dropping an
+    /// item there clears its kind.
+    fn render_type_group(
+        &self,
+        key: Option<String>,
+        label: SharedString,
+        color: gpui::Hsla,
+        items: Vec<&InboxItem>,
+        now: i64,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let group_key = key
+            .clone()
+            .unwrap_or_else(|| Self::UNASSIGNED_GROUP_KEY.to_string());
+        let collapsed = self.collapsed_groups.contains(&group_key);
+        let mut group = v_flex()
+            .id(SharedString::from(format!("inbox-group-{group_key}")))
+            .rounded_md()
+            .drag_over::<DraggedText>(|style, _, _, cx| {
+                style.bg(cx.theme().colors().drop_target_background)
+            })
+            .on_drop(cx.listener({
+                let target = key;
+                move |this, drag: &DraggedText, _, cx| {
                     let drag_id: ItemId = drag.id.as_ref().into();
                     this.store.update(cx, |store, cx| {
-                        let already_unassigned = store
-                            .item(&drag_id)
-                            .is_some_and(|item| store.resolve_kind(item).is_none());
-                        if !already_unassigned {
-                            store.set_kind(&drag_id, None, cx);
+                        let already_there = store.item(&drag_id).is_some_and(|item| {
+                            store.resolve_kind(item).map(|t| t.key.clone()) == target
+                        });
+                        if !already_there {
+                            store.set_kind(&drag_id, target.clone(), cx);
                         }
                     });
-                }))
-                .child(self.render_group_header(
-                    Self::UNASSIGNED_GROUP_KEY.to_string(),
-                    SharedString::from("Unassigned"),
-                    cx.theme().colors().border_variant,
-                    unassigned.len(),
-                    collapsed,
-                    cx,
-                ));
-            if !collapsed {
-                for item in unassigned {
-                    group = group.child(self.render_item(item, ItemRow::Open, now, cx));
                 }
+            }))
+            .child(self.render_group_header(group_key, label, color, items.len(), collapsed, cx));
+        if !collapsed {
+            for item in items {
+                group = group.child(self.render_item(item, ItemRow::Open, now, cx));
             }
-            elements.push(group.into_any_element());
         }
-
-        elements
+        group.into_any_element()
     }
 
     /// The partitioned and sorted rows of the list, cached across frames and
@@ -2670,7 +2660,7 @@ impl Render for InboxPanel {
                     this.child(self.render_no_worktree(cx))
                 }
             })
-            .children(self.render_type_editor(cx))
+            .children(self.render_type_editor(window, cx))
             .children(self.render_detail_overlay(cx))
             .children(self.render_delete_confirmation(cx))
             .children(self.render_attachment_removal_confirmation(cx))

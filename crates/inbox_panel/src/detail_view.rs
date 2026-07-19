@@ -23,8 +23,8 @@ use markdown::{Markdown, MarkdownElement, MarkdownStyle};
 use settings::Settings as _;
 use theme_settings::ThemeSettings;
 use ui::{
-    Checkbox, ContextMenu, ContextMenuEntry, Divider, PopoverMenu, Tab, ToggleState, Tooltip,
-    prelude::*,
+    Checkbox, ContextMenu, ContextMenuEntry, Divider, PopoverMenu, ScrollAxes, Scrollbars, Tab,
+    ToggleState, Tooltip, WithScrollbar, prelude::*,
 };
 use workspace::Workspace;
 
@@ -1539,24 +1539,36 @@ impl InboxDetailView {
             .into_any_element()
     }
 
-    fn render_body(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_body(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let last_index = self.document.blocks().len().saturating_sub(1);
 
         let mut body = v_flex()
             .id("inbox-detail-body")
-            .flex_1()
-            .min_h_0()
+            .size_full()
             .overflow_y_scroll()
             .track_scroll(&self.scroll_handle)
-            .border_t_1()
-            .border_color(cx.theme().colors().border_variant)
             .px_2()
             .py_3();
         for index in 0..self.document.blocks().len() {
             let block = &self.document.blocks()[index];
             body = body.child(self.render_block(block, index == last_index, window, cx));
         }
-        body
+        // Two layers, as in the panel's list: the outer container hosts the
+        // scrollbar overlay and does not scroll itself.
+        v_flex()
+            .id("inbox-detail-body-scroll")
+            .flex_1()
+            .min_h_0()
+            .border_t_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(body)
+            .custom_scrollbars(
+                Scrollbars::new(ScrollAxes::Vertical)
+                    .tracked_scroll_handle(&self.scroll_handle)
+                    .tracked_entity(cx.entity_id()),
+                window,
+                cx,
+            )
     }
 
     /// The slash menu popup, anchored to the bottom-left of the edited
