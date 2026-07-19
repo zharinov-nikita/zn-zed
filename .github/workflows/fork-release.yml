@@ -1,0 +1,66 @@
+# zn-zed fork: builds an unsigned Windows installer on every push to main and
+# publishes it as a GitHub release tagged `nightly-<version>-<sha>`. The
+# auto-updater (crates/auto_update/src/fork_updates.rs) reads the latest
+# release and parses the commit sha out of the tag.
+name: fork-release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: true
+
+jobs:
+  bundle-windows-x86_64:
+    runs-on: windows-2022
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set release channel to nightly
+        shell: pwsh
+        run: Set-Content -Path crates/zed/RELEASE_CHANNEL -Value nightly -NoNewline
+
+      - name: Ensure Inno Setup 6
+        shell: pwsh
+        run: if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+
+      - name: Log disk space
+        shell: pwsh
+        run: Get-PSDrive -PSProvider FileSystem
+
+      - name: Bundle
+        shell: pwsh
+        run: script/bundle-windows.ps1 -Architecture x86_64
+        env:
+          # Neutralizes the signing/Azure gates in bundle-windows.ps1 and
+          # zed.iss, which are all `$env:CI` truthiness checks.
+          CI: ""
+          ZED_COMMIT_SHA: ${{ github.sha }}
+          CARGO_INCREMENTAL: "0"
+
+      - name: Compute version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = ((cargo metadata --no-deps --offline | ConvertFrom-Json).packages | Where-Object name -eq zed).version
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "nightly-${{ steps.ver.outputs.version }}-${{ github.sha }}"
+          gh release create $tag `
+            target/Zed-x86_64.exe `
+            target/zed-remote-server-windows-x86_64.zip `
+            --title "Zed Nightly $tag" `
+            --latest `
+            --notes "Automated build of ${{ github.sha }}"
