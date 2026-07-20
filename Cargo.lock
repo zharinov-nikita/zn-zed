@@ -9069,6 +9069,7 @@ dependencies = [
  "fuzzy",
  "git",
  "gpui",
+ "http_client",
  "image",
  "language",
  "log",

@@ -185,8 +185,9 @@ fn section_label(text: &'static str) -> Label {
 impl InboxPanel {
     pub(crate) fn open_type_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // The type editor and the detail view overlays are mutually
-        // exclusive: opening one closes the other.
+        // exclusive: opening one closes the others.
         self.detail = None;
+        self.issue_detail = None;
         if self.type_editor.is_none() {
             let store = self.store.clone();
             self.type_editor = Some(TypeEditorState::new(&store, window, cx));

@@ -1,9 +1,11 @@
 pub mod attachment;
 pub mod block;
 pub mod detail_view;
+pub mod github_issues;
 pub mod inbox_model;
 mod inbox_panel_settings;
 pub mod inbox_store;
+pub mod issue_detail;
 pub mod markdown_codec;
 pub mod slash_menu;
 mod type_editor;
@@ -33,9 +35,9 @@ use gpui::{
 use project::DirectoryLister;
 use theme_settings::ThemeSettings;
 use ui::{
-    ButtonLike, Checkbox, ContextMenu, ContextMenuEntry, ContextMenuItem, Disclosure, IconPosition,
-    PopoverMenu, ScrollAxes, Scrollbars, Tab, TintColor, ToggleState, Tooltip, WithScrollbar,
-    prelude::*,
+    ButtonLike, Checkbox, CommonAnimationExt as _, ContextMenu, ContextMenuEntry, ContextMenuItem,
+    Disclosure, IconPosition, PopoverMenu, ScrollAxes, Scrollbars, Tab, TintColor, ToggleState,
+    Tooltip, WithScrollbar, prelude::*,
 };
 use workspace::{
     DraggedText, Toast, Workspace,
@@ -48,6 +50,10 @@ use util::paths::PathWithPosition;
 use crate::attachment::{
     AttachmentCompletionProvider, AttachmentSet, OnPick, attach_external_paths,
     handle_attachment_paste, pick_and_attach,
+};
+use crate::github_issues::GithubIssue;
+use crate::issue_detail::{
+    GithubIssueDetailEvent, GithubIssueDetailView, github_label_color, github_label_dot,
 };
 use crate::inbox_model::{
     AttachmentRef, InboxFile, InboxItem, ItemId, MetaField, SortMode, catalog_color, format_age,
@@ -167,6 +173,12 @@ pub struct InboxPanel {
     type_editor: Option<TypeEditorState>,
     /// The detail view overlay of a single item; `Some` while it is open.
     detail: Option<(Entity<InboxDetailView>, Subscription)>,
+    /// The read-only overlay of a single GitHub issue; `Some` while it is
+    /// open. Mutually exclusive with `detail` and `type_editor`.
+    issue_detail: Option<(Entity<GithubIssueDetailView>, Subscription)>,
+    /// Whether the GitHub issues section is expanded. Ephemeral view state,
+    /// collapsed by default like the archive.
+    show_github_issues: bool,
     confirming_delete: Option<(ItemId, Point<Pixels>)>,
     /// Pending confirmation before removing a staged capture attachment.
     confirming_attachment_removal: Option<(AttachmentRef, Point<Pixels>)>,
@@ -445,10 +457,36 @@ fn attachment_chip(
         )
 }
 
-/// The colored square marking a catalog entry (list or tag). The one owner of
-/// the swatch's size/shape, shared by chips, menu rows and drag ghosts.
+/// The one owner of the 7px color marker's size. Two shapes: the square
+/// catalog swatch and the round GitHub label dot (round so GitHub's
+/// arbitrary label colors read as accents, not content).
+pub(crate) fn color_swatch(color: gpui::Hsla, round: bool) -> Div {
+    let swatch = div().flex_none().size(px(7.)).bg(color);
+    if round {
+        swatch.rounded_full()
+    } else {
+        swatch.rounded_xs()
+    }
+}
+
+/// The colored square marking a catalog entry (list or tag), shared by
+/// chips, menu rows and drag ghosts.
 pub(crate) fn catalog_swatch(color: gpui::Hsla) -> Div {
-    div().flex_none().size(px(7.)).rounded_xs().bg(color)
+    color_swatch(color, false)
+}
+
+/// The count badge of a collapsible section header, shared by the catalog
+/// sections, the archive and the GitHub issues header.
+fn section_count_badge(count: usize, cx: &App) -> impl IntoElement {
+    div()
+        .px_1()
+        .rounded_sm()
+        .bg(cx.theme().colors().element_background)
+        .child(
+            Label::new(count.to_string())
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+        )
 }
 
 /// The shared read-only visual for a tag chip: a colored dot and the tag
@@ -702,6 +740,8 @@ impl InboxPanel {
                 panel_active: false,
                 type_editor: None,
                 detail: None,
+                issue_detail: None,
+                show_github_issues: false,
                 confirming_delete: None,
                 confirming_attachment_removal: None,
                 scroll_handle: ScrollHandle::new(),
@@ -754,10 +794,14 @@ impl InboxPanel {
     ) {
         // Any store change can affect an item's rendered Markdown (body, kind,
         // type labels) and the cached row order, so drop both caches
-        // wholesale.
-        self.markdown_cache.borrow_mut().clear();
-        self.list_cache.borrow_mut().take();
+        // wholesale — except for the issues mirror, which lives outside the
+        // inbox document: a background poll tick must not trash them.
+        if !matches!(event, InboxStoreEvent::GithubIssuesUpdated) {
+            self.markdown_cache.borrow_mut().clear();
+            self.list_cache.borrow_mut().take();
+        }
         match event {
+            InboxStoreEvent::GithubIssuesUpdated => cx.notify(),
             InboxStoreEvent::ItemDeleted(id) => {
                 if self
                     .confirming_delete
@@ -789,6 +833,18 @@ impl InboxPanel {
                 // confirmation as well.
                 self.type_editor = None;
                 self.confirming_delete = None;
+                // The issue overlay belongs to the issues *binding*, not the
+                // document: close it only when a rebind reset the mirror
+                // (external document reloads leave the binding Bound).
+                if self
+                    .store
+                    .read(cx)
+                    .github_issues()
+                    .owner_repo()
+                    .is_none()
+                {
+                    self.issue_detail = None;
+                }
                 self.reconcile_catalog_refs(cx);
                 cx.notify();
             }
@@ -816,6 +872,8 @@ impl InboxPanel {
     fn focus_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some((detail, _)) = &self.detail {
             detail.focus_handle(cx).focus(window, cx);
+        } else if let Some((issue_detail, _)) = &self.issue_detail {
+            issue_detail.focus_handle(cx).focus(window, cx);
         } else if self.store.read(cx).has_worktree() {
             self.capture_editor.focus_handle(cx).focus(window, cx);
         }
@@ -825,6 +883,7 @@ impl InboxPanel {
     /// type editor if it was open.
     fn open_detail(&mut self, id: ItemId, window: &mut Window, cx: &mut Context<Self>) {
         self.type_editor = None;
+        self.issue_detail = None;
         self.confirming_delete = None;
         let detail = cx.new(|cx| {
             InboxDetailView::new(self.store.clone(), id, self.workspace.clone(), window, cx)
@@ -2403,17 +2462,7 @@ impl InboxPanel {
                     .weight(FontWeight::BOLD)
                     .color(Color::Muted),
             )
-            .child(
-                div()
-                    .px_1()
-                    .rounded_sm()
-                    .bg(cx.theme().colors().element_background)
-                    .child(
-                        Label::new(count.to_string())
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    ),
-            )
+            .child(section_count_badge(count, cx))
     }
 
     fn render_archive_header(&self, count: usize, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2689,6 +2738,11 @@ impl InboxPanel {
         let archive_count = cleared.len() + archived.len();
         let archive_exists = !rows.cleared.is_empty() || !rows.archived.is_empty();
         let now = now_unix();
+        // The GitHub issues section is absent (not merely empty) without a
+        // github.com binding or cached issues, and while disabled.
+        let issues_section = (InboxPanelSettings::get_global(cx).github_issues_enabled
+            && self.store.read(cx).github_issues().is_visible())
+        .then(|| self.render_github_issues_section(now, cx));
 
         let open_rows = match self.view_mode {
             ViewMode::All => open
@@ -2746,7 +2800,8 @@ impl InboxPanel {
                     .when(archive_exists, |this| {
                         this.child(self.render_archive_header(archive_count, cx))
                             .children(archive_rows)
-                    }),
+                    })
+                    .children(issues_section),
             )
             .custom_scrollbars(
                 Scrollbars::new(ScrollAxes::Vertical)
@@ -2755,6 +2810,223 @@ impl InboxPanel {
                 window,
                 cx,
             )
+    }
+
+    /// The "GITHUB ISSUES" section: a collapsible read-only mirror of the
+    /// repository's open issues, rendered after the archive. Hand-rolled
+    /// header (not [`Self::render_section_header`]) because it carries
+    /// trailing controls: the freshness tooltip and the refresh button.
+    fn render_github_issues_section(&self, now: i64, cx: &mut Context<Self>) -> AnyElement {
+        let expanded = self.show_github_issues;
+        let state = self.store.read(cx).github_issues();
+        let issue_count = state.issues().len();
+        // An `Arc` handle, not a deep copy: rows borrow from it, and it ends
+        // the `store.read` borrow that `cx.listener` calls below would
+        // otherwise conflict with. Only taken when the rows actually render.
+        let issues = expanded.then(|| state.issues_arc());
+        let loading = state.loading();
+        let loading_more = state.loading_more();
+        let has_more = state.has_more();
+        let error = state.error().map(str::to_string);
+        let freshness = state.freshness_line(now);
+
+        let refresh_control = if loading {
+            Icon::new(IconName::ArrowCircle)
+                .size(IconSize::Small)
+                .color(Color::Muted)
+                .with_rotate_animation(2)
+                .into_any_element()
+        } else {
+            IconButton::new("inbox-issues-refresh", IconName::RotateCw)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .tooltip(Tooltip::text(format!("Refresh — {freshness}")))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.store
+                        .update(cx, |store, cx| store.refresh_github_issues(true, cx));
+                }))
+                .into_any_element()
+        };
+
+        let header = h_flex()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .child(
+                h_flex()
+                    .id("inbox-github-issues-header")
+                    .flex_1()
+                    .gap_1()
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_github_issues = !this.show_github_issues;
+                        cx.notify();
+                    }))
+                    .child(Disclosure::new("inbox-github-issues-disclosure", expanded))
+                    .child(
+                        Icon::new(IconName::Github)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new("GITHUB ISSUES")
+                            .size(LabelSize::XSmall)
+                            .weight(FontWeight::BOLD)
+                            .color(Color::Muted),
+                    )
+                    .child(section_count_badge(issue_count, cx)),
+            )
+            .child(refresh_control);
+
+        let mut section = v_flex().child(header);
+        if let Some(error) = error {
+            // The error annotates the (possibly cached) list, which keeps
+            // rendering below it.
+            section = section.child(
+                div().px_2().pb_1().child(
+                    Label::new(error)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
+            );
+        }
+        if let Some(issues) = &issues {
+            for issue in issues.iter() {
+                section = section.child(self.render_issue_row(issue, now, cx));
+            }
+            if has_more {
+                section = section.child(
+                    h_flex().px_2().py_1().child(
+                        Button::new(
+                            "inbox-issues-show-more",
+                            if loading_more { "Loading…" } else { "Show more" },
+                        )
+                        .style(ButtonStyle::Subtle)
+                        .label_size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .disabled(loading_more)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.store
+                                .update(cx, |store, cx| store.load_more_github_issues(cx));
+                        })),
+                    ),
+                );
+            }
+        }
+        section.into_any_element()
+    }
+
+    /// One issue row: number, truncated title, label dots, age and author.
+    /// Read-only — the only interaction is opening the detail overlay.
+    fn render_issue_row(&self, issue: &GithubIssue, now: i64, cx: &mut Context<Self>) -> AnyElement {
+        let number = issue.number;
+        let updated = issue.updated_unix();
+        let login = issue.user.as_ref().map(|user| user.login.clone());
+        let label_dots = issue
+            .labels
+            .iter()
+            .map(|label| github_label_dot(github_label_color(&label.color, cx)).into_any_element())
+            .collect::<Vec<_>>();
+
+        h_flex()
+            .id(SharedString::from(format!("inbox-issue-{number}")))
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1p5()
+            .rounded_md()
+            .hover(|style| style.bg(cx.theme().colors().element_hover))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, window, cx| {
+                // Look the issue up at click time (capturing just the number
+                // keeps the closure from deep-copying issue bodies every
+                // frame); a refresh may have dropped it meanwhile — then the
+                // click is a no-op.
+                let issue = this
+                    .store
+                    .read(cx)
+                    .github_issues()
+                    .issues()
+                    .iter()
+                    .find(|issue| issue.number == number)
+                    .cloned();
+                if let Some(issue) = issue {
+                    this.open_issue_detail(issue, window, cx);
+                }
+            }))
+            .child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .font_buffer(cx)
+                    .text_color(cx.theme().colors().text_placeholder)
+                    .child(format!("#{number}")),
+            )
+            .child(
+                div().flex_1().min_w_0().child(
+                    Label::new(issue.title.clone())
+                        .size(LabelSize::Default)
+                        .truncate(),
+                ),
+            )
+            .when(!label_dots.is_empty(), |this| {
+                this.child(h_flex().flex_none().gap_0p5().children(label_dots))
+            })
+            .when_some(updated, |this, updated| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .font_buffer(cx)
+                        .text_color(cx.theme().colors().text_placeholder)
+                        .child(format_age(updated, now)),
+                )
+            })
+            .when_some(login, |this, login| {
+                this.child(
+                    Label::new(format!("@{login}"))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// Opens the read-only detail overlay of one GitHub issue, closing the
+    /// other overlays.
+    fn open_issue_detail(&mut self, issue: GithubIssue, window: &mut Window, cx: &mut Context<Self>) {
+        self.type_editor = None;
+        self.detail = None;
+        self.confirming_delete = None;
+        let view = cx.new(|cx| GithubIssueDetailView::new(&self.store, issue, cx));
+        let subscription = cx.subscribe_in(
+            &view,
+            window,
+            |this, _, event: &GithubIssueDetailEvent, window, cx| match event {
+                GithubIssueDetailEvent::Closed => {
+                    this.issue_detail = None;
+                    this.focus_handle.focus(window, cx);
+                    cx.notify();
+                }
+            },
+        );
+        view.focus_handle(cx).focus(window, cx);
+        self.issue_detail = Some((view, subscription));
+        cx.notify();
+    }
+
+    /// The full-panel GitHub issue overlay, or `None` while it is closed.
+    fn render_issue_detail_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (issue_detail, _) = self.issue_detail.as_ref()?;
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .occlude()
+                .bg(cx.theme().colors().panel_background)
+                .child(issue_detail.clone())
+                .into_any_element(),
+        )
     }
 
     /// The full-panel detail view overlay, or `None` while it is closed.
@@ -2890,6 +3162,7 @@ impl Render for InboxPanel {
             })
             .children(self.render_type_editor(window, cx))
             .children(self.render_detail_overlay(cx))
+            .children(self.render_issue_detail_overlay(cx))
             .children(self.render_delete_confirmation(cx))
             .children(self.render_attachment_removal_confirmation(cx))
     }

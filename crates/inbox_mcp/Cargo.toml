@@ -26,6 +26,7 @@ release_channel.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+settings.workspace = true
 tiny_http.workspace = true
 util.workspace = true
 

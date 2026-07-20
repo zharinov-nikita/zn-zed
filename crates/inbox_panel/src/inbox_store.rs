@@ -19,6 +19,7 @@ use crate::inbox_model::{
     AttachmentRef, CATALOG_COLOR_TOKENS, CatalogEntry, CatalogKind, InboxFile, InboxItem, ItemId,
     SortMode, new_item_id, now_unix, now_unix_millis,
 };
+use crate::inbox_panel_settings::{InboxPanelSettings, Settings as _};
 
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(250);
 
@@ -26,8 +27,10 @@ const SAVE_DEBOUNCE: Duration = Duration::from_millis(250);
 const BACKUP_KEEP: usize = 10;
 
 /// Namespace of the inbox entries in Zed's scoped key-value store; the key
-/// within it identifies the project (see [`project_key`]).
-const INBOX_KV_NAMESPACE: &str = "inbox_panel";
+/// within it identifies the project (see [`project_key`]). Also hosts the
+/// GitHub issues cache under a distinct key shape (see
+/// [`crate::github_issues`]).
+pub(crate) const INBOX_KV_NAMESPACE: &str = "inbox_panel";
 
 /// Version pinned into every write. Loads refuse a document written by a
 /// newer Zed so an older build can't destroy data it doesn't understand.
@@ -115,6 +118,10 @@ pub enum InboxStoreEvent {
     Changed,
     Reloaded,
     ItemDeleted(ItemId),
+    /// The GitHub issues mirror changed (fetch started/landed, cache
+    /// adopted). Issues live outside the inbox document, so this must NOT
+    /// invalidate any item-derived caches.
+    GithubIssuesUpdated,
 }
 
 /// Merges `snapshot` into `state` non-destructively: items and catalog
@@ -183,16 +190,25 @@ enum ReloadOutcome {
 /// entry per project. Legacy `.zed/inbox.json` files are imported once and
 /// left untouched.
 pub struct InboxStore {
-    project: Entity<Project>,
+    // `pub(crate)` fields are shared with the sibling `github_issues` module,
+    // whose store operations live in a second `impl InboxStore` block there.
+    pub(crate) project: Entity<Project>,
     fs: Arc<dyn Fs>,
-    key_value_store: KeyValueStore,
+    pub(crate) key_value_store: KeyValueStore,
     state: InboxFile,
-    worktree_id: Option<WorktreeId>,
+    pub(crate) worktree_id: Option<WorktreeId>,
     /// KV key of the bound worktree's project, cached while the worktree is
     /// alive: on a `WorktreeRemoved` event the worktree is already gone from
     /// the project, but a pending edit must still be flushed to the entry it
     /// owned. The backup directory is derived via [`backup_dir_for_key`].
-    bound_project_key: Option<String>,
+    pub(crate) bound_project_key: Option<String>,
+    /// The read-only GitHub issues mirror; all operations live in
+    /// [`crate::github_issues`].
+    pub(crate) github_issues: crate::github_issues::GithubIssuesState,
+    /// True from the start of a worktree rebind until its (possibly
+    /// flush-deferred) reload has re-derived `bound_project_key`. Guards
+    /// `bind_github_issues` against binding through a stale project key.
+    pub(crate) rebinding: bool,
     load_error: Option<String>,
     /// Set when the most recent debounced save failed to write to the
     /// database. The mutation stays `dirty` in that case so it keeps being
@@ -233,6 +249,41 @@ impl EventEmitter<InboxStoreEvent> for InboxStore {}
 impl InboxStore {
     pub fn new(project: Entity<Project>, fs: Arc<dyn Fs>, cx: &mut Context<Self>) -> Self {
         let subscription = cx.subscribe(&project, Self::handle_project_event);
+        // Remote URLs are populated asynchronously after the repo scan, so
+        // the GitHub issues binding retries on git-store events until it
+        // resolves (see `bind_github_issues`). `NoGithubRemote` re-probes
+        // too — cheap, and it picks up an `origin` switched to github.com.
+        let git_store_subscription =
+            cx.subscribe(&project.read(cx).git_store().clone(), |this, _, event, cx| {
+                match event {
+                    project::git_store::GitStoreEvent::RepositoryAdded
+                    | project::git_store::GitStoreEvent::RepositoryUpdated(..) => {
+                        if !matches!(
+                            this.github_issues.binding(),
+                            crate::github_issues::GithubBinding::Bound { .. }
+                        ) {
+                            this.bind_github_issues(cx);
+                        }
+                    }
+                    _ => {}
+                }
+            });
+        // Makes `github_issues.enabled` live: enabling binds (and starts the
+        // poll) without waiting for an unrelated git event or a restart;
+        // disabling tears the mirror down and hides the section.
+        let settings_subscription = cx.observe_global::<settings::SettingsStore>(|this, cx| {
+            let enabled = InboxPanelSettings::get_global(cx).github_issues_enabled;
+            let bound = !matches!(
+                this.github_issues.binding(),
+                crate::github_issues::GithubBinding::Unresolved
+            );
+            if enabled && !bound {
+                this.bind_github_issues(cx);
+            } else if !enabled && bound {
+                this.reset_github_issues();
+                cx.emit(InboxStoreEvent::GithubIssuesUpdated);
+            }
+        });
         let worktree_id = project
             .read(cx)
             .visible_worktrees(cx)
@@ -245,6 +296,8 @@ impl InboxStore {
             state: InboxFile::default(),
             worktree_id,
             bound_project_key: None,
+            github_issues: Default::default(),
+            rebinding: false,
             load_error: None,
             save_error: None,
             dirty: false,
@@ -255,10 +308,13 @@ impl InboxStore {
             pending_writes: 0,
             load_generation: 0,
             pending_save: Task::ready(()),
-            _subscriptions: vec![subscription],
+            _subscriptions: vec![subscription, git_store_subscription, settings_subscription],
         };
         InboxStoreRegistry::register(cx.weak_entity(), cx);
         this.reload(cx);
+        // After `reload`: the binding derivation needs the
+        // `bound_project_key` that `reload` sets synchronously.
+        this.bind_github_issues(cx);
         this
     }
 
@@ -313,6 +369,14 @@ impl InboxStore {
         self.save_error = None;
         self.last_seen_text = None;
         self.restore_dismissed = false;
+        // Kills the poll timer and invalidates in-flight fetches; the
+        // binding is re-derived for the new worktree after the reload.
+        // `rebinding` blocks git-event-triggered binds until the reload has
+        // re-derived `bound_project_key` — otherwise a repo scan finishing
+        // inside the flush window would bind the new repo through the old
+        // project's cache key.
+        self.reset_github_issues();
+        self.rebinding = true;
         cx.emit(InboxStoreEvent::Reloaded);
         match flush {
             // The reload must wait for the flush to commit: on a `git init`
@@ -322,10 +386,19 @@ impl InboxStore {
             Some(flush) => cx
                 .spawn(async move |this, cx| {
                     flush.await;
-                    this.update(cx, |this, cx| this.reload(cx)).ok();
+                    this.update(cx, |this, cx| {
+                        this.reload(cx);
+                        this.rebinding = false;
+                        this.bind_github_issues(cx);
+                    })
+                    .ok();
                 })
                 .detach(),
-            None => self.reload(cx),
+            None => {
+                self.reload(cx);
+                self.rebinding = false;
+                self.bind_github_issues(cx);
+            }
         }
     }
 

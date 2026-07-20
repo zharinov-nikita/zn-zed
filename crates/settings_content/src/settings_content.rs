@@ -1161,6 +1161,23 @@ pub struct InboxPanelSettingsContent {
     ///
     /// Default: true
     pub mcp_server: Option<bool>,
+    /// GitHub issues section of the inbox panel.
+    pub github_issues: Option<InboxGithubIssuesSettingsContent>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, PartialEq)]
+pub struct InboxGithubIssuesSettingsContent {
+    /// Whether to show the open GitHub issues of the project's repository as
+    /// a section in the inbox panel (read-only mirror; requires a github.com
+    /// remote).
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
+    /// How often (in minutes) the issues list is refreshed in the background.
+    ///
+    /// Default: 5
+    pub poll_minutes: Option<u64>,
 }
 
 #[derive(
