@@ -27,6 +27,14 @@ jobs:
         shell: pwsh
         run: Set-Content -Path crates/zed/RELEASE_CHANNEL -Value nightly -NoNewline
 
+      - name: Enable long paths
+        # cargo checks out python-environment-tools, whose test fixtures exceed
+        # MAX_PATH; see docs/src/development/windows.md ("path too long").
+        shell: pwsh
+        run: |
+          git config --system core.longpaths true
+          New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force | Out-Null
+
       - name: Ensure Inno Setup 6
         shell: pwsh
         run: if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
