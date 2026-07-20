@@ -9069,6 +9069,7 @@ dependencies = [
  "fuzzy",
  "git",
  "gpui",
+ "image",
  "language",
  "log",
  "markdown",

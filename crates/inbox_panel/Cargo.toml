@@ -22,6 +22,7 @@ fs.workspace = true
 futures.workspace = true
 fuzzy.workspace = true
 gpui.workspace = true
+image.workspace = true
 language.workspace = true
 log.workspace = true
 markdown.workspace = true

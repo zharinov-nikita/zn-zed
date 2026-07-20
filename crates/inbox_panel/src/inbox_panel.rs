@@ -46,7 +46,8 @@ use workspace::{
 use util::paths::PathWithPosition;
 
 use crate::attachment::{
-    AttachmentCompletionProvider, AttachmentSet, OnPick, attach_external_paths, pick_and_attach,
+    AttachmentCompletionProvider, AttachmentSet, OnPick, attach_external_paths,
+    handle_attachment_paste, pick_and_attach,
 };
 use crate::inbox_model::{
     AttachmentRef, InboxFile, InboxItem, ItemId, MetaField, SortMode, catalog_color, format_age,
@@ -710,6 +711,22 @@ impl InboxPanel {
                 _subscriptions: subscriptions,
             }
         })
+    }
+
+    /// Ctrl+V in the capture editor: clipboard images/files become staged
+    /// attachment chips; plain text falls through to the editor's own paste.
+    /// Registered in the capture phase on the capture box wrapper, so it
+    /// runs before the editor's `Paste` handler.
+    fn intercept_capture_paste(
+        &mut self,
+        _: &editor::actions::Paste,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let sink: OnPick = Arc::new(Self::capture_sink(&self.capture_attachments));
+        if handle_attachment_paste(self.workspace.clone(), self.store.clone(), sink, cx) {
+            cx.stop_propagation();
+        }
     }
 
     /// Sink appending a picked attachment to the staged capture set. Shared
@@ -1923,6 +1940,7 @@ impl InboxPanel {
                 .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
                     this.stage_external_attachments(paths.paths(), cx);
                 }))
+                .capture_action(cx.listener(Self::intercept_capture_paste))
                 .bg(cx.theme().colors().editor_background)
                 .rounded_md()
                 .border_1()

@@ -737,6 +737,12 @@ impl InboxStore {
         self.bound_project_key.as_deref()
     }
 
+    /// The store's filesystem handle, shared with helpers that write
+    /// attachment files (pasted images) outside the store's own save path.
+    pub fn fs(&self) -> Arc<dyn Fs> {
+        self.fs.clone()
+    }
+
     /// Absolute root of the bound worktree, if it is still part of the
     /// project.
     pub fn worktree_root(&self, cx: &App) -> Option<Arc<Path>> {

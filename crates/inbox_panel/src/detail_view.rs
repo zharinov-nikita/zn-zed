@@ -29,7 +29,8 @@ use ui::{
 use workspace::Workspace;
 
 use crate::attachment::{
-    AttachmentCompletionProvider, OnPick, attach_external_paths, pick_and_attach,
+    AttachmentCompletionProvider, OnPick, attach_external_paths, handle_attachment_paste,
+    pick_and_attach,
 };
 use crate::block::{Block, BlockDocument, BlockId, BlockType, CaretPos};
 use crate::inbox_model::{AttachmentRef, InboxItem, ItemId, format_age, now_unix};
@@ -171,6 +172,22 @@ impl InboxDetailView {
                     store.add_attachment(&item_id, attachment, cx);
                 })
                 .ok();
+        }
+    }
+
+    /// Ctrl+V in the title or a block editor: clipboard images/files become
+    /// attachments on this item; plain text falls through to the editor's
+    /// own paste. Registered in the capture phase on the view root, so it
+    /// runs before the focused editor's `Paste` handler.
+    fn intercept_paste(
+        &mut self,
+        _: &editor::actions::Paste,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let sink: OnPick = Arc::new(Self::attachment_sink(&self.store, &self.item_id));
+        if handle_attachment_paste(self.workspace.clone(), self.store.clone(), sink, cx) {
+            cx.stop_propagation();
         }
     }
 
@@ -1748,6 +1765,7 @@ impl Render for InboxDetailView {
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
                 this.stage_external_attachments(paths.paths(), cx);
             }))
+            .capture_action(cx.listener(Self::intercept_paste))
             // The item can briefly be gone while the delete event is still in
             // flight; `Closed` is already on its way in that case.
             .when_some(item, |this, item| {
@@ -2094,6 +2112,85 @@ mod tests {
         // The second Escape closes the detail view.
         cx.simulate_keystrokes("escape");
         assert_eq!(closed.get(), 1);
+    }
+
+    /// Binds Ctrl+V the way the default keymaps do, so a paste dispatches
+    /// `editor::Paste` through the view's capture-phase interception.
+    fn bind_paste(cx: &mut VisualTestContext) {
+        cx.update(|_, cx| {
+            cx.bind_keys([KeyBinding::new(
+                "ctrl-v",
+                editor::actions::Paste,
+                Some("Editor"),
+            )])
+        });
+    }
+
+    fn item_attachments(
+        store: &Entity<InboxStore>,
+        item_id: &ItemId,
+        cx: &mut VisualTestContext,
+    ) -> Vec<AttachmentRef> {
+        store.read_with(cx, |store, _| {
+            store.item(item_id).unwrap().attachments.clone()
+        })
+    }
+
+    /// The text of the block editor currently being edited.
+    fn editing_text(view: &Entity<InboxDetailView>, cx: &mut VisualTestContext) -> String {
+        view.read_with(cx, |view, cx| {
+            view.editing
+                .as_ref()
+                .expect("a block should be edited")
+                .editor
+                .read(cx)
+                .text(cx)
+        })
+    }
+
+    #[gpui::test]
+    async fn test_paste_image_attaches_to_item_without_inserting_text(cx: &mut TestAppContext) {
+        let (store, item_id, view, cx) = build_detail_view(Some("Body"), cx).await;
+        bind_paste(cx);
+        begin_editing(&view, cx, 0, CaretPos::End);
+
+        cx.update(|_, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_image(&gpui::Image::from_bytes(
+                gpui::ImageFormat::Png,
+                vec![1, 2, 3],
+            )))
+        });
+        cx.simulate_keystrokes("ctrl-v");
+        cx.run_until_parked();
+
+        let attachments = item_attachments(&store, &item_id, cx);
+        assert_eq!(attachments.len(), 1, "{attachments:?}");
+        assert!(
+            matches!(
+                &attachments[0],
+                AttachmentRef::External { path } if path.contains("inbox_attachments")
+            ),
+            "{:?}",
+            attachments[0]
+        );
+        // The paste must not also insert text into the live block editor.
+        assert_eq!(editing_text(&view, cx), "Body");
+    }
+
+    #[gpui::test]
+    async fn test_paste_text_falls_through_to_editor(cx: &mut TestAppContext) {
+        let (store, item_id, view, cx) = build_detail_view(Some("Body"), cx).await;
+        bind_paste(cx);
+        begin_editing(&view, cx, 0, CaretPos::End);
+
+        cx.update(|_, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("!".into()));
+        });
+        cx.simulate_keystrokes("ctrl-v");
+        cx.run_until_parked();
+
+        assert_eq!(editing_text(&view, cx), "Body!");
+        assert!(item_attachments(&store, &item_id, cx).is_empty());
     }
 
     #[gpui::test]
