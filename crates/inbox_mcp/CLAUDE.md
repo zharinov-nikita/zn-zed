@@ -76,8 +76,8 @@ cargo test -p inbox_mcp      # dispatcher + tool tests (gpui::test + FakeFs)
   clobber the write.
 - Store lookups go through weak handles (`InboxStoreRegistry`), upgraded per
   call: a closed window surfaces as a tool error, never a panic. Two windows
-  on the same worktree share one KV key; only the first registered store is
-  used.
+  on the same project (same repo identity / worktree key) share one KV
+  entry; only the first registered store is used.
 - Mutating tools validate `kind`/tag keys against the catalogs and item ids
   against the store first — the underlying store mutations silently no-op on
   unknown ids and the panel silently hides dangling keys, which would read
