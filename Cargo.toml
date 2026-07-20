@@ -1041,19 +1041,15 @@ time_format = { codegen-units = 1 }
 ui_input = { codegen-units = 1 }
 zed_actions = { codegen-units = 1 }
 
-# zn-zed fork: this fork ships nightly builds only, so we trade a little
-# runtime performance for a much shorter build. `codegen-units = 1` plus
-# thin LTO was the dominant cost in fork-release (~2.5h). `line-tables-only`
-# keeps the .pdb files that script/bundle-windows.ps1 archives while cutting
-# link time. Upstream values were: debug = "limited", lto = "thin",
-# codegen-units = 1.
+# zn-zed fork: tuned for runtime speed over build time, since fork-release
+# now runs on a self-hosted machine where a long build costs nothing but
+# wall-clock. Two deviations from upstream, both trading build time for
+# performance: `lto = "fat"` instead of "thin", and no codegen-units override
+# for the zed crate itself.
 [profile.release]
-debug = "line-tables-only"
-lto = false
-codegen-units = 16
-
-[profile.release.package]
-zed = { codegen-units = 16 }
+debug = "limited"
+lto = "fat"
+codegen-units = 1
 
 [profile.release-fast]
 inherits = "release"
