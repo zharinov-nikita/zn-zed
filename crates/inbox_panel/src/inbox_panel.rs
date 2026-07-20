@@ -156,6 +156,10 @@ pub struct InboxPanel {
     /// Type keys of the groups collapsed in the grouped view.
     collapsed_groups: HashSet<String>,
     show_archive: bool,
+    /// Whether the panel is the visible member of its dock (`Panel::set_active`).
+    /// The window-activation refresh is gated on it: a hidden panel renders
+    /// nothing, so reloading for it on every alt-tab would be wasted I/O.
+    panel_active: bool,
     /// State of the type editor overlay; `Some` while it is open. Mutually
     /// exclusive with `detail`: opening one closes the other.
     type_editor: Option<TypeEditorState>,
@@ -659,6 +663,15 @@ impl InboxPanel {
                 cx.on_focus_out(&editor_focus_handle, window, |_, _, _, cx| cx.notify()),
                 // Re-render the staged attachment chips when the set changes.
                 cx.observe(&capture_attachments, |_, _, cx| cx.notify()),
+                // Another window on the same repo may have saved under our
+                // key; pick its edits up when this window regains focus.
+                // Only while the panel is visible — a hidden panel refreshes
+                // when it opens (`set_active`) instead.
+                cx.observe_window_activation(window, |this, window, cx| {
+                    if window.is_window_active() && this.panel_active {
+                        this.store.update(cx, |store, cx| store.refresh(cx));
+                    }
+                }),
             ];
 
             let age_refresh = cx.spawn(async move |this, cx| {
@@ -683,6 +696,7 @@ impl InboxPanel {
                 view_mode: ViewMode::All,
                 collapsed_groups: HashSet::default(),
                 show_archive: false,
+                panel_active: false,
                 type_editor: None,
                 detail: None,
                 confirming_delete: None,
@@ -2806,6 +2820,15 @@ impl Panel for InboxPanel {
 
     fn activation_priority(&self) -> u32 {
         4
+    }
+
+    fn set_active(&mut self, active: bool, _: &mut Window, cx: &mut Context<Self>) {
+        self.panel_active = active;
+        // Opening the panel (e.g. after working in another window on the
+        // same repo) must show the latest stored document.
+        if active {
+            self.store.update(cx, |store, cx| store.refresh(cx));
+        }
     }
 
     fn hide_button_setting(&self, _: &App) -> Option<workspace::HideStatusItem> {

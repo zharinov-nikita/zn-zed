@@ -8,8 +8,8 @@ use collections::HashSet;
 use db::kvp::KeyValueStore;
 use fs::{Fs, RemoveOptions};
 use futures::StreamExt as _;
-use gpui::{AppContext as _, Context, Entity, EventEmitter, Subscription, Task, TaskExt as _};
-use project::{Project, WorktreeId};
+use gpui::{AppContext as _, Context, Entity, EventEmitter, Subscription, Task};
+use project::{Project, Worktree, WorktreeId};
 use sha2::{Digest as _, Sha256};
 use util::ResultExt as _;
 
@@ -31,15 +31,45 @@ const INBOX_KV_NAMESPACE: &str = "inbox_panel";
 /// newer Zed so an older build can't destroy data it doesn't understand.
 const CURRENT_INBOX_VERSION: u32 = 1;
 
-/// Key of a project's entry in the scoped key-value store: a hash of the
-/// worktree root, so different projects never collide. The backup ring uses
-/// the same key, keeping a project's backups findable even when its stored
-/// entry is corrupt.
-fn project_key(worktree_root: &Path) -> String {
+/// Key of a project's entry in the scoped key-value store: a hash of an
+/// identity path (see [`compute_keys`]), so different projects never
+/// collide. The backup ring uses the same key, keeping a project's backups
+/// findable even when its stored entry is corrupt.
+fn project_key(identity_path: &Path) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(worktree_root.to_string_lossy().as_bytes());
+    hasher.update(identity_path.to_string_lossy().as_bytes());
     let key = format!("{:x}", hasher.finalize());
     key[..16].to_string()
+}
+
+/// The KV keys of a bound worktree.
+struct BoundKeys {
+    /// Key the store reads and writes. Derived from the repository's common
+    /// git dir when the worktree root is inside a git repository — one key
+    /// shared by the main checkout, all its linked `git worktree`s, and any
+    /// subdirectory of the repo opened as a project root — and from the
+    /// worktree root path otherwise. Both paths arrive sanitized (and, for
+    /// gitfile-based worktrees, canonicalized) from the worktree layer, so
+    /// no extra normalization is needed before hashing.
+    primary: String,
+    /// The pre-repo-identity path-based key, present only when `primary` is
+    /// repo-based; checked once per load to auto-migrate data saved by a
+    /// build that keyed entries by the worktree path.
+    migration_source: Option<String>,
+}
+
+fn compute_keys(worktree: &Worktree) -> BoundKeys {
+    let path_key = project_key(&worktree.abs_path());
+    match worktree.root_repo_common_dir() {
+        Some(common_dir) => BoundKeys {
+            primary: project_key(common_dir),
+            migration_source: Some(path_key),
+        },
+        None => BoundKeys {
+            primary: path_key,
+            migration_source: None,
+        },
+    }
 }
 
 /// Directory holding a project's out-of-repo backups. Lives under Zed's
@@ -99,11 +129,18 @@ enum ReloadOutcome {
     /// The stored value could not be read, or was read but is not valid JSON
     /// for our schema; the error text carries the distinction.
     Failed(String),
-    /// The stored value parsed successfully. Boxed to keep the enum small.
-    Loaded(Box<InboxFile>),
+    /// The stored value parsed successfully. Boxed to keep the enum small;
+    /// the raw text rides along so an unchanged document can be recognized
+    /// byte-for-byte (parsing regenerates missing ids, so the parsed states
+    /// of two loads of the same document need not compare equal).
+    Loaded { state: Box<InboxFile>, text: String },
     /// No entry exists in the key-value store, but a legacy `.zed/inbox.json`
     /// parsed successfully; adopting it schedules a save that imports it.
     LegacyImported(Box<InboxFile>),
+    /// No entry exists under the repo-based key, but the pre-repo-identity
+    /// path-based key holds a valid document; adopting it schedules a save
+    /// that migrates it. The old entry is left in place as a backup.
+    MigratedFromPathKey(Box<InboxFile>),
     /// The stored value was written by a newer Zed (`version` above ours);
     /// it must be neither loaded nor offered for a downgrading restore.
     NewerVersion,
@@ -137,6 +174,24 @@ pub struct InboxStore {
     /// Monotonic counter that keeps backup filenames unique within a session,
     /// even for two saves that land in the same millisecond.
     backup_seq: u64,
+    /// The raw stored text this store last loaded or wrote. A refresh whose
+    /// read returns the same bytes is a no-op — immune to the id/`created`
+    /// regeneration and version stamping that make parsed-state comparison
+    /// unreliable.
+    last_seen_text: Option<String>,
+    /// Set when the user dismisses a recovery offer; stops focus-triggered
+    /// refreshes from resurrecting the same offer on every activation.
+    /// Cleared on rebind.
+    restore_dismissed: bool,
+    /// KV writes currently in flight for the bound entry (the debounce
+    /// optimistically clears `dirty` before its write commits, and the
+    /// rebind flush must finish before the next load's migration probe).
+    /// `refresh` is skipped while non-zero so a read can't overtake a write
+    /// and revert the UI to a pre-edit document.
+    pending_writes: usize,
+    /// Invalidates in-flight reloads: a slow load spawned for a previous
+    /// binding must not land on top of a newer one's state.
+    load_generation: u64,
     pending_save: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -163,6 +218,10 @@ impl InboxStore {
             dirty: false,
             restorable: None,
             backup_seq: 0,
+            last_seen_text: None,
+            restore_dismissed: false,
+            pending_writes: 0,
+            load_generation: 0,
             pending_save: Task::ready(()),
             _subscriptions: vec![subscription],
         };
@@ -180,26 +239,36 @@ impl InboxStore {
             project::Event::WorktreeAdded(_) | project::Event::WorktreeRemoved(_) => {
                 self.rebind_worktree(cx);
             }
+            // The bound worktree's git identity changed: a repo was
+            // discovered after open (subdirectory projects), `git init` ran,
+            // or `.git` disappeared. The entry key follows it.
+            project::Event::WorktreeUpdatedRootRepoCommonDir(worktree_id)
+                if Some(*worktree_id) == self.worktree_id =>
+            {
+                self.rebind_worktree(cx);
+            }
             _ => {}
         }
     }
 
     fn rebind_worktree(&mut self, cx: &mut Context<Self>) {
-        let worktree_id = self
-            .project
-            .read(cx)
-            .visible_worktrees(cx)
-            .next()
-            .map(|worktree| worktree.read(cx).id());
-        if worktree_id == self.worktree_id {
+        let worktree = self.project.read(cx).visible_worktrees(cx).next();
+        let worktree_id = worktree.as_ref().map(|worktree| worktree.read(cx).id());
+        let primary_key = worktree.map(|worktree| compute_keys(worktree.read(cx)).primary);
+        // Same worktree under the same key is a no-op; a changed key with an
+        // unchanged worktree (git identity appeared or vanished) rebinds just
+        // like a worktree switch.
+        if worktree_id == self.worktree_id && primary_key == self.bound_project_key {
             return;
         }
-        if self.dirty {
+        let flush = if self.dirty {
             // The pending debounced save would run after the switch, see
             // `dirty == false` and silently drop the edit; write it to the
             // outgoing project's entry now, while its key is still bound.
-            self.flush_state_to_database(cx);
-        }
+            self.flush_state_to_database(cx)
+        } else {
+            None
+        };
         self.worktree_id = worktree_id;
         // Reset to a clean slate before reloading: carrying the old
         // worktree's items across would leak them into the new project (and
@@ -209,29 +278,52 @@ impl InboxStore {
         self.restorable = None;
         self.load_error = None;
         self.save_error = None;
+        self.last_seen_text = None;
+        self.restore_dismissed = false;
         cx.emit(InboxStoreEvent::Reloaded);
-        self.reload(cx);
+        match flush {
+            // The reload must wait for the flush to commit: on a `git init`
+            // rebind the load's migration probe reads the very entry the
+            // flush is writing, and the KV store gives no ordering between a
+            // queued write and a read from another thread.
+            Some(flush) => cx
+                .spawn(async move |this, cx| {
+                    flush.await;
+                    this.update(cx, |this, cx| this.reload(cx)).ok();
+                })
+                .detach(),
+            None => self.reload(cx),
+        }
     }
 
     /// Immediately writes the current state to the bound project's entry and
-    /// backup ring, bypassing the save debounce. Fire-and-forget: the store
-    /// may be rebinding away from this worktree, so failures are only logged.
-    fn flush_state_to_database(&mut self, cx: &mut Context<Self>) {
+    /// backup ring, bypassing the save debounce. The store may be rebinding
+    /// away from this worktree, so failures are only logged; the returned
+    /// task resolves when the write has committed (or failed).
+    fn flush_state_to_database(&mut self, cx: &mut Context<Self>) -> Option<Task<()>> {
         // The cached key, not a live worktree lookup: on a `WorktreeRemoved`
         // event the worktree is already gone from the project, but the entry
         // it owned must still receive the pending edit.
-        let Some(key) = self.bound_project_key.clone() else {
-            return;
-        };
+        let key = self.bound_project_key.clone()?;
         let backup_seq = self.next_backup_seq();
-        cx.background_spawn(persist_snapshot(
+        self.pending_writes += 1;
+        let write = cx.background_spawn(persist_snapshot(
             self.key_value_store.clone(),
             self.fs.clone(),
             key,
             self.state.clone(),
             backup_seq,
-        ))
-        .detach_and_log_err(cx);
+        ));
+        Some(cx.spawn(async move |this, cx| {
+            let result = write.await;
+            this.update(cx, |this, _| {
+                this.pending_writes = this.pending_writes.saturating_sub(1);
+                if let Err(error) = &result {
+                    log::error!("inbox: failed to flush the outgoing project's entry: {error:#}");
+                }
+            })
+            .ok();
+        }))
     }
 
     /// Allocates the next backup sequence number. One owner for the
@@ -243,12 +335,24 @@ impl InboxStore {
         backup_seq
     }
 
+    /// Re-reads the stored document, e.g. when the window regains focus, so
+    /// edits made in another window under the same key become visible.
+    /// Skipped while local edits are pending or a write is in flight: local
+    /// state is newer than anything stored, and reading concurrently with
+    /// our own write could revert the UI to the pre-edit document (last
+    /// writer wins).
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        if self.dirty || self.pending_writes > 0 {
+            return;
+        }
+        self.reload(cx);
+    }
+
     fn reload(&mut self, cx: &mut Context<Self>) {
-        let worktree_root = self
+        let worktree = self
             .worktree_id
-            .and_then(|worktree_id| self.project.read(cx).worktree_for_id(worktree_id, cx))
-            .map(|worktree| worktree.read(cx).abs_path());
-        let Some(worktree_root) = worktree_root else {
+            .and_then(|worktree_id| self.project.read(cx).worktree_for_id(worktree_id, cx));
+        let Some(worktree) = worktree else {
             self.bound_project_key = None;
             if self.dirty {
                 // Unsaved local mutations win over whatever is stored right
@@ -264,12 +368,17 @@ impl InboxStore {
             }
             return;
         };
-        let key = project_key(&worktree_root);
+        let worktree = worktree.read(cx);
+        let keys = compute_keys(worktree);
+        let key = keys.primary;
+        let migration_source_key = keys.migration_source;
         let backup_dir = backup_dir_for_key(&key);
         self.bound_project_key = Some(key.clone());
+        self.load_generation += 1;
+        let generation = self.load_generation;
         let fs = self.fs.clone();
         let key_value_store = self.key_value_store.clone();
-        let legacy_path = worktree_root.join(".zed").join("inbox.json");
+        let legacy_path = worktree.abs_path().join(".zed").join("inbox.json");
         cx.spawn(async move |this, cx| {
             // Read and parse off the UI thread: a large document would
             // otherwise stall the foreground executor.
@@ -281,6 +390,7 @@ impl InboxStore {
                     load_outcome(
                         &key_value_store,
                         &key,
+                        migration_source_key.as_deref(),
                         &fs_for_load,
                         &legacy_path,
                         &quarantine_dir,
@@ -292,39 +402,68 @@ impl InboxStore {
             // data; a healthy reload never touches the backup ring, and a
             // newer-version document must not surface a downgrading restore.
             let backup = match &outcome {
-                ReloadOutcome::Loaded(_)
+                ReloadOutcome::Loaded { .. }
                 | ReloadOutcome::LegacyImported(_)
+                | ReloadOutcome::MigratedFromPathKey(_)
                 | ReloadOutcome::NewerVersion => None,
                 ReloadOutcome::Missing | ReloadOutcome::Failed(_) => {
                     load_latest_backup(&fs, &backup_dir).await
                 }
             };
-            this.update(cx, |this, cx| this.finish_reload(outcome, backup, cx))
-                .ok();
+            this.update(cx, |this, cx| {
+                this.finish_reload(generation, outcome, backup, cx)
+            })
+            .ok();
         })
         .detach();
     }
 
     fn finish_reload(
         &mut self,
+        generation: u64,
         outcome: ReloadOutcome,
         backup: Option<InboxFile>,
         cx: &mut Context<Self>,
     ) {
+        if generation != self.load_generation {
+            // A newer reload was spawned (e.g. a rebind switched keys) while
+            // this one's read was still running; its outcome belongs to a
+            // binding that no longer exists.
+            return;
+        }
         if self.dirty {
             // Unsaved local mutations win over whatever is stored right now;
             // the pending save will persist them shortly.
             return;
         }
+        if matches!(&outcome, ReloadOutcome::MigratedFromPathKey(_)) {
+            log::info!("inbox: migrated path-keyed data to the repo-based key");
+        }
         match outcome {
-            ReloadOutcome::Loaded(state) => {
+            ReloadOutcome::Loaded { state, text } => {
+                if self.last_seen_text.as_deref() == Some(text.as_str()) {
+                    // The stored document is byte-identical to what this
+                    // store last loaded or wrote: nothing to adopt, and no
+                    // `Reloaded` (the panel resets scroll/selection on it).
+                    // Do clear a banner left by a transient failure — with a
+                    // repaint, or it stays on screen with a dead Restore
+                    // button.
+                    let had_banner = self.load_error.is_some() || self.restorable.is_some();
+                    self.load_error = None;
+                    self.restorable = None;
+                    if had_banner {
+                        cx.emit(InboxStoreEvent::Changed);
+                    }
+                    return;
+                }
+                self.last_seen_text = Some(text);
                 self.adopt_loaded_state(*state, cx);
             }
-            ReloadOutcome::LegacyImported(state) => {
+            ReloadOutcome::LegacyImported(state) | ReloadOutcome::MigratedFromPathKey(state) => {
                 self.adopt_loaded_state(*state, cx);
-                // Persist the imported legacy file through the one normal
-                // mutation path; the file itself is left untouched and never
-                // written again.
+                // Persist through the one normal mutation path; the source
+                // (legacy file or old path-keyed entry) is left untouched
+                // and goes stale from here on.
                 self.on_mutated(cx);
             }
             ReloadOutcome::NewerVersion => {
@@ -339,7 +478,12 @@ impl InboxStore {
             }
             ReloadOutcome::Missing => {
                 self.load_error = None;
+                self.last_seen_text = None;
                 match backup {
+                    // A dismissed offer stays dismissed: without the guard
+                    // every focus-triggered refresh would find the same
+                    // backup and resurrect the banner the user closed.
+                    Some(_) if self.restore_dismissed => {}
                     Some(offer) => {
                         // Don't auto-adopt the backup: offer a restore banner
                         // so a deliberate fresh start isn't silently undone.
@@ -366,12 +510,14 @@ impl InboxStore {
     }
 
     /// Installs a freshly loaded document as the live state, backfilling
-    /// missing `created` timestamps.
+    /// missing `created` timestamps. The unchanged-document fast path lives
+    /// in `finish_reload` (raw-text comparison): by the time a document
+    /// reaches here it is genuinely different from what the store held.
     fn adopt_loaded_state(&mut self, mut state: InboxFile, cx: &mut Context<Self>) {
         backfill_created(&mut state);
-        self.state = state;
         self.load_error = None;
         self.restorable = None;
+        self.state = state;
         cx.emit(InboxStoreEvent::Reloaded);
     }
 
@@ -395,8 +541,10 @@ impl InboxStore {
                     let key = this.bound_project_key.clone()?;
                     // Optimistically clear `dirty`: a mutation landing while
                     // the write is in flight re-marks it and replaces this
-                    // task with a fresh save.
+                    // task with a fresh save. `pending_writes` keeps
+                    // `refresh` from reading concurrently with the write.
                     this.dirty = false;
+                    this.pending_writes += 1;
                     Some((
                         this.key_value_store.clone(),
                         this.fs.clone(),
@@ -413,15 +561,23 @@ impl InboxStore {
                 .background_spawn(persist_snapshot(key_value_store, fs, key, file, backup_seq))
                 .await;
 
-            this.update(cx, |this, cx| match write_result {
-                Ok(()) => this.save_error = None,
-                Err(error) => {
-                    // The write failed: restore `dirty` so the mutation is
-                    // retried on the next edit instead of being silently
-                    // lost.
-                    this.dirty = true;
-                    this.save_error = Some(format!("{error:#}"));
-                    cx.emit(InboxStoreEvent::Changed);
+            this.update(cx, |this, cx| {
+                this.pending_writes = this.pending_writes.saturating_sub(1);
+                match write_result {
+                    Ok(content) => {
+                        this.save_error = None;
+                        // What we just wrote is what a refresh will read
+                        // back; remembering it keeps that round-trip a no-op.
+                        this.last_seen_text = Some(content);
+                    }
+                    Err(error) => {
+                        // The write failed: restore `dirty` so the mutation
+                        // is retried on the next edit instead of being
+                        // silently lost.
+                        this.dirty = true;
+                        this.save_error = Some(format!("{error:#}"));
+                        cx.emit(InboxStoreEvent::Changed);
+                    }
                 }
             })
             .ok();
@@ -583,9 +739,7 @@ impl InboxStore {
         cx: &mut Context<Self>,
     ) -> anyhow::Result<usize> {
         anyhow::ensure!(
-            snapshot
-                .version
-                .is_none_or(|version| version <= CURRENT_INBOX_VERSION),
+            version_supported(&snapshot),
             "the file was exported by a newer version of Zed"
         );
         let item_count_before = self.state.inbox.len() + self.state.archived.len();
@@ -611,11 +765,13 @@ impl InboxStore {
     }
 
     /// Dismisses the recovery offer, leaving whatever the user has built up
-    /// since untouched. Nothing is written until the next real edit.
+    /// since untouched. Nothing is written until the next real edit, and
+    /// later refreshes won't re-offer the declined backup.
     pub fn dismiss_restore(&mut self, cx: &mut Context<Self>) {
         if self.restorable.take().is_none() {
             return;
         }
+        self.restore_dismissed = true;
         self.load_error = None;
         cx.emit(InboxStoreEvent::Changed);
     }
@@ -1020,7 +1176,7 @@ async fn persist_snapshot(
     key: String,
     mut file: InboxFile,
     backup_seq: u64,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     file.version = Some(CURRENT_INBOX_VERSION);
     let should_backup = file.has_content();
     let backup_dir = backup_dir_for_key(&key);
@@ -1030,18 +1186,27 @@ async fn persist_snapshot(
         .write(key, content.clone())
         .await?;
     if should_backup {
-        write_backup(&fs, backup_dir, content, now_unix_millis(), backup_seq).await;
+        write_backup(
+            &fs,
+            backup_dir,
+            content.clone(),
+            now_unix_millis(),
+            backup_seq,
+        )
+        .await;
     }
-    Ok(())
+    Ok(content)
 }
 
-/// Reads and parses the project's stored document, falling back to a legacy
-/// `.zed/inbox.json` when no entry exists yet. An unusable raw value
-/// (corrupt or newer-versioned) is quarantined first, so a later save
-/// overwriting the entry can't destroy it.
+/// Reads and parses the project's stored document, falling back to the
+/// pre-repo-identity path-keyed entry and then to a legacy `.zed/inbox.json`
+/// when no entry exists yet. An unusable raw value (corrupt or
+/// newer-versioned) is quarantined first, so a later save overwriting the
+/// entry can't destroy it.
 async fn load_outcome(
     key_value_store: &KeyValueStore,
     key: &str,
+    migration_source_key: Option<&str>,
     fs: &Arc<dyn Fs>,
     legacy_path: &Path,
     quarantine_dir: &Path,
@@ -1050,6 +1215,32 @@ async fn load_outcome(
         Err(error) => return ReloadOutcome::Failed(format!("{error:#}")),
         Ok(Some(text)) => text,
         Ok(None) => {
+            // A failed or refused probe falls through to `Missing`: it is
+            // another key's entry, so it must be neither quarantined nor
+            // re-saved (migrating a newer-versioned document would downgrade
+            // it), only left in place — but never silently, since for an
+            // upgrading user that entry IS their data.
+            if let Some(source_key) = migration_source_key {
+                match key_value_store.scoped(INBOX_KV_NAMESPACE).read(source_key) {
+                    Ok(None) => {}
+                    Ok(Some(text)) => match serde_json::from_str::<InboxFile>(&text) {
+                        Ok(state) if version_supported(&state) => {
+                            return ReloadOutcome::MigratedFromPathKey(Box::new(state));
+                        }
+                        Ok(_) => log::warn!(
+                            "inbox: pre-migration path-keyed entry was written by a newer \
+                             Zed; leaving it in place unmigrated"
+                        ),
+                        Err(error) => log::warn!(
+                            "inbox: pre-migration path-keyed entry is unparseable, leaving \
+                             it in place: {error}"
+                        ),
+                    },
+                    Err(error) => log::warn!(
+                        "inbox: failed to read the pre-migration path-keyed entry: {error:#}"
+                    ),
+                }
+            }
             if !fs.is_file(legacy_path).await {
                 return ReloadOutcome::Missing;
             }
@@ -1063,13 +1254,10 @@ async fn load_outcome(
         }
     };
     match serde_json::from_str::<InboxFile>(&text) {
-        Ok(state)
-            if state
-                .version
-                .is_none_or(|version| version <= CURRENT_INBOX_VERSION) =>
-        {
-            ReloadOutcome::Loaded(Box::new(state))
-        }
+        Ok(state) if version_supported(&state) => ReloadOutcome::Loaded {
+            state: Box::new(state),
+            text,
+        },
         parsed => {
             write_quarantine(fs, quarantine_dir, text).await;
             match parsed {
@@ -1078,6 +1266,15 @@ async fn load_outcome(
             }
         }
     }
+}
+
+/// Whether a parsed document may be loaded and re-saved by this build. A
+/// `version` above ours must be refused everywhere — loading would show a
+/// lie and re-saving would downgrade it. One owner for the predicate shared
+/// by the load path, the migration probe and import.
+fn version_supported(file: &InboxFile) -> bool {
+    file.version
+        .is_none_or(|version| version <= CURRENT_INBOX_VERSION)
 }
 
 /// Preserves an unusable raw stored value as a single overwrite-in-place
@@ -2283,6 +2480,474 @@ mod tests {
         assert!(
             stored_for_root(cx, Path::new(path!("/other"))).is_none(),
             "nothing may be written for the new worktree without an edit there"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_repo_key_loads_when_git_at_root(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({ ".git": {} })).await;
+        // An entry keyed by the repo's common git dir, as written by another
+        // checkout (e.g. a linked worktree) of the same repository.
+        seed_kv(
+            cx,
+            Path::new(path!("/root/.git")),
+            r#"{ "version": 1, "inbox": [{ "id": "r", "text": "repo-keyed" }] }"#,
+        )
+        .await;
+        let (_project, store) = build_store(fs, cx).await;
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.load_error(), None);
+            assert_eq!(store.items().len(), 1);
+            assert_eq!(store.items()[0].text, "repo-keyed");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_repo_key_saves_when_git_at_root(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({ ".git": {} })).await;
+        let (_project, store) = build_store(fs, cx).await;
+
+        store.update(cx, |store, cx| {
+            store.capture("task".to_string(), None, None, cx);
+        });
+        flush_saves(cx);
+
+        assert!(
+            stored_for_root(cx, Path::new(path!("/root/.git"))).is_some(),
+            "the entry must live under the repo key (hash of the common git dir)"
+        );
+        assert!(
+            stored_for_root(cx, Path::new(path!("/root"))).is_none(),
+            "nothing may be written under the path key when the root is a repo"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_migrates_path_key_data_to_repo_key(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({ ".git": {} })).await;
+        // Data persisted by a build that keyed entries by the worktree path.
+        let old = r#"{ "version": 1, "inbox": [{ "id": "m", "text": "migrated" }] }"#;
+        seed_kv(cx, Path::new(path!("/root")), old).await;
+        let (_project, store) = build_store(fs, cx).await;
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.load_error(), None);
+            assert_eq!(store.items().len(), 1);
+            assert_eq!(store.items()[0].text, "migrated");
+        });
+
+        // The migrated data lands under the repo key through the normal save
+        // path...
+        flush_saves(cx);
+        let stored = stored_for_root(cx, Path::new(path!("/root/.git"))).unwrap();
+        let parsed: InboxFile = serde_json::from_str(&stored).unwrap();
+        assert_eq!(parsed.inbox.len(), 1);
+        assert_eq!(parsed.inbox[0].text, "migrated");
+
+        // ...while the old path-key entry is left untouched as a backup.
+        assert_eq!(
+            stored_for_root(cx, Path::new(path!("/root"))).as_deref(),
+            Some(old)
+        );
+    }
+
+    #[gpui::test]
+    async fn test_repo_key_wins_over_path_key(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({ ".git": {} })).await;
+        seed_kv(
+            cx,
+            Path::new(path!("/root/.git")),
+            r#"{ "version": 1, "inbox": [{ "id": "r", "text": "from repo key" }] }"#,
+        )
+        .await;
+        // A stale pre-migration entry must be shadowed, not merged.
+        seed_kv(
+            cx,
+            Path::new(path!("/root")),
+            r#"{ "version": 1, "inbox": [{ "id": "p", "text": "from path key" }] }"#,
+        )
+        .await;
+        let (_project, store) = build_store(fs, cx).await;
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.items().len(), 1);
+            assert_eq!(store.items()[0].text, "from repo key");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_newer_version_path_key_entry_is_not_migrated(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({ ".git": {} })).await;
+        let newer = r#"{ "version": 99, "inbox": [{ "id": "n", "text": "future" }] }"#;
+        seed_kv(cx, Path::new(path!("/root")), newer).await;
+        let (_project, store) = build_store(fs, cx).await;
+
+        store.read_with(cx, |store, _| {
+            // Migrating (and re-saving as version 1) would downgrade data
+            // written by a newer build; start empty instead.
+            assert_eq!(store.items().len(), 0);
+        });
+        // Even after any wrongly-scheduled debounced save had a chance to
+        // run, the newer entry stays untouched under its old key and nothing
+        // is persisted under the repo key.
+        flush_saves(cx);
+        assert_eq!(
+            stored_for_root(cx, Path::new(path!("/root"))).as_deref(),
+            Some(newer)
+        );
+        assert!(stored_for_root(cx, Path::new(path!("/root/.git"))).is_none());
+    }
+
+    #[gpui::test]
+    async fn test_linked_worktree_shares_repo_key(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/main_repo"), json!({ ".git": {}, "file.txt": "content" }))
+            .await;
+        fs.add_linked_worktree_for_repo(
+            Path::new(path!("/main_repo/.git")),
+            false,
+            git::repository::Worktree {
+                path: std::path::PathBuf::from(path!("/linked_worktree")),
+                ref_name: Some("refs/heads/feature".into()),
+                sha: "abc123".into(),
+                is_main: false,
+                is_bare: false,
+            },
+        )
+        .await;
+        fs.write(path!("/linked_worktree/file.txt").as_ref(), b"content")
+            .await
+            .unwrap();
+
+        // Capture an item in the main checkout...
+        let project = Project::test(fs.clone(), [path!("/main_repo").as_ref() as &Path], cx).await;
+        let fs_dyn: Arc<dyn Fs> = fs.clone();
+        let store = cx.new(|cx| InboxStore::new(project.clone(), fs_dyn.clone(), cx));
+        cx.run_until_parked();
+        store.update(cx, |store, cx| {
+            store.capture("shared".to_string(), None, None, cx);
+        });
+        flush_saves(cx);
+
+        // ...and see it from the linked worktree: both hash the same common
+        // git dir.
+        let linked_project =
+            Project::test(fs.clone(), [path!("/linked_worktree").as_ref() as &Path], cx).await;
+        let linked_store =
+            cx.new(|cx| InboxStore::new(linked_project.clone(), fs_dyn.clone(), cx));
+        cx.run_until_parked();
+        linked_store.read_with(cx, |store, _| {
+            assert_eq!(store.load_error(), None);
+            assert_eq!(store.items().len(), 1);
+            assert_eq!(store.items()[0].text, "shared");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_subdirectory_of_repo_uses_repo_key(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/repo"), json!({ ".git": {}, "sub": { "file.txt": "x" } }))
+            .await;
+        seed_kv(
+            cx,
+            Path::new(path!("/repo/.git")),
+            r#"{ "version": 1, "inbox": [{ "id": "r", "text": "repo-wide" }] }"#,
+        )
+        .await;
+
+        // Open a subdirectory of the repo as the project root. The ancestor
+        // repo is discovered by the scanner a beat after open, so the store
+        // must rebind to the repo key when the event arrives.
+        let project = Project::test(fs.clone(), [path!("/repo/sub").as_ref() as &Path], cx).await;
+        let fs_dyn: Arc<dyn Fs> = fs.clone();
+        let store = cx.new(|cx| InboxStore::new(project.clone(), fs_dyn, cx));
+        cx.run_until_parked();
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.load_error(), None);
+            assert_eq!(
+                store.items().len(),
+                1,
+                "ancestor repo discovery must rebind the store to the repo key"
+            );
+            assert_eq!(store.items()[0].text, "repo-wide");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_git_init_mid_session_migrates_to_repo_key(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({})).await;
+        let (_project, store) = build_store(fs.clone(), cx).await;
+        store.update(cx, |store, cx| {
+            store.capture("survives git init".to_string(), None, None, cx);
+        });
+        flush_saves(cx);
+        assert!(stored_for_root(cx, Path::new(path!("/root"))).is_some());
+
+        // `git init`: a .git directory appears in the open worktree.
+        fs.insert_tree(path!("/root/.git"), json!({})).await;
+        cx.run_until_parked();
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.load_error(), None);
+            assert_eq!(store.items().len(), 1);
+            assert_eq!(store.items()[0].text, "survives git init");
+        });
+        // The data migrated to the repo key through the normal save path.
+        flush_saves(cx);
+        assert!(
+            stored_for_root(cx, Path::new(path!("/root/.git"))).is_some(),
+            "data must migrate to the repo key after git init"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_refresh_picks_up_external_changes(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({})).await;
+        let (_project, store) = build_store(fs, cx).await;
+        store.read_with(cx, |store, _| assert_eq!(store.items().len(), 0));
+
+        // Another window saved a new document under the same key.
+        seed_kv(
+            cx,
+            Path::new(path!("/root")),
+            r#"{ "version": 1, "inbox": [{ "id": "x", "text": "from other window", "created": 100 }] }"#,
+        )
+        .await;
+        store.update(cx, |store, cx| store.refresh(cx));
+        cx.run_until_parked();
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.items().len(), 1);
+            assert_eq!(store.items()[0].text, "from other window");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_refresh_skips_when_dirty(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({})).await;
+        let (_project, store) = build_store(fs, cx).await;
+        store.update(cx, |store, cx| {
+            store.capture("local edit".to_string(), None, None, cx);
+        });
+
+        // While the debounced save is still pending, a refresh (e.g. the
+        // window regaining focus) must not clobber the local edit.
+        seed_kv(
+            cx,
+            Path::new(path!("/root")),
+            r#"{ "version": 1, "inbox": [{ "id": "x", "text": "from other window", "created": 100 }] }"#,
+        )
+        .await;
+        store.update(cx, |store, cx| store.refresh(cx));
+        cx.run_until_parked();
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.items().len(), 1);
+            assert_eq!(store.items()[0].text, "local edit");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_refresh_identical_content_emits_no_events(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({})).await;
+        seed_kv(
+            cx,
+            Path::new(path!("/root")),
+            r#"{ "version": 1, "inbox": [{ "id": "x", "text": "same", "created": 100 }] }"#,
+        )
+        .await;
+        let (_project, store) = build_store(fs, cx).await;
+        let events = track_events(&store, cx);
+
+        store.update(cx, |store, cx| store.refresh(cx));
+        cx.run_until_parked();
+
+        assert!(
+            events.borrow().is_empty(),
+            "an unchanged document must not reset panel state via Reloaded, got {:?}",
+            events.borrow()
+        );
+        store.read_with(cx, |store, _| assert_eq!(store.items().len(), 1));
+    }
+
+    #[gpui::test]
+    async fn test_refresh_after_save_emits_no_events(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({})).await;
+        let (_project, store) = build_store(fs, cx).await;
+        store.update(cx, |store, cx| {
+            store.capture("stable".to_string(), None, None, cx);
+        });
+        flush_saves(cx);
+        let events = track_events(&store, cx);
+
+        // Re-reading our own save must be recognized as unchanged, even
+        // though the stored document carries fields the in-memory state may
+        // lack (e.g. the stamped `version`).
+        store.update(cx, |store, cx| store.refresh(cx));
+        cx.run_until_parked();
+
+        assert!(
+            events.borrow().is_empty(),
+            "re-reading our own save must not reset panel state, got {:?}",
+            events.borrow()
+        );
+        store.read_with(cx, |store, _| assert_eq!(store.items().len(), 1));
+    }
+
+    #[gpui::test]
+    async fn test_refresh_unchanged_doc_without_ids_emits_no_events(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({})).await;
+        // Items lacking `id`/`created` get fresh ones generated on every
+        // parse; the unchanged-document check must not be defeated by that.
+        seed_kv(
+            cx,
+            Path::new(path!("/root")),
+            r#"{ "version": 1, "inbox": [{ "text": "no id" }] }"#,
+        )
+        .await;
+        let (_project, store) = build_store(fs, cx).await;
+        let events = track_events(&store, cx);
+
+        store.update(cx, |store, cx| store.refresh(cx));
+        cx.run_until_parked();
+
+        assert!(
+            events.borrow().is_empty(),
+            "an unchanged stored document must not reset panel state, got {:?}",
+            events.borrow()
+        );
+        store.read_with(cx, |store, _| assert_eq!(store.items().len(), 1));
+    }
+
+    #[gpui::test]
+    async fn test_dismissed_restore_offer_is_not_reoffered_on_refresh(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({})).await;
+        let (_project, store) = build_store(fs.clone(), cx).await;
+        store.update(cx, |store, cx| {
+            store.capture("backed up".to_string(), None, None, cx);
+        });
+        flush_saves(cx);
+
+        // The stored entry vanishes while a backup remains: the next refresh
+        // offers a restore.
+        let key_value_store = cx.update(|cx| KeyValueStore::global(cx));
+        key_value_store
+            .scoped(INBOX_KV_NAMESPACE)
+            .delete(project_key(Path::new(path!("/root"))))
+            .await
+            .unwrap();
+        store.update(cx, |store, cx| store.refresh(cx));
+        cx.run_until_parked();
+        store.read_with(cx, |store, _| assert!(store.can_restore()));
+
+        // Dismissing is a decision; a later focus-triggered refresh must not
+        // resurrect the offer.
+        store.update(cx, |store, cx| store.dismiss_restore(cx));
+        store.update(cx, |store, cx| store.refresh(cx));
+        cx.run_until_parked();
+        store.read_with(cx, |store, _| {
+            assert!(
+                !store.can_restore(),
+                "a dismissed restore offer must not come back on focus refresh"
+            )
+        });
+    }
+
+    #[gpui::test]
+    async fn test_transient_failure_banner_clears_on_successful_refresh(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({})).await;
+        seed_kv(
+            cx,
+            Path::new(path!("/root")),
+            r#"{ "version": 1, "inbox": [{ "id": "a", "text": "kept", "created": 100 }] }"#,
+        )
+        .await;
+        let (_project, store) = build_store(fs, cx).await;
+
+        // A transiently unreadable database surfaces an error banner while
+        // the in-memory state is kept.
+        let broken = KeyValueStore::from_app_db(&db::AppDatabase(
+            db::open_test_db::<()>("inbox-broken-kv-refresh").await,
+        ));
+        let good = store.update(cx, |store, _| {
+            std::mem::replace(&mut store.key_value_store, broken)
+        });
+        store.update(cx, |store, cx| store.refresh(cx));
+        cx.run_until_parked();
+        store.read_with(cx, |store, _| {
+            assert!(store.load_error().is_some());
+            assert_eq!(store.items().len(), 1);
+        });
+
+        // The database recovers and the next refresh loads the same
+        // document: the banner must be cleared AND the panel notified, or a
+        // stale banner with a dead Restore button stays on screen.
+        store.update(cx, |store, _| store.key_value_store = good);
+        let events = track_events(&store, cx);
+        store.update(cx, |store, cx| store.refresh(cx));
+        cx.run_until_parked();
+        store.read_with(cx, |store, _| assert_eq!(store.load_error(), None));
+        assert!(
+            !events.borrow().is_empty(),
+            "clearing the error banner must notify the panel"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_git_init_with_unsaved_edit_migrates_the_edit(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({})).await;
+        let (_project, store) = build_store(fs.clone(), cx).await;
+        store.update(cx, |store, cx| {
+            store.capture("unsaved edit".to_string(), None, None, cx);
+        });
+
+        // `git init` lands while the debounced save is still pending: the
+        // rebind must flush the edit to the path key BEFORE the migration
+        // probe reads it, or the edit is stranded under the old key forever.
+        fs.insert_tree(path!("/root/.git"), json!({})).await;
+        cx.run_until_parked();
+        flush_saves(cx);
+
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.items().len(), 1);
+            assert_eq!(store.items()[0].text, "unsaved edit");
+        });
+        let stored = stored_for_root(cx, Path::new(path!("/root/.git"))).unwrap();
+        assert!(
+            stored.contains("unsaved edit"),
+            "the flushed edit must migrate to the repo key"
         );
     }
 }

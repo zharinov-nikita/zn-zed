@@ -43,6 +43,8 @@ zed_actions.workspace = true
 [dev-dependencies]
 db = { workspace = true, features = ["test-support"] }
 fs = { workspace = true, features = ["test-support"] }
+# For `FakeFs::add_linked_worktree_for_repo` in the shared-repo-key tests.
+git.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 pretty_assertions.workspace = true
 project = { workspace = true, features = ["test-support"] }
