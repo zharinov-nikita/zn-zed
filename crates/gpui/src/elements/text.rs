@@ -1153,23 +1153,33 @@ impl Element for InteractiveText {
                         let clickable_ranges = mem::take(&mut self.clickable_ranges);
                         window.on_mouse_event(
                             move |event: &MouseUpEvent, phase, window: &mut Window, cx| {
-                                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
-                                    if let Ok(mouse_up_index) =
-                                        text_layout.index_for_position(event.position)
-                                    {
-                                        click_listener(
-                                            &clickable_ranges,
-                                            InteractiveTextClickEvent {
-                                                mouse_down_index,
-                                                mouse_up_index,
-                                            },
-                                            window,
-                                            cx,
-                                        )
-                                    }
+                                if phase != DispatchPhase::Bubble {
+                                    return;
+                                }
+                                // Clear the pending mouse-down on every release, not
+                                // only over the text: a stale index would suppress
+                                // mouse-down tracking and fire a phantom click on a
+                                // later, unrelated release.
+                                mouse_down.take();
+                                window.refresh();
 
-                                    mouse_down.take();
-                                    window.refresh();
+                                // A release that ends a drag is not a click;
+                                // `active_drag` is still set while mouse listeners
+                                // run (the window clears it afterwards).
+                                if hitbox.is_hovered(window)
+                                    && !cx.has_active_drag()
+                                    && let Ok(mouse_up_index) =
+                                        text_layout.index_for_position(event.position)
+                                {
+                                    click_listener(
+                                        &clickable_ranges,
+                                        InteractiveTextClickEvent {
+                                            mouse_down_index,
+                                            mouse_up_index,
+                                        },
+                                        window,
+                                        cx,
+                                    )
                                 }
                             },
                         );

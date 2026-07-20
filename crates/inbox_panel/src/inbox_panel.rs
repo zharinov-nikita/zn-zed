@@ -27,15 +27,16 @@ use fs::Fs;
 use gpui::{
     Action, AnyElement, App, AppContext as _, AsyncWindowContext, ClickEvent, ClipboardItem,
     Context, DismissEvent, Div, ElementId, Entity, EventEmitter, ExternalPaths, FocusHandle,
-    Focusable, FontWeight, IntoElement, ParentElement, Pixels, Point, Render, ScrollHandle,
-    Stateful, Styled, Subscription, Task, WeakEntity, Window, actions, anchored, deferred,
+    Focusable, FontWeight, HighlightStyle, InteractiveText, IntoElement, ParentElement, Pixels,
+    Point, Render, ScrollHandle, Stateful, Styled, StyledText, Subscription, Task, UnderlineStyle,
+    WeakEntity, Window, actions, anchored, deferred,
 };
 use project::DirectoryLister;
 use theme_settings::ThemeSettings;
 use ui::{
     ButtonLike, Checkbox, ContextMenu, ContextMenuEntry, ContextMenuItem, Disclosure, IconPosition,
-    PopoverMenu, ScrollAxes, Scrollbars, Tab, TintColor, ToggleState, Tooltip, WithScrollbar,
-    prelude::*,
+    LabelLike, PopoverMenu, ScrollAxes, Scrollbars, Tab, TintColor, ToggleState, Tooltip,
+    WithScrollbar, prelude::*,
 };
 use workspace::{
     DraggedText, Toast, Workspace,
@@ -483,6 +484,131 @@ pub(crate) fn resolved_tag_chips(
             )
         })
         .collect()
+}
+
+/// A clickable link inside an item title, addressed by its byte range in the
+/// display string returned by [`parse_title_links`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct TitleLink {
+    pub range: std::ops::Range<usize>,
+    pub url: String,
+}
+
+/// Extracts links from an item title for rendering: markdown `[text](url)`
+/// spans collapse to their link text, bare URLs stay verbatim. Returns the
+/// display string plus the links' byte ranges within it. Nested brackets or
+/// parens in the markdown form are not supported.
+///
+/// Only `http(s)` targets become links: a click hands the URL straight to the
+/// OS opener, and titles can be authored externally (MCP server, import), so
+/// `file://` and other schemes must not hide behind an innocent-looking label.
+/// Non-matching `[text](target)` stays verbatim rather than collapsing.
+pub(crate) fn parse_title_links(text: &str) -> (String, Vec<TitleLink>) {
+    static MD_LINK: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\[([^\[\]]+)\]\(((?i:https?)://[^()\s]+)\)")
+            .expect("static pattern compiles")
+    });
+    fn is_http_url(url: &str) -> bool {
+        url.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+            || url.get(..8).is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+    }
+
+    let mut finder = linkify::LinkFinder::new();
+    finder.kinds(&[linkify::LinkKind::Url]);
+    let push_plain_segment = |segment: &str, display: &mut String, links: &mut Vec<TitleLink>| {
+        for found in finder.links(segment) {
+            if !is_http_url(found.as_str()) {
+                continue;
+            }
+            links.push(TitleLink {
+                range: display.len() + found.start()..display.len() + found.end(),
+                url: found.as_str().to_owned(),
+            });
+        }
+        display.push_str(segment);
+    };
+
+    let mut display = String::with_capacity(text.len());
+    let mut links = Vec::new();
+    let mut last = 0;
+    for caps in MD_LINK.captures_iter(text) {
+        let whole = caps.get(0).expect("group 0 always matches");
+        push_plain_segment(&text[last..whole.start()], &mut display, &mut links);
+        let label = &caps[1];
+        links.push(TitleLink {
+            range: display.len()..display.len() + label.len(),
+            url: caps[2].to_owned(),
+        });
+        display.push_str(label);
+        last = whole.end();
+    }
+    push_plain_segment(&text[last..], &mut display, &mut links);
+    (display, links)
+}
+
+/// The one-line title of a list row. Titles with links (markdown or bare
+/// URLs) render them clickable; plain titles stay a simple [`Label`]. The
+/// styling mirrors `Label::new(..).size(LabelSize::Default)` in both variants
+/// so mixed rows line up.
+fn render_item_title(item: &InboxItem, is_archive_row: bool, cx: &App) -> AnyElement {
+    let (display, links) = parse_title_links(&item.text);
+    let label = if is_archive_row {
+        // `Muted` (not `Disabled`) so cleared/archived text stays legible in
+        // both themes, including under the hover background on dark themes.
+        LabelLike::new().color(Color::Muted).strikethrough()
+    } else {
+        LabelLike::new()
+    };
+    if links.is_empty() {
+        return label.child(display).into_any_element();
+    }
+
+    let accent = cx.theme().colors().text_accent;
+    // Archive rows keep the muted base color so links don't pop out of a
+    // dimmed line; the underline alone marks them.
+    let link_color = (!is_archive_row).then_some(accent);
+    let link_style = HighlightStyle {
+        color: link_color,
+        underline: Some(UnderlineStyle {
+            thickness: px(1.),
+            color: link_color,
+            wavy: false,
+        }),
+        ..Default::default()
+    };
+    let links: Rc<[TitleLink]> = links.into();
+    let highlights: Vec<_> = links
+        .iter()
+        .map(|link| (link.range.clone(), link_style))
+        .collect();
+    let ranges: Vec<_> = links.iter().map(|link| link.range.clone()).collect();
+
+    label
+        .child(
+            InteractiveText::new(
+                (ElementId::from(item.id.clone()), "title"),
+                StyledText::new(display).with_highlights(highlights),
+            )
+            .on_click(ranges, {
+                let links = links.clone();
+                move |ix, _, cx| {
+                    // A link click must not fall through to the row's own
+                    // click handler, or it would also open the detail view.
+                    cx.stop_propagation();
+                    if let Some(link) = links.get(ix) {
+                        cx.open_url(&link.url);
+                    }
+                }
+            })
+            // Markdown links hide their URL; surface it on hover.
+            .tooltip(move |ix, _, cx| {
+                links
+                    .iter()
+                    .find(|link| link.range.contains(&ix))
+                    .map(|link| Tooltip::simple(link.url.clone(), cx))
+            }),
+        )
+        .into_any_element()
 }
 
 /// An [`attachment_chip`] with a trailing remove button. `on_open` fires when
@@ -1051,24 +1177,6 @@ impl InboxPanel {
                             })),
                         )
                     })
-                    .child(
-                        IconButton::new(
-                            "toggle-archive",
-                            if self.show_archive {
-                                IconName::EyeOff
-                            } else {
-                                IconName::Eye
-                            },
-                        )
-                        .icon_size(IconSize::Small)
-                        .icon_color(Color::Muted)
-                        .toggle_state(self.show_archive)
-                        .tooltip(Tooltip::text("Show/hide cleared"))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.show_archive = !this.show_archive;
-                            cx.notify();
-                        })),
-                    )
                     .child(
                         IconButton::new("inbox-type-settings", IconName::Settings)
                             .icon_size(IconSize::Small)
@@ -2091,16 +2199,7 @@ impl InboxPanel {
             }
         }));
 
-        let text_label = if is_archive_row {
-            // `Muted` (not `Disabled`) so cleared/archived text stays legible in
-            // both themes, including under the hover background on dark themes.
-            Label::new(item.text.clone())
-                .size(LabelSize::Default)
-                .color(Color::Muted)
-                .strikethrough()
-        } else {
-            Label::new(item.text.clone()).size(LabelSize::Default)
-        };
+        let text_label = render_item_title(item, is_archive_row, cx);
 
         // Per-field visibility, toggled from the header "Fields" menu.
         let (hide_list, hide_tags, hide_age, hide_subtasks, hide_context, hide_attachments) = {
@@ -2235,8 +2334,9 @@ impl InboxPanel {
                 // The drag payload is a shared `DraggedText` carrying the item's
                 // Markdown, so it can be dropped onto the agent panel (send to
                 // chat) as well as onto other lists (reorder / move). The ghost
-                // preview shows just the title.
-                let title = SharedString::from(item.text.clone());
+                // preview shows just the title — the same collapsed display
+                // string the list row renders, not the raw markdown.
+                let title = SharedString::from(parse_title_links(&item.text).0);
                 let payload = DraggedText {
                     id: SharedString::from(item.id.to_string()),
                     text: self.drag_markdown(item, cx),
@@ -2892,5 +2992,109 @@ impl Render for InboxPanel {
             .children(self.render_detail_overlay(cx))
             .children(self.render_delete_confirmation(cx))
             .children(self.render_attachment_removal_confirmation(cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TitleLink, parse_title_links};
+
+    fn link(display: &str, needle: &str, url: &str) -> TitleLink {
+        let start = display.find(needle).expect("needle not in display");
+        TitleLink {
+            range: start..start + needle.len(),
+            url: url.to_owned(),
+        }
+    }
+
+    #[test]
+    fn plain_text_has_no_links() {
+        let (display, links) = parse_title_links("just a plain title");
+        assert_eq!(display, "just a plain title");
+        assert_eq!(links, vec![]);
+    }
+
+    #[test]
+    fn bare_url_in_the_middle_is_a_link() {
+        let (display, links) = parse_title_links("see https://example.com/docs for details");
+        assert_eq!(display, "see https://example.com/docs for details");
+        assert_eq!(
+            links,
+            vec![link(&display, "https://example.com/docs", "https://example.com/docs")]
+        );
+    }
+
+    #[test]
+    fn markdown_link_collapses_to_its_text() {
+        let (display, links) = parse_title_links("fix [the issue](https://github.com/x/1) today");
+        assert_eq!(display, "fix the issue today");
+        assert_eq!(
+            links,
+            vec![link(&display, "the issue", "https://github.com/x/1")]
+        );
+    }
+
+    #[test]
+    fn markdown_and_bare_urls_mix() {
+        let (display, links) =
+            parse_title_links("[docs](https://docs.rs) vs https://crates.io here");
+        assert_eq!(display, "docs vs https://crates.io here");
+        assert_eq!(
+            links,
+            vec![
+                link(&display, "docs", "https://docs.rs"),
+                link(&display, "https://crates.io", "https://crates.io"),
+            ]
+        );
+    }
+
+    #[test]
+    fn trailing_punctuation_stays_outside_a_bare_url() {
+        // NB: linkify validates hosts — single-char labels (`a.b`) are not
+        // recognized as domains, so the URL needs a realistic host.
+        let (display, links) = parse_title_links("(см. https://example.com/x).");
+        assert_eq!(display, "(см. https://example.com/x).");
+        assert_eq!(
+            links,
+            vec![link(
+                &display,
+                "https://example.com/x",
+                "https://example.com/x"
+            )]
+        );
+    }
+
+    #[test]
+    fn stray_brackets_are_left_alone() {
+        let (display, links) = parse_title_links("array[0] and (parens) [alone");
+        assert_eq!(display, "array[0] and (parens) [alone");
+        assert_eq!(links, vec![]);
+    }
+
+    #[test]
+    fn markdown_target_without_scheme_stays_verbatim() {
+        let (display, links) = parse_title_links("task [cfg](windows) done");
+        assert_eq!(display, "task [cfg](windows) done");
+        assert_eq!(links, vec![]);
+    }
+
+    #[test]
+    fn non_http_schemes_are_not_links() {
+        let (display, links) =
+            parse_title_links("[click](file:///C:/x.exe) or ftp://example.com/f");
+        assert_eq!(display, "[click](file:///C:/x.exe) or ftp://example.com/f");
+        assert_eq!(links, vec![]);
+    }
+
+    #[test]
+    fn bracket_parens_inside_a_bare_url_are_not_consumed() {
+        let (display, links) = parse_title_links("see http://example.com/a[1](b) soon");
+        assert_eq!(display, "see http://example.com/a[1](b) soon");
+        assert_eq!(links.len(), 1);
+        assert!(
+            links[0].url.starts_with("http://example.com/a"),
+            "url: {}",
+            links[0].url
+        );
     }
 }
