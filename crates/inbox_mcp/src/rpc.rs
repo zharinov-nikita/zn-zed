@@ -344,13 +344,14 @@ mod tests {
         )
         .unwrap();
         let tools = response["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 12);
         let names: Vec<&str> = tools
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
             .collect();
         assert!(names.contains(&"inbox_capture"));
         assert!(names.contains(&"inbox_list_projects"));
+        assert!(names.contains(&"inbox_github_issues"));
         for tool in tools {
             assert!(
                 tool["description"].as_str().is_some_and(|d| !d.is_empty()),

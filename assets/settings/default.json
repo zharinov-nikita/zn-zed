@@ -977,6 +977,14 @@
     // Whether to serve the inbox over the embedded localhost MCP server
     // (read once at startup; toggling it requires a restart).
     "mcp_server": true,
+    // Read-only mirror of the repository's open GitHub issues, shown as a
+    // separate section of the panel (requires a github.com remote).
+    "github_issues": {
+      // Whether to show the GitHub issues section.
+      "enabled": true,
+      // How often (in minutes) the issues list is refreshed in the background.
+      "poll_minutes": 5,
+    },
   },
   "collaboration_panel": {
     // Whether to show the collaboration panel button in the status bar.

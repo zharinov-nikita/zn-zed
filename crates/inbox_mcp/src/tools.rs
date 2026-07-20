@@ -10,8 +10,9 @@ use anyhow::{Result, anyhow};
 use collections::HashSet;
 use context_server::types::{Tool, ToolAnnotations};
 use gpui::App;
-use inbox_panel::InboxStore;
-use inbox_panel::inbox_model::{InboxItem, ItemId};
+use inbox_panel::inbox_model::{InboxItem, ItemId, format_age, now_unix};
+use inbox_panel::{InboxPanelSettings, InboxStore};
+use settings::Settings as _;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -62,6 +63,7 @@ pub(crate) fn all_tools() -> Vec<RegisteredTool> {
         register(DeleteItem),
         register(MoveItemBefore),
         register(ListCatalogs),
+        register(GithubIssues),
     ]
 }
 
@@ -711,6 +713,114 @@ struct ListCatalogsInput {
     /// project. May be omitted when exactly one project is open.
     #[serde(default)]
     project: Option<String>,
+}
+
+struct GithubIssues;
+
+/// List the open GitHub issues of the repository the project's inbox is
+/// bound to — a read-only mirror of GitHub (no local state, pull requests
+/// excluded, sorted by most recently updated). Served from the panel's
+/// cache: `fetched_at`/`from_cache` describe freshness, and a stale cache
+/// kicks a background refresh — call again in a few seconds for fresher
+/// data. Fails when the project has no github.com remote.
+#[derive(Deserialize, JsonSchema)]
+struct GithubIssuesInput {
+    /// Absolute worktree root path (or a project_key prefix) of the target
+    /// project. May be omitted when exactly one project is open.
+    #[serde(default)]
+    project: Option<String>,
+}
+
+impl InboxTool for GithubIssues {
+    type Input = GithubIssuesInput;
+
+    const NAME: &'static str = "inbox_github_issues";
+
+    fn annotations(&self) -> ToolAnnotations {
+        annotations(true, false, true)
+    }
+
+    fn run(&self, input: Self::Input, cx: &mut App) -> Result<ToolOutput> {
+        use inbox_panel::github_issues::GithubBinding;
+
+        if !InboxPanelSettings::get_global(cx).github_issues_enabled {
+            return Err(anyhow!(
+                "the GitHub issues section is disabled \
+                 (settings: inbox_panel.github_issues.enabled)"
+            ));
+        }
+        let project = resolve_store(input.project.as_deref(), cx)?;
+        // Handlers are synchronous, so the response is whatever the mirror
+        // holds right now; the refresh (skipped while fresh) runs in the
+        // background for the next call.
+        project
+            .store
+            .update(cx, |store, cx| store.refresh_github_issues(false, cx));
+        let store = project.store.read(cx);
+        let state = store.github_issues();
+        let Some((owner, repo)) = state.owner_repo() else {
+            return Err(match state.binding() {
+                GithubBinding::NoGithubRemote => {
+                    anyhow!("this project's git remote does not point at github.com")
+                }
+                _ => anyhow!(
+                    "this project's github.com remote is not discovered yet — \
+                     retry in a few seconds"
+                ),
+            });
+        };
+
+        let now = now_unix();
+        let freshness = state.freshness_line(now);
+        let mut lines = vec![format!(
+            "Open issues of {owner}/{repo} — {} loaded{} ({freshness}):",
+            state.issues().len(),
+            if state.has_more() {
+                ", more available"
+            } else {
+                ""
+            },
+        )];
+        if let Some(error) = state.error() {
+            lines.push(format!("Last fetch error: {error}"));
+        }
+        for issue in state.issues() {
+            let mut line = format!("- #{} {}", issue.number, issue.title);
+            if !issue.labels.is_empty() {
+                let labels: Vec<&str> = issue
+                    .labels
+                    .iter()
+                    .map(|label| label.name.as_str())
+                    .collect();
+                line.push_str(&format!(" [{}]", labels.join(", ")));
+            }
+            if let Some(user) = &issue.user {
+                line.push_str(&format!(" — @{}", user.login));
+            }
+            if let Some(updated) = issue.updated_unix() {
+                line.push_str(&format!(", updated {} ago", format_age(updated, now)));
+            }
+            if issue.comments > 0 {
+                line.push_str(&format!(", {} comment(s)", issue.comments));
+            }
+            lines.push(line);
+        }
+
+        Ok(ToolOutput {
+            text: lines.join("\n"),
+            structured: Some(json!({
+                "project": project.worktree_root,
+                "owner": owner,
+                "repo": repo,
+                "fetched_at": state.fetched_at(),
+                "from_cache": state.from_cache(),
+                "loading": state.loading(),
+                "error": state.error(),
+                "has_more": state.has_more(),
+                "issues": state.issues(),
+            })),
+        })
+    }
 }
 
 impl InboxTool for ListCatalogs {

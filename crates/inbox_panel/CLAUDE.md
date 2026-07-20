@@ -16,6 +16,7 @@ cargo test -p inbox_panel      # full crate test suite (gpui::test + FakeFs)
 - `inbox_model.rs` — serde types (`InboxFile`, `InboxItem`, `CatalogEntry`), pure helpers (`item_to_markdown`, `format_age`).
 - `detail_view.rs` + `block.rs` + `markdown_codec.rs` + `slash_menu.rs` — block-based item editor.
 - `type_editor.rs` — Lists & Tags catalog overlay; `attachment.rs` — file attachments.
+- `github_issues.rs` — read-only GitHub issues mirror: REST fetcher, auth chain (`gh auth token` → `GITHUB_TOKEN` → anonymous), `GithubIssuesState` owned by the store, poll timer, KV cache under `github_issues:<project key>`; `issue_detail.rs` — its read-only detail overlay.
 
 ## Gotchas
 
@@ -34,6 +35,7 @@ cargo test -p inbox_panel      # full crate test suite (gpui::test + FakeFs)
 - Tests must `cx.set_global(db::AppDatabase::test_new())` in `init_test` (a fresh in-memory DB per test); without it the store falls back to the process-wide shared test DB and tests pollute each other.
 - `ItemId` is `Arc<str>`, not `String` — collect into `HashSet<ItemId>`, compare with `.clone()`d ids.
 - `item_to_markdown` is pure: type/tag labels are resolved by the caller. UI code must go through `item_markdown` (in `inbox_panel.rs`) so copy, send-to-chat and drag all produce identical markdown — don't call `item_to_markdown` directly from views.
-- The colored catalog square has one owner: `catalog_swatch`. Chips, menu rows and drag ghosts all use it; don't hand-roll `div().size(px(7.))…`.
+- The 7px color marker has one owner: `color_swatch` (square `catalog_swatch` for catalogs, round dot for GitHub labels). Chips, menu rows and drag ghosts all go through it; don't hand-roll `div().size(px(7.))…`.
 - `remote_connection` in dev-dependencies is load-bearing for test builds — see the comment in `Cargo.toml` before removing it.
+- **GitHub issues are not `InboxItem`s.** They are never persisted into `InboxFile`, carry no local read/cleared state (pure mirror), and their cache key (`github_issues:<project key>`) must stay disjoint from the 16-hex document keys so the backup ring, quarantine and migration probe never touch it. `InboxStoreEvent::GithubIssuesUpdated` deliberately does **not** invalidate the panel's `markdown_cache`/`list_cache` — a poll tick must not rebuild item rows. Store-side ops live in a second `impl InboxStore` block in `github_issues.rs`; rebinds go through `reset_github_issues` (keeps the fetch generation monotonic so stale in-flight fetches can't land into the new binding).
 - Ctrl+V paste of clipboard images/files is intercepted in the **capture phase** (`.capture_action` on the capture-box wrapper and the detail-view root — `handle_attachment_paste` in `attachment.rs`); a leading String clipboard entry falls through to the editor's own paste. Pasted images are saved to `paths::data_dir()/inbox_attachments/<project key>/` and attached as `External`; removing a chip never deletes the file (reference-only doctrine).

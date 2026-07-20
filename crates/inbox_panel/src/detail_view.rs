@@ -266,6 +266,8 @@ impl InboxDetailView {
                     cx.notify();
                 }
             }
+            // The issues mirror is disjoint from the item this view edits.
+            InboxStoreEvent::GithubIssuesUpdated => {}
             InboxStoreEvent::Changed => {
                 self.apply_title_style(cx);
                 cx.notify();
@@ -1022,31 +1024,7 @@ impl InboxDetailView {
     /// styling (heading size, quote italics, todo strikethrough) comes from
     /// the base text style rather than from markdown parsing.
     fn markdown_style(block: &Block, window: &Window, cx: &App) -> MarkdownStyle {
-        let theme_settings = ThemeSettings::get_global(cx);
-        let colors = cx.theme().colors();
-        let base_text_style = Self::block_text_style(block, window, cx);
-
-        MarkdownStyle {
-            base_text_style,
-            syntax: cx.theme().syntax().clone(),
-            selection_background_color: colors.element_selection_background,
-            inline_code: TextStyleRefinement {
-                font_family: Some(theme_settings.buffer_font.family.clone()),
-                font_fallbacks: theme_settings.buffer_font.fallbacks.clone(),
-                background_color: Some(colors.editor_background),
-                ..Default::default()
-            },
-            link: TextStyleRefinement {
-                color: Some(colors.text_accent),
-                underline: Some(UnderlineStyle {
-                    thickness: px(1.),
-                    color: Some(colors.text_accent),
-                    wavy: false,
-                }),
-                ..Default::default()
-            },
-            ..Default::default()
-        }
+        base_markdown_style(Self::block_text_style(block, window, cx), cx)
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1785,6 +1763,36 @@ impl Render for InboxDetailView {
             }))
             .children(self.render_delete_confirmation(cx))
             .children(self.render_attachment_removal_confirmation(cx))
+    }
+}
+
+/// The crate's shared read-only markdown recipe — inline code in the buffer
+/// font on the editor background, accent-colored underlined links, themed
+/// selection — parameterized by the base text style so both the block editor
+/// (per-block styles) and the issue overlay (whole documents) build on it.
+pub(crate) fn base_markdown_style(base_text_style: gpui::TextStyle, cx: &App) -> MarkdownStyle {
+    let theme_settings = ThemeSettings::get_global(cx);
+    let colors = cx.theme().colors();
+    MarkdownStyle {
+        base_text_style,
+        syntax: cx.theme().syntax().clone(),
+        selection_background_color: colors.element_selection_background,
+        inline_code: TextStyleRefinement {
+            font_family: Some(theme_settings.buffer_font.family.clone()),
+            font_fallbacks: theme_settings.buffer_font.fallbacks.clone(),
+            background_color: Some(colors.editor_background),
+            ..Default::default()
+        },
+        link: TextStyleRefinement {
+            color: Some(colors.text_accent),
+            underline: Some(UnderlineStyle {
+                thickness: px(1.),
+                color: Some(colors.text_accent),
+                wavy: false,
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
     }
 }
 

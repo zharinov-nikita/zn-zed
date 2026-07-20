@@ -59,9 +59,12 @@ cargo test -p inbox_mcp      # dispatcher + tool tests (gpui::test + FakeFs)
 - `rpc.rs` — JSON-RPC dispatch (`initialize`, `ping`, `tools/list`,
   `tools/call`); wire structs come from `context_server::types` so the server
   can't drift from Zed's own MCP client. Tests live here.
-- `tools.rs` — the 11 `inbox_*` tools (`listener.rs`-style trait: doc comment
+- `tools.rs` — the 12 `inbox_*` tools (`listener.rs`-style trait: doc comment
   on the input struct = tool description, schemars draft07 + inlined
-  subschemas).
+  subschemas). `inbox_github_issues` is read-only and serves the panel's
+  GitHub issues mirror (`inbox_panel::github_issues`) from cache — a sync
+  handler can't await the fetch, so it kicks a staleness-gated background
+  refresh and returns the current state with freshness fields.
 - `project_resolve.rs` — resolves the optional `project` argument against
   `InboxStoreRegistry` (in `inbox_panel::inbox_store`).
 

@@ -10,6 +10,11 @@ pub struct InboxPanelSettings {
     /// Whether to serve the inbox over the embedded localhost MCP server.
     /// Read once at startup — toggling it requires a restart.
     pub mcp_server: bool,
+    /// Whether to show the GitHub issues section (read-only mirror of the
+    /// repository's open issues).
+    pub github_issues_enabled: bool,
+    /// Background refresh interval of the issues list, in minutes.
+    pub github_issues_poll_minutes: u64,
 }
 
 impl Settings for InboxPanelSettings {
@@ -25,6 +30,17 @@ impl Settings for InboxPanelSettings {
                 .map_or(gpui::px(300.), gpui::px),
             dock: panel.and_then(|panel| panel.dock).unwrap_or(DockSide::Left),
             mcp_server: panel.and_then(|panel| panel.mcp_server).unwrap_or(true),
+            github_issues_enabled: panel
+                .and_then(|panel| panel.github_issues.as_ref())
+                .and_then(|github| github.enabled)
+                .unwrap_or(true),
+            // Clamped: 0 would busy-loop, and an absurd value would overflow
+            // the seconds conversion (see `issues_poll_interval`).
+            github_issues_poll_minutes: panel
+                .and_then(|panel| panel.github_issues.as_ref())
+                .and_then(|github| github.poll_minutes)
+                .unwrap_or(5)
+                .clamp(1, 24 * 60),
         }
     }
 }
