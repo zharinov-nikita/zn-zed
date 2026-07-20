@@ -18,10 +18,18 @@ concurrency:
 
 jobs:
   bundle-windows-x86_64:
-    runs-on: windows-2022
+    # The self-hosted runner keeps target/ warm between runs, which turns a
+    # ~2.5h cold build into an incremental one and skips the ~2h queue wait for
+    # a hosted windows runner. Fall back to `windows-2022` by editing this line
+    # if the machine is offline.
+    runs-on: [self-hosted, windows, x64, zed-build]
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
+        with:
+          # `git clean -ffdx` (the default) would wipe target/ on every run and
+          # defeat the whole point of a persistent runner.
+          clean: false
 
       - name: Set release channel to nightly
         shell: pwsh
@@ -30,6 +38,9 @@ jobs:
       - name: Enable long paths
         # cargo checks out python-environment-tools, whose test fixtures exceed
         # MAX_PATH; see docs/src/development/windows.md ("path too long").
+        # Needs admin, so only on hosted runners — the self-hosted machine has
+        # LongPathsEnabled set once, by hand.
+        if: runner.environment == 'github-hosted'
         shell: pwsh
         run: |
           git config --system core.longpaths true
@@ -37,7 +48,17 @@ jobs:
 
       - name: Ensure Inno Setup 6
         shell: pwsh
-        run: if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+        run: |
+          $paths = @(
+            "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+            "C:\Program Files\Inno Setup 6\ISCC.exe",
+            "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+          )
+          if ($paths | Where-Object { Test-Path $_ }) { exit 0 }
+          if ($env:RUNNER_ENVIRONMENT -eq 'self-hosted') {
+            throw "ISCC.exe not found. Install Inno Setup 6 on this machine (winget install JRSoftware.InnoSetup)."
+          }
+          choco install innosetup -y --no-progress
 
       - name: Log disk space
         shell: pwsh
