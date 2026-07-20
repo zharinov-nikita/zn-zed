@@ -19,6 +19,7 @@ cargo test -p inbox_panel      # full crate test suite (gpui::test + FakeFs)
 
 ## Gotchas
 
+- **The MCP surface is a public contract.** Any change to the inbox data model (`inbox_model.rs`), store operations (`inbox_store.rs`) or their semantics MUST be mirrored in the MCP tools in `crates/inbox_mcp` (tool schemas, validation, docs) **in the same PR** — agents talk to the inbox through them. See `crates/inbox_mcp/CLAUDE.md`.
 - The lib root is `src/inbox_panel.rs`, so its items are at `crate::…`, **not** `crate::inbox_panel::…` — `use crate::{catalog_swatch, item_markdown}` etc.
 - Saves are debounced (`SAVE_DEBOUNCE`, 250ms). Tests must call `flush_saves` + `run_until_parked` before asserting on stored state; a mutation is not persisted synchronously.
 - The `dirty` flag stops an async reload from clobbering unsaved edits, and a failed KV write restores it so the mutation is retried on the next edit — any new write/reload path must keep it updated or edits get silently reverted.

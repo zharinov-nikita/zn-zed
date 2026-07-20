@@ -7,6 +7,9 @@ pub struct InboxPanelSettings {
     pub button: bool,
     pub default_width: Pixels,
     pub dock: DockSide,
+    /// Whether to serve the inbox over the embedded localhost MCP server.
+    /// Read once at startup — toggling it requires a restart.
+    pub mcp_server: bool,
 }
 
 impl Settings for InboxPanelSettings {
@@ -21,6 +24,7 @@ impl Settings for InboxPanelSettings {
                 .and_then(|panel| panel.default_width)
                 .map_or(gpui::px(300.), gpui::px),
             dock: panel.and_then(|panel| panel.dock).unwrap_or(DockSide::Left),
+            mcp_server: panel.and_then(|panel| panel.mcp_server).unwrap_or(true),
         }
     }
 }

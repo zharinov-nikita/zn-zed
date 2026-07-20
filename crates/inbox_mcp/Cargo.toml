@@ -1,0 +1,46 @@
+[package]
+name = "inbox_mcp"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/inbox_mcp.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+collections.workspace = true
+context_server.workspace = true
+futures.workspace = true
+gpui.workspace = true
+inbox_panel.workspace = true
+log.workspace = true
+paths.workspace = true
+rand.workspace = true
+release_channel.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tiny_http.workspace = true
+util.workspace = true
+
+[dev-dependencies]
+db = { workspace = true, features = ["test-support"] }
+fs = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
+pretty_assertions.workspace = true
+project = { workspace = true, features = ["test-support"] }
+# inbox_panel pulls in agent_ui → remote_connection; project's test-support
+# enables `remote/test-support` (exposing the Mock variant), so pair it with
+# remote_connection's own test-support to keep its match exhaustive.
+remote_connection = { workspace = true, features = ["test-support"] }
+settings = { workspace = true, features = ["test-support"] }
+# workspace's persistence gates its RemoteConnectionIdentity::Mock arm behind
+# test-support; with remote's test-support unified in (see above), workspace
+# must see its own feature too or its match stops being exhaustive.
+workspace = { workspace = true, features = ["test-support"] }

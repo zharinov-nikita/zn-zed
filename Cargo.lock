@@ -9028,6 +9028,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7c5cedc30da3a610cac6b4ba17597bdf7152cf974e8aab3afb3d54455e371c8"
 
 [[package]]
+name = "inbox_mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "context_server",
+ "db",
+ "fs",
+ "futures 0.3.32",
+ "gpui",
+ "inbox_panel",
+ "log",
+ "paths",
+ "pretty_assertions",
+ "project",
+ "rand 0.9.4",
+ "release_channel",
+ "remote_connection",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "settings",
+ "tiny_http",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "inbox_panel"
 version = "0.1.0"
 dependencies = [
@@ -23247,6 +23275,7 @@ dependencies = [
  "http_client",
  "image",
  "image_viewer",
+ "inbox_mcp",
  "inbox_panel",
  "input_latency_ui",
  "inspector_ui",

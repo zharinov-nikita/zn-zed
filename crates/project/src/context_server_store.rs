@@ -14,7 +14,8 @@ use credentials_provider::CredentialsProvider;
 use futures::future::Either;
 use futures::{FutureExt as _, StreamExt as _, future::join_all};
 use gpui::{
-    App, AsyncApp, Context, Entity, EventEmitter, Subscription, Task, TaskExt, WeakEntity, actions,
+    App, AsyncApp, Context, Entity, EventEmitter, Global, Subscription, Task, TaskExt, WeakEntity,
+    actions,
 };
 use http_client::HttpClient;
 use itertools::Itertools;
@@ -285,6 +286,16 @@ struct ContextServerSettingsEntry {
     worktree_id: Option<WorktreeId>,
     settings: ContextServerSettings,
 }
+
+/// Context servers registered programmatically (e.g. the embedded inbox MCP
+/// server), without any user settings involvement. Set the global before
+/// workspaces open; every store merges these entries ahead of user/project
+/// settings, so a user-settings entry under the same id cannot override the
+/// registration.
+#[derive(Default)]
+pub struct BuiltinContextServers(pub HashMap<Arc<str>, ContextServerSettings>);
+
+impl Global for BuiltinContextServers {}
 
 pub struct ContextServerStore {
     state: ContextServerStoreState,
@@ -1104,6 +1115,20 @@ impl ContextServerStore {
         cx: &App,
     ) -> HashMap<Arc<str>, ContextServerSettingsEntry> {
         let mut merged = HashMap::default();
+        // Builtin registrations come first: `or_insert_with` below never
+        // replaces them, so a user-settings entry under the same id can't
+        // repoint a builtin server elsewhere.
+        if let Some(builtin) = cx.try_global::<BuiltinContextServers>() {
+            for (id, settings) in &builtin.0 {
+                merged.insert(
+                    id.clone(),
+                    ContextServerSettingsEntry {
+                        worktree_id: None,
+                        settings: settings.clone(),
+                    },
+                );
+            }
+        }
         for worktree in worktree_store.read(cx).visible_worktrees(cx) {
             let worktree_id = worktree.read(cx).id();
             let location = settings::SettingsLocation {

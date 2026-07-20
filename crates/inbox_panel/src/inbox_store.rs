@@ -8,7 +8,10 @@ use collections::HashSet;
 use db::kvp::KeyValueStore;
 use fs::{Fs, RemoveOptions};
 use futures::StreamExt as _;
-use gpui::{AppContext as _, Context, Entity, EventEmitter, Subscription, Task, TaskExt as _};
+use gpui::{
+    App, AppContext as _, Context, Entity, EventEmitter, Global, Subscription, Task,
+    TaskExt as _, WeakEntity,
+};
 use project::{Project, WorktreeId};
 use sha2::{Digest as _, Sha256};
 use util::ResultExt as _;
@@ -46,6 +49,36 @@ fn project_key(worktree_root: &Path) -> String {
 /// global data dir, so it survives DB-level problems and bulk deletes.
 fn backup_dir_for_key(key: &str) -> PathBuf {
     paths::data_dir().join("inbox_backups").join(key)
+}
+
+/// Process-wide registry of live inbox stores, so out-of-band consumers
+/// (the embedded MCP server) can reach the per-window stores. Holds weak
+/// handles only: a store dies with its panel/window, and dead handles are
+/// pruned on every access — there is no explicit unregister.
+#[derive(Default)]
+pub struct InboxStoreRegistry {
+    stores: Vec<WeakEntity<InboxStore>>,
+}
+
+impl Global for InboxStoreRegistry {}
+
+impl InboxStoreRegistry {
+    fn register(store: WeakEntity<InboxStore>, cx: &mut App) {
+        let registry = cx.default_global::<Self>();
+        registry.stores.retain(|weak| weak.upgrade().is_some());
+        registry.stores.push(store);
+    }
+
+    /// All currently live stores, in registration order.
+    pub fn live_stores(cx: &mut App) -> Vec<Entity<InboxStore>> {
+        let registry = cx.default_global::<Self>();
+        registry.stores.retain(|weak| weak.upgrade().is_some());
+        registry
+            .stores
+            .iter()
+            .filter_map(|weak| weak.upgrade())
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -166,6 +199,7 @@ impl InboxStore {
             pending_save: Task::ready(()),
             _subscriptions: vec![subscription],
         };
+        InboxStoreRegistry::register(cx.weak_entity(), cx);
         this.reload(cx);
         this
     }
@@ -546,6 +580,16 @@ impl InboxStore {
     /// a project switch that happened while a file dialog was open.
     pub fn bound_project_key(&self) -> Option<&str> {
         self.bound_project_key.as_deref()
+    }
+
+    /// Absolute root of the bound worktree, if it is still part of the
+    /// project.
+    pub fn worktree_root(&self, cx: &App) -> Option<Arc<Path>> {
+        let worktree = self
+            .project
+            .read(cx)
+            .worktree_for_id(self.worktree_id?, cx)?;
+        Some(worktree.read(cx).abs_path())
     }
 
     /// Whether the stored document went missing or corrupt while a backup
@@ -2284,5 +2328,36 @@ mod tests {
             stored_for_root(cx, Path::new(path!("/other"))).is_none(),
             "nothing may be written for the new worktree without an edit there"
         );
+    }
+
+    #[gpui::test]
+    async fn test_registry_tracks_live_stores(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({})).await;
+        let (_project_a, store_a) = build_store(fs.clone(), cx).await;
+        let (_project_b, store_b) = build_store(fs.clone(), cx).await;
+
+        cx.update(|cx| {
+            assert_eq!(
+                InboxStoreRegistry::live_stores(cx),
+                vec![store_a.clone(), store_b.clone()]
+            );
+        });
+
+        // Dropping a store's last strong handle removes it from the registry
+        // on the next access — closing a window must not leave a dead entry.
+        drop(store_b);
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(InboxStoreRegistry::live_stores(cx), vec![store_a.clone()]);
+        });
+
+        store_a.read_with(cx, |store, cx| {
+            assert_eq!(
+                store.worktree_root(cx).as_deref(),
+                Some(Path::new(path!("/root")))
+            );
+        });
     }
 }

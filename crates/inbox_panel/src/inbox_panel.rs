@@ -9,6 +9,7 @@ pub mod slash_menu;
 mod type_editor;
 
 pub use detail_view::{InboxDetailEvent, InboxDetailView};
+pub use inbox_panel_settings::InboxPanelSettings;
 pub use inbox_store::{InboxStore, InboxStoreEvent};
 
 use std::{
@@ -51,7 +52,7 @@ use crate::inbox_model::{
     AttachmentRef, InboxFile, InboxItem, ItemId, MetaField, SortMode, catalog_color, format_age,
     item_to_markdown, now_unix, subtask_counts,
 };
-use crate::inbox_panel_settings::{DockSide, InboxPanelSettings, Settings};
+use crate::inbox_panel_settings::{DockSide, Settings};
 use crate::type_editor::TypeEditorState;
 
 actions!(
@@ -316,8 +317,9 @@ pub(crate) fn open_attachment(
 
 /// Renders an item as Markdown, resolving its list label through the store.
 /// Shared by the copy-to-clipboard and send-to-chat actions in both the list
-/// rows and the detail view.
-pub(crate) fn item_markdown(store: &Entity<InboxStore>, item: &InboxItem, cx: &App) -> String {
+/// rows and the detail view. Public so out-of-crate consumers (the MCP
+/// server) produce identical markdown.
+pub fn item_markdown(store: &Entity<InboxStore>, item: &InboxItem, cx: &App) -> String {
     let store = store.read(cx);
     let label = store.resolve_kind(item).map(|kind| kind.label.clone());
     let tags = store

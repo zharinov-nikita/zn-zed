@@ -753,6 +753,7 @@ fn main() {
         project_panel::init(cx);
         outline_panel::init(cx);
         inbox_panel::init(cx);
+        init_inbox_mcp(cx);
         tasks_ui::init(cx);
         snippets_ui::init(cx);
         channel::init(&app_state.client.clone(), app_state.user_store.clone(), cx);
@@ -1813,6 +1814,41 @@ fn parse_url_arg(arg: &str, cx: &App) -> String {
             }
         }
     }
+}
+
+/// Starts the embedded inbox MCP server and registers it as a builtin HTTP
+/// context server, so all three consumers can reach the inbox panel: the
+/// built-in agent, ACP agents (via `mcp_servers_for_project` forwarding) and
+/// MCP clients in the integrated terminal (via the exported
+/// `ZED_INBOX_MCP_URL`/`ZED_INBOX_MCP_TOKEN` env vars). Must run before
+/// workspaces are restored so the first `ContextServerStore` already sees
+/// the registration. Gated by the `inbox_panel.mcp_server` setting.
+fn init_inbox_mcp(cx: &mut App) {
+    if !inbox_panel::InboxPanelSettings::get_global(cx).mcp_server {
+        return;
+    }
+    let Some(handle) = inbox_mcp::init(cx) else {
+        return;
+    };
+    let mut headers = HashMap::default();
+    headers.insert(
+        "Authorization".to_string(),
+        format!("Bearer {}", handle.token()),
+    );
+    let mut servers = HashMap::default();
+    servers.insert(
+        "zed-inbox".into(),
+        project::project_settings::ContextServerSettings::Http {
+            enabled: true,
+            url: handle.url().to_string(),
+            headers,
+            timeout: None,
+            oauth: None,
+        },
+    );
+    cx.set_global(project::context_server_store::BuiltinContextServers(
+        servers,
+    ));
 }
 
 fn load_embedded_fonts(cx: &App) {

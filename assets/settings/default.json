@@ -974,6 +974,9 @@
     "default_width": 300,
     // Where to dock the inbox panel. Can be 'left' or 'right'.
     "dock": "left",
+    // Whether to serve the inbox over the embedded localhost MCP server
+    // (read once at startup; toggling it requires a restart).
+    "mcp_server": true,
   },
   "collaboration_panel": {
     // Whether to show the collaboration panel button in the status bar.

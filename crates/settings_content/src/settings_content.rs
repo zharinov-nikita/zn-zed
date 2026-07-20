@@ -1157,6 +1157,10 @@ pub struct InboxPanelSettingsContent {
     ///
     /// Default: left
     pub dock: Option<DockSide>,
+    /// Whether to serve the inbox over the embedded localhost MCP server.
+    ///
+    /// Default: true
+    pub mcp_server: Option<bool>,
 }
 
 #[derive(
