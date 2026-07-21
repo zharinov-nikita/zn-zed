@@ -37,8 +37,9 @@ use crate::inbox_model::{AttachmentRef, InboxItem, ItemId, format_age, now_unix}
 use crate::inbox_store::{InboxStore, InboxStoreEvent};
 use crate::slash_menu::{self, SlashEntry, SlashMenuState};
 use crate::{
-    InboxPanel, copy_item_as_markdown, entity_confirmation_popover, open_attachment,
-    open_capture_context, send_item_to_chat, tag_chip,
+    DraggedInboxItems, InboxItemGhost, InboxPanel, copy_item_as_markdown,
+    entity_confirmation_popover, item_markdown, open_attachment, open_capture_context,
+    parse_title_links, tag_chip,
 };
 
 /// Placeholder of the last (slash-menu-advertising) block; shared verbatim
@@ -268,41 +269,67 @@ impl InboxDetailView {
             }
             // The issues mirror is disjoint from the item this view edits.
             InboxStoreEvent::GithubIssuesUpdated => {}
+            // `Changed` covers this view's own mutations (where the resync
+            // no-ops — store and view already agree) and external ones (MCP
+            // tools, another window), which must show up here immediately:
+            // the detail view is "the one place tasks are edited", so an agent
+            // edit the user can't see would look like the tool did nothing.
             InboxStoreEvent::Changed => {
-                self.apply_title_style(cx);
-                cx.notify();
+                self.resync_from_store(window, cx);
             }
             InboxStoreEvent::Reloaded => {
-                // The attachment list may be different now, so drop any pending
-                // removal confirmation rather than acting on a stale reference.
+                // The attachment list may be different after an external
+                // reload, so drop any pending removal confirmation rather
+                // than acting on a stale reference. (Not done on `Changed`:
+                // that fires on every mutation of *any* item and would
+                // dismiss the popover for unrelated edits.)
                 self.confirming_attachment_removal = None;
-                let Some(item) = self.store.read(cx).item(&self.item_id).cloned() else {
-                    cx.emit(InboxDetailEvent::Closed);
-                    return;
-                };
-                // The file changed externally: rebuild the document if the
-                // body no longer matches ours (compared through the codec so
-                // formatting-only differences don't count). While a block is
-                // being edited the in-progress edit wins and the resync is
-                // skipped; the external change is overwritten by the next
-                // save. This is a known compromise — the store-side dirty
-                // guard already protects unsaved local edits.
-                if self.editing.is_none() {
-                    let new_document =
-                        BlockDocument::from_markdown(item.body.as_deref().unwrap_or_default());
-                    if new_document.to_markdown() != self.document.to_markdown() {
-                        self.document = new_document;
-                        self.read_markdown.borrow_mut().clear();
-                    }
-                }
-                if self.title_editor.read(cx).text(cx) != item.text {
-                    self.title_editor
-                        .update(cx, |editor, cx| editor.set_text(item.text, window, cx));
-                }
-                self.apply_title_style(cx);
-                cx.notify();
+                self.resync_from_store(window, cx);
             }
         }
+    }
+
+    /// Brings the view in line with the store after the item changed under it
+    /// (an MCP tool, another window, an external file reload). Rebuilds the
+    /// document only if the body actually differs (compared through the codec
+    /// so formatting-only differences don't count). While a block or the
+    /// title is being edited the in-progress edit wins and that part of the
+    /// resync is skipped; the external change is overwritten by the next
+    /// save. This is a known compromise — the store-side dirty guard already
+    /// protects unsaved local edits.
+    fn resync_from_store(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = self.store.read(cx).item(&self.item_id).cloned() else {
+            cx.emit(InboxDetailEvent::Closed);
+            return;
+        };
+        if self.editing.is_none() {
+            // Cheap first: this runs on every `Changed`, including each title
+            // keystroke's own write-back. Our saves store `to_markdown()`
+            // verbatim, so the raw comparison catches the no-change case
+            // without reparsing; the codec-normalized comparison only runs
+            // when the raw text actually differs.
+            let current = self.document.to_markdown();
+            if item.body.as_deref().unwrap_or_default() != current {
+                let new_document =
+                    BlockDocument::from_markdown(item.body.as_deref().unwrap_or_default());
+                if new_document.to_markdown() != current {
+                    self.document = new_document;
+                    self.read_markdown.borrow_mut().clear();
+                }
+            }
+        }
+        // Never overwrite a title the user is typing — mirror the `editing`
+        // guard the body has. The store catches up from the editor on every
+        // keystroke, so skipping here loses nothing of ours; a concurrent
+        // external rename is the losing side, same as for the body.
+        if !self.title_editor.focus_handle(cx).is_focused(window)
+            && self.title_editor.read(cx).text(cx) != item.text
+        {
+            self.title_editor
+                .update(cx, |editor, cx| editor.set_text(item.text, window, cx));
+        }
+        self.apply_title_style(cx);
+        cx.notify();
     }
 
     /// Serializes the document back into the item's body.
@@ -1049,6 +1076,7 @@ impl InboxDetailView {
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(InboxDetailEvent::Closed))),
             )
             .child(div().flex_1())
+            .children(self.render_drag_handle(cx))
             .child(
                 IconButton::new("inbox-detail-attach", IconName::Paperclip)
                     .icon_size(IconSize::Small)
@@ -1068,17 +1096,6 @@ impl InboxDetailView {
                     })),
             )
             .child(
-                IconButton::new("inbox-detail-to-chat", IconName::Thread)
-                    .icon_size(IconSize::Small)
-                    .icon_color(Color::Muted)
-                    .tooltip(Tooltip::text("Send to AI Chat"))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        if let Some(item) = this.store.read(cx).item(&this.item_id).cloned() {
-                            send_item_to_chat(&this.workspace, &this.store, &item, window, cx);
-                        }
-                    })),
-            )
-            .child(
                 IconButton::new("inbox-detail-delete", IconName::Trash)
                     .icon_size(IconSize::Small)
                     .icon_color(Color::Muted)
@@ -1090,6 +1107,42 @@ impl InboxDetailView {
                         cx.notify();
                     })),
             )
+    }
+
+    /// The header's drag handle: drags this task out of the panel (the agent
+    /// panel turns the payload into a task attachment). A dedicated handle
+    /// rather than the whole header or the title — the title is editable text,
+    /// where a drag would fight text selection.
+    fn render_drag_handle(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let item = self.store.read(cx).item(&self.item_id)?.clone();
+        let store = self.store.read(cx);
+        let payload = DraggedInboxItems {
+            project_key: store.bound_project_key().unwrap_or_default().into(),
+            ids: vec![self.item_id.clone()],
+            markdown: item_markdown(&self.store, &item, cx).into(),
+        };
+        let ghost_text = SharedString::from(parse_title_links(&item.text).0);
+
+        Some(
+            div()
+                .id("inbox-detail-drag")
+                .cursor_grab()
+                .p_0p5()
+                .rounded_sm()
+                .hover(|style| style.bg(cx.theme().colors().element_hover))
+                .child(
+                    Icon::new(IconName::Thread)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
+                .tooltip(Tooltip::text("Drag into the AI chat"))
+                .on_drag(payload, move |_payload, click_offset, _window, cx| {
+                    cx.new(|_| InboxItemGhost {
+                        text: ghost_text.clone(),
+                        click_offset,
+                    })
+                }),
+        )
     }
 
     /// Opens the OS file dialog and attaches the chosen files to the item.

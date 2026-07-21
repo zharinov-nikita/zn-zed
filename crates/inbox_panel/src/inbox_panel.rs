@@ -22,15 +22,15 @@ use std::{
     time::Duration,
 };
 
-use agent_ui::AgentPanel;
 use collections::{HashMap, HashSet};
 use editor::Editor;
 use fs::Fs;
 use gpui::{
     Action, AnyElement, App, AppContext as _, AsyncWindowContext, ClickEvent, ClipboardItem,
     Context, DismissEvent, Div, ElementId, Entity, EventEmitter, ExternalPaths, FocusHandle,
-    Focusable, FontWeight, HighlightStyle, InteractiveText, IntoElement, ParentElement, Pixels,
-    Point, Render, ScrollHandle, Stateful, Styled, StyledText, Subscription, Task, UnderlineStyle,
+    Focusable, FontWeight, HighlightStyle, InteractiveText, IntoElement, Modifiers, ParentElement,
+    Pixels, Point, Render, ScrollHandle, Stateful, Styled, StyledText, Subscription, Task,
+    UnderlineStyle,
     WeakEntity, Window, actions, anchored, deferred,
 };
 use project::DirectoryLister;
@@ -41,7 +41,7 @@ use ui::{
     ToggleState, Tooltip, WithScrollbar, prelude::*,
 };
 use workspace::{
-    DraggedText, Toast, Workspace,
+    Toast, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
     notifications::NotificationId,
 };
@@ -98,14 +98,28 @@ enum ViewMode {
     Grouped,
 }
 
-/// Drag payload for moving an inbox item into another group. Doubles as the
-/// ghost view that follows the cursor while dragging. The drag payload itself
-/// is a shared [`DraggedText`] (so the agent panel can accept it); this struct
-/// only renders the floating preview.
+/// Drag payload of one or more open inbox rows. Carried both inside the panel
+/// (reorder, move between lists) and out of it — the agent panel turns it into
+/// task mentions — so it names the items by id instead of shipping only text.
 #[derive(Clone)]
-struct InboxItemGhost {
-    text: SharedString,
-    click_offset: Point<Pixels>,
+pub struct DraggedInboxItems {
+    /// Key of the project whose inbox owns the items, as reported by
+    /// [`InboxStore::bound_project_key`]. Consumers outside the panel resolve
+    /// the store through it.
+    pub project_key: SharedString,
+    /// The dragged items, in display order.
+    pub ids: Vec<ItemId>,
+    /// The items' Markdown, joined by blank lines — for drop targets that
+    /// understand nothing but text.
+    pub markdown: SharedString,
+}
+
+/// The floating preview that follows the cursor while dragging inbox rows.
+/// Shared with the detail view's drag handle so both surfaces drag alike.
+#[derive(Clone)]
+pub(crate) struct InboxItemGhost {
+    pub(crate) text: SharedString,
+    pub(crate) click_offset: Point<Pixels>,
 }
 
 impl Render for InboxItemGhost {
@@ -180,6 +194,13 @@ pub struct InboxPanel {
     /// Whether the GitHub issues section is expanded. Ephemeral view state,
     /// collapsed by default like the archive.
     show_github_issues: bool,
+    /// Ids of the selected open items. Ephemeral view state — it drives the
+    /// drag payload (dragging a selected row drags the whole selection) and
+    /// never reaches the stored document.
+    selected: HashSet<ItemId>,
+    /// Row the last plain or toggling click landed on. Shift-click extends the
+    /// selection from it over the current display order.
+    selection_anchor: Option<ItemId>,
     confirming_delete: Option<(ItemId, Point<Pixels>)>,
     /// Pending confirmation before removing a staged capture attachment.
     confirming_attachment_removal: Option<(AttachmentRef, Point<Pixels>)>,
@@ -191,6 +212,11 @@ pub struct InboxPanel {
     /// the per-frame render doesn't re-clone and re-sort the whole inbox.
     /// Cleared on any store change.
     list_cache: RefCell<Option<Rc<ListRows>>>,
+    /// The selected ids in display order, cached across frames: the eager
+    /// `on_drag` value asks for it once per selected row per render, which
+    /// would otherwise re-filter the whole list each time (O(k·n)). Cleared
+    /// whenever the selection or the row order changes.
+    selection_order_cache: RefCell<Option<Rc<Vec<ItemId>>>>,
     _age_refresh: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -334,9 +360,9 @@ pub(crate) fn open_attachment(
 }
 
 /// Renders an item as Markdown, resolving its list label through the store.
-/// Shared by the copy-to-clipboard and send-to-chat actions in both the list
-/// rows and the detail view. Public so out-of-crate consumers (the MCP
-/// server) produce identical markdown.
+/// Shared by the copy-to-clipboard action and the drag payload in both the
+/// list rows and the detail view. Public so out-of-crate consumers (the MCP
+/// server, the agent panel's inbox mentions) produce identical markdown.
 pub fn item_markdown(store: &Entity<InboxStore>, item: &InboxItem, cx: &App) -> String {
     let store = store.read(cx);
     let label = store.resolve_kind(item).map(|kind| kind.label.clone());
@@ -345,6 +371,98 @@ pub fn item_markdown(store: &Entity<InboxStore>, item: &InboxItem, cx: &App) -> 
         .map(|tag| tag.label.clone())
         .collect::<Vec<_>>();
     item_to_markdown(item, label.as_deref(), &tags)
+}
+
+/// The read-only meta row of an item — the same fields the panel's rows show,
+/// honouring the panel's "Fields" setting, but without any click targets or
+/// menus. Public so the chat's task attachment card renders identical metadata
+/// instead of hand-rolling its own row.
+pub fn item_meta_row(store: &Entity<InboxStore>, item: &InboxItem, cx: &App) -> AnyElement {
+    let now = now_unix();
+    let store = store.read(cx);
+    let hidden = |field: MetaField| store.is_field_hidden(field.key());
+
+    // Single line, overflow clipped: the chat card lives in a block of fixed
+    // height, where a wrapped meta row would overflow instead of growing it.
+    let mut meta = h_flex().overflow_hidden().items_center().gap_2();
+
+    if !hidden(MetaField::List)
+        && let Some(kind) = store.resolve_kind(item)
+    {
+        meta = meta.child(tag_chip(
+            kind.label.clone().into(),
+            catalog_color(&kind.color, cx),
+        ));
+    }
+    if !hidden(MetaField::Tags) {
+        for (label, color) in resolved_tag_chips(store, item, cx) {
+            meta = meta.child(tag_chip(label, color));
+        }
+    }
+    if let Some(created) = item.created.filter(|_| !hidden(MetaField::Age)) {
+        meta = meta.child(age_label(created, now, cx));
+    }
+    if let Some((done, total)) = item
+        .body
+        .as_deref()
+        .and_then(subtask_counts)
+        .filter(|_| !hidden(MetaField::Subtasks))
+    {
+        meta = meta.child(subtask_counter(done, total));
+    }
+    if let Some(from) = item.from.clone().filter(|_| !hidden(MetaField::Context)) {
+        meta = meta.child(
+            h_flex()
+                .gap_1()
+                .text_xs()
+                .font_buffer(cx)
+                .text_color(cx.theme().colors().text_placeholder)
+                .child(
+                    Icon::new(IconName::File)
+                        .size(IconSize::XSmall)
+                        .color(Color::Placeholder),
+                )
+                .child(from),
+        );
+    }
+    if !hidden(MetaField::Attachments) {
+        for (index, attachment) in item.attachments.iter().enumerate() {
+            meta = meta.child(attachment_chip(
+                SharedString::from(format!("inbox-meta-attachment-{}-{index}", item.id)),
+                attachment,
+                cx,
+            ));
+        }
+    }
+
+    meta.into_any_element()
+}
+
+/// The captured-age label of a meta row — one owner, shared by the panel's
+/// rows and the chat's task card so the two surfaces can't drift.
+fn age_label(created: i64, now: i64, cx: &App) -> Div {
+    div()
+        .text_xs()
+        .font_buffer(cx)
+        .text_color(cx.theme().colors().text_placeholder)
+        .child(format_age(created, now))
+}
+
+/// The `done/total` subtask counter of a meta row — one owner, shared by the
+/// panel's rows and the chat's task card.
+fn subtask_counter(done: usize, total: usize) -> impl IntoElement {
+    h_flex()
+        .gap_0p5()
+        .child(
+            Icon::new(IconName::TodoComplete)
+                .size(IconSize::XSmall)
+                .color(Color::Placeholder),
+        )
+        .child(
+            Label::new(format!("{done}/{total}"))
+                .size(LabelSize::XSmall)
+                .color(Color::Placeholder),
+        )
 }
 
 /// Copies the item's Markdown to the clipboard and shows a confirmation toast.
@@ -362,36 +480,6 @@ pub(crate) fn copy_item_as_markdown(
         "Copied task as Markdown",
         cx,
     );
-}
-
-/// Opens the Zed agent panel and drops the item's Markdown into the message
-/// editor as a draft. The item itself is left untouched.
-pub(crate) fn send_item_to_chat(
-    workspace: &WeakEntity<Workspace>,
-    store: &Entity<InboxStore>,
-    item: &InboxItem,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let Some(workspace_entity) = workspace.upgrade() else {
-        return;
-    };
-    let markdown = item_markdown(store, item, cx);
-    let Some(panel) = workspace_entity.read(cx).panel::<AgentPanel>(cx) else {
-        show_inbox_toast(
-            workspace,
-            "inbox-agent-unavailable",
-            "The Zed agent panel is unavailable",
-            cx,
-        );
-        return;
-    };
-    workspace_entity.update(cx, |workspace, cx| {
-        workspace.focus_panel::<AgentPanel>(window, cx);
-    });
-    panel.update(cx, |panel, cx| {
-        panel.insert_prompt_text(markdown, window, cx);
-    });
 }
 
 /// Shows a short auto-hiding toast in the workspace.
@@ -527,7 +615,7 @@ pub(crate) fn resolved_tag_chips(
 /// A clickable link inside an item title, addressed by its byte range in the
 /// display string returned by [`parse_title_links`].
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct TitleLink {
+pub struct TitleLink {
     pub range: std::ops::Range<usize>,
     pub url: String,
 }
@@ -541,7 +629,7 @@ pub(crate) struct TitleLink {
 /// OS opener, and titles can be authored externally (MCP server, import), so
 /// `file://` and other schemes must not hide behind an innocent-looking label.
 /// Non-matching `[text](target)` stays verbatim rather than collapsing.
-pub(crate) fn parse_title_links(text: &str) -> (String, Vec<TitleLink>) {
+pub fn parse_title_links(text: &str) -> (String, Vec<TitleLink>) {
     static MD_LINK: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"\[([^\[\]]+)\]\(((?i:https?)://[^()\s]+)\)")
             .expect("static pattern compiles")
@@ -868,11 +956,14 @@ impl InboxPanel {
                 detail: None,
                 issue_detail: None,
                 show_github_issues: false,
+                selected: HashSet::default(),
+                selection_anchor: None,
                 confirming_delete: None,
                 confirming_attachment_removal: None,
                 scroll_handle: ScrollHandle::new(),
                 markdown_cache: RefCell::new(HashMap::default()),
                 list_cache: RefCell::new(None),
+                selection_order_cache: RefCell::new(None),
                 _age_refresh: age_refresh,
                 _subscriptions: subscriptions,
             }
@@ -925,6 +1016,10 @@ impl InboxPanel {
         if !matches!(event, InboxStoreEvent::GithubIssuesUpdated) {
             self.markdown_cache.borrow_mut().clear();
             self.list_cache.borrow_mut().take();
+            self.selection_order_cache.borrow_mut().take();
+            // Rows that were deleted, archived or replaced by a reload must
+            // leave the selection, or a later drag would carry dead ids.
+            self.reconcile_selection(cx);
         }
         match event {
             InboxStoreEvent::GithubIssuesUpdated => cx.notify(),
@@ -1003,6 +1098,116 @@ impl InboxPanel {
         } else if self.store.read(cx).has_worktree() {
             self.capture_editor.focus_handle(cx).focus(window, cx);
         }
+    }
+
+    /// Applies a click on an open row to the selection, following the usual
+    /// list conventions: `ctrl`/`cmd` toggles one row, `shift` extends from the
+    /// anchor, a plain click selects just this row. Returns whether the click
+    /// was a selection gesture (modified), so the caller can suppress its own
+    /// plain-click behavior — opening the detail view.
+    fn select_item(&mut self, id: &ItemId, modifiers: Modifiers, cx: &mut Context<Self>) -> bool {
+        self.selection_order_cache.borrow_mut().take();
+        if modifiers.shift && let Some(anchor) = self.selection_anchor.clone() {
+            // The range runs over the filtered flat order — the same order the
+            // rows render in, except in the grouped view, where the groups
+            // reorder them.
+            let rows = self.list_rows(cx);
+            let visible = self.filter_rows(&rows.open);
+            let position = |needle: &ItemId| visible.iter().position(|item| &item.id == needle);
+            if let Some((from, to)) = position(&anchor).zip(position(id)) {
+                let range = if from <= to { from..=to } else { to..=from };
+                self.selected
+                    .extend(range.map(|index| visible[index].id.clone()));
+                cx.notify();
+                return true;
+            }
+        }
+        if modifiers.secondary() {
+            if self.selected.remove(id) {
+                // The row was just deselected — a later shift-click must not
+                // extend from it, or it would silently come back.
+                self.selection_anchor = None;
+            } else {
+                self.selected.insert(id.clone());
+                self.selection_anchor = Some(id.clone());
+            }
+        } else {
+            self.selected.clear();
+            self.selected.insert(id.clone());
+            self.selection_anchor = Some(id.clone());
+        }
+        cx.notify();
+        modifiers.secondary() || modifiers.shift
+    }
+
+    /// Drops the selection, e.g. when its rows can no longer be dragged as a
+    /// set (the document was replaced) or the user pressed <kbd>escape</kbd>.
+    fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        if self.selected.is_empty() && self.selection_anchor.is_none() {
+            return;
+        }
+        self.selected.clear();
+        self.selection_anchor = None;
+        self.selection_order_cache.borrow_mut().take();
+        cx.notify();
+    }
+
+    /// Drops selected ids that no longer name an open item (deleted, archived
+    /// or replaced by a reload).
+    fn reconcile_selection(&mut self, cx: &App) {
+        if self.selected.is_empty() && self.selection_anchor.is_none() {
+            return;
+        }
+        self.selection_order_cache.borrow_mut().take();
+        let store = self.store.read(cx);
+        let is_open = |id: &ItemId| store.item(id).is_some_and(|item| !item.is_cleared());
+        self.selected.retain(|id| is_open(id));
+        if let Some(anchor) = &self.selection_anchor
+            && !is_open(anchor)
+        {
+            self.selection_anchor = None;
+        }
+    }
+
+    /// The ids a drag starting on `id` should carry: the whole selection when
+    /// the row is part of it, and just the row otherwise. Always in display
+    /// order — the set itself is unordered, but consumers (reorder, the chat
+    /// mentions) must see the rows the way the list shows them.
+    fn drag_ids(&self, id: &ItemId, cx: &App) -> Vec<ItemId> {
+        if !self.selected.contains(id) {
+            return vec![id.clone()];
+        }
+        if let Some(ordered) = self.selection_order_cache.borrow().as_ref() {
+            return ordered.as_ref().clone();
+        }
+        let rows = self.list_rows(cx);
+        let ordered: Vec<ItemId> = self
+            .filter_rows(&rows.open)
+            .into_iter()
+            .filter(|item| self.selected.contains(&item.id))
+            .map(|item| item.id.clone())
+            .collect();
+        *self.selection_order_cache.borrow_mut() = Some(Rc::new(ordered.clone()));
+        ordered
+    }
+
+    /// The panel's store, for consumers that need to read this window's inbox
+    /// (the agent panel's task attachments).
+    pub fn store(&self) -> &Entity<InboxStore> {
+        &self.store
+    }
+
+    /// Opens an item for editing, from outside the panel — the agent panel
+    /// does this when a task attachment is clicked. Selects the row too, so it
+    /// is obvious which task the chat was pointing at once the overlay closes.
+    pub fn open_item(&mut self, id: ItemId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.store.read(cx).item(&id).is_none() {
+            return;
+        }
+        self.selected.clear();
+        self.selected.insert(id.clone());
+        self.selection_anchor = Some(id.clone());
+        self.open_detail(id, window, cx);
     }
 
     /// Opens the detail view of an item as a full-panel overlay, closing the
@@ -1180,7 +1385,7 @@ impl InboxPanel {
                 h_flex()
                     .gap_1p5()
                     .child(
-                        Icon::new(IconName::Envelope)
+                        Icon::new(IconName::InboxTray)
                             .size(IconSize::Small)
                             .color(Color::Muted),
                     )
@@ -1910,6 +2115,18 @@ impl InboxPanel {
                             Self::tag_set_menu_hooks(panel.clone(), cx, |this| {
                                 &mut this.tag_filter.keys
                             });
+                        // Changing the filter changes which rows are visible;
+                        // a selection kept across that would silently drag
+                        // rows the user can no longer see.
+                        let on_toggle = {
+                            let panel = panel.clone();
+                            move |key: String, window: &mut Window, cx: &mut App| {
+                                on_toggle(key, window, cx);
+                                panel
+                                    .update(cx, |this, cx| this.clear_selection(cx))
+                                    .ok();
+                            }
+                        };
                         menu = menu.header("Filter by tags");
                         for (label, menu_mode) in [
                             ("Match any", TagFilterMode::Any),
@@ -1925,6 +2142,7 @@ impl InboxPanel {
                                     panel
                                         .update(cx, |this, cx| {
                                             this.tag_filter.mode = menu_mode;
+                                            this.clear_selection(cx);
                                             cx.notify();
                                         })
                                         .ok();
@@ -1946,6 +2164,7 @@ impl InboxPanel {
                                 panel
                                     .update(cx, |this, cx| {
                                         this.tag_filter.keys.clear();
+                                        this.clear_selection(cx);
                                         cx.notify();
                                     })
                                     .ok();
@@ -2159,7 +2378,7 @@ impl InboxPanel {
             .gap_1()
             .p_4()
             .child(
-                Icon::new(IconName::Envelope)
+                Icon::new(IconName::InboxTray)
                     .size(IconSize::XLarge)
                     .color(Color::Muted),
             )
@@ -2199,6 +2418,7 @@ impl InboxPanel {
                     .label_size(LabelSize::Small)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.tag_filter.keys.clear();
+                        this.clear_selection(cx);
                         cx.notify();
                     })),
             )
@@ -2292,13 +2512,7 @@ impl InboxPanel {
             meta = meta.child(tag_chip(label, color));
         }
         if let Some(created) = item.created.filter(|_| !hide_age) {
-            meta = meta.child(
-                div()
-                    .text_xs()
-                    .font_buffer(cx)
-                    .text_color(cx.theme().colors().text_placeholder)
-                    .child(format_age(created, now)),
-            );
+            meta = meta.child(age_label(created, now, cx));
         }
         if let Some((done, total)) = item
             .body
@@ -2306,20 +2520,7 @@ impl InboxPanel {
             .and_then(subtask_counts)
             .filter(|_| !hide_subtasks)
         {
-            meta = meta.child(
-                h_flex()
-                    .gap_0p5()
-                    .child(
-                        Icon::new(IconName::TodoComplete)
-                            .size(IconSize::XSmall)
-                            .color(Color::Placeholder),
-                    )
-                    .child(
-                        Label::new(format!("{done}/{total}"))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Placeholder),
-                    ),
-            );
+            meta = meta.child(subtask_counter(done, total));
         }
         if let Some(from) = item.from.clone().filter(|_| !hide_context) {
             meta = meta.child(
@@ -2380,6 +2581,7 @@ impl InboxPanel {
         let reorderable = row == ItemRow::Open
             && !self.tag_filter.is_active()
             && self.store.read(cx).sort_mode().is_manual();
+        let selected = row == ItemRow::Open && self.selected.contains(&item.id);
         h_flex()
             .id((ElementId::from(item.id.clone()), "row"))
             .group("inbox-item")
@@ -2388,49 +2590,74 @@ impl InboxPanel {
             .px_2()
             .py_1p5()
             .rounded_md()
+            .when(selected, |this| {
+                this.bg(cx.theme().colors().element_selected)
+            })
             .hover(|style| style.bg(cx.theme().colors().element_hover))
             .when(row == ItemRow::Open, |this| {
-                // The drag payload is a shared `DraggedText` carrying the item's
-                // Markdown, so it can be dropped onto the agent panel (send to
-                // chat) as well as onto other lists (reorder / move). The ghost
-                // preview shows just the title — the same collapsed display
-                // string the list row renders, not the raw markdown.
-                let title = SharedString::from(parse_title_links(&item.text).0);
-                let payload = DraggedText {
-                    id: SharedString::from(item.id.to_string()),
-                    text: self.drag_markdown(item, cx),
+                // Clicking the row's empty space only moves the selection; the
+                // title (below) is what opens the item.
+                this.on_click(cx.listener({
+                    let id = item.id.clone();
+                    move |this, event: &ClickEvent, _, cx| {
+                        this.select_item(&id, event.modifiers(), cx);
+                    }
+                }))
+            })
+            .when(row == ItemRow::Open, |this| {
+                // Dragging a selected row carries the whole selection, so the
+                // payload names the items by id; its Markdown is there for drop
+                // targets that only take text. The ghost preview shows the title
+                // — the same collapsed display string the list row renders — or
+                // the count for a multi-row drag.
+                let ids = self.drag_ids(&item.id, cx);
+                let ghost_text = if ids.len() > 1 {
+                    SharedString::from(format!("{} tasks", ids.len()))
+                } else {
+                    SharedString::from(parse_title_links(&item.text).0)
                 };
+                let payload = self.drag_payload(ids, cx);
                 this.on_drag(payload, move |_payload, click_offset, _window, cx| {
                     cx.new(|_| InboxItemGhost {
-                        text: title.clone(),
+                        text: ghost_text.clone(),
                         click_offset,
                     })
                 })
             })
             .when(reorderable, |this| {
-                this.drag_over::<DraggedText>(|style, _, _, cx| {
+                this.drag_over::<DraggedInboxItems>(|style, _, _, cx| {
                     style.bg(cx.theme().colors().drop_target_background)
                 })
                 .on_drop(cx.listener({
                     let target_id = item.id.clone();
-                    move |this, drag: &DraggedText, _, cx| {
-                        let drag_id: ItemId = drag.id.as_ref().into();
-                        if drag_id == target_id {
+                    move |this, drag: &DraggedInboxItems, _, cx| {
+                        // Dropping a selection onto one of its own rows is a
+                        // no-op: moving the other members "before" a target
+                        // inside the batch would scramble their relative
+                        // order (A,B,C onto B would become A,C,B).
+                        if drag.ids.contains(&target_id) {
                             return;
                         }
                         this.store.update(cx, |store, cx| {
                             // Dropping onto an item in another list also moves
-                            // the dragged item into that list.
+                            // the dragged items into that list.
                             let target_kind = store
                                 .item(&target_id)
                                 .and_then(|item| store.resolve_kind(item).map(|t| t.key.clone()));
-                            let drag_kind = store
-                                .item(&drag_id)
-                                .and_then(|item| store.resolve_kind(item).map(|t| t.key.clone()));
-                            if target_kind != drag_kind {
-                                store.set_kind(&drag_id, target_kind, cx);
+                            for drag_id in &drag.ids {
+                                if drag_id == &target_id {
+                                    continue;
+                                }
+                                let drag_kind = store
+                                    .item(drag_id)
+                                    .and_then(|item| store.resolve_kind(item).map(|t| t.key.clone()));
+                                if target_kind != drag_kind {
+                                    store.set_kind(drag_id, target_kind.clone(), cx);
+                                }
+                                // Inserting each one before the target in turn
+                                // keeps their relative order.
+                                store.move_item_before(drag_id, &target_id, cx);
                             }
-                            store.move_item_before(&drag_id, &target_id, cx);
                         });
                     }
                 }))
@@ -2453,7 +2680,17 @@ impl InboxPanel {
                             .cursor_pointer()
                             .on_click(cx.listener({
                                 let id = item.id.clone();
-                                move |this, _, window, cx| {
+                                let selectable = row == ItemRow::Open;
+                                move |this, event: &ClickEvent, window, cx| {
+                                    // Handled here rather than letting the click
+                                    // bubble to the row, so a modified click
+                                    // only adjusts the selection.
+                                    cx.stop_propagation();
+                                    if selectable
+                                        && this.select_item(&id, event.modifiers(), cx)
+                                    {
+                                        return;
+                                    }
                                     this.open_detail(id.clone(), window, cx);
                                 }
                             }))
@@ -2471,6 +2708,24 @@ impl InboxPanel {
             .into_any_element()
     }
 
+    /// Builds the drag payload for a set of rows. Eagerly evaluated by
+    /// `on_drag` for every open row on every render, so the per-item Markdown
+    /// comes from the memoizing [`Self::drag_markdown`].
+    fn drag_payload(&self, ids: Vec<ItemId>, cx: &App) -> DraggedInboxItems {
+        let store = self.store.read(cx);
+        let markdown = ids
+            .iter()
+            .filter_map(|id| store.item(id))
+            .map(|item| self.drag_markdown(item, cx).to_string())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        DraggedInboxItems {
+            project_key: store.bound_project_key().unwrap_or_default().into(),
+            ids,
+            markdown: markdown.into(),
+        }
+    }
+
     /// The item's Markdown for the drag payload, memoized so the eager
     /// `on_drag` value isn't rebuilt for every open row on every render. The
     /// cache is invalidated on any store change in [`Self::handle_store_event`].
@@ -2485,7 +2740,7 @@ impl InboxPanel {
         markdown
     }
 
-    /// The per-row overflow menu (`…`): Copy as Markdown / Send to AI Chat.
+    /// The per-row overflow menu (`…`): Copy as Markdown.
     fn render_item_actions_menu(
         &self,
         item: &InboxItem,
@@ -2508,25 +2763,11 @@ impl InboxPanel {
                 let panel = panel.clone();
                 let item = item.clone();
                 Some(ContextMenu::build(window, cx, move |menu, _, _| {
-                    let (copy_item, copy_panel) = (item.clone(), panel.clone());
-                    let (chat_item, chat_panel) = (item.clone(), panel);
+                    let (copy_item, copy_panel) = (item.clone(), panel);
                     menu.entry("Copy as Markdown", None, move |_window, cx| {
                         copy_panel
                             .update(cx, |this, cx| {
                                 copy_item_as_markdown(&this.workspace, &this.store, &copy_item, cx);
-                            })
-                            .ok();
-                    })
-                    .entry("Send to AI Chat", None, move |window, cx| {
-                        chat_panel
-                            .update(cx, |this, cx| {
-                                send_item_to_chat(
-                                    &this.workspace,
-                                    &this.store,
-                                    &chat_item,
-                                    window,
-                                    cx,
-                                );
                             })
                             .ok();
                     })
@@ -2766,19 +3007,20 @@ impl InboxPanel {
         let mut group = v_flex()
             .id(SharedString::from(format!("inbox-group-{group_key}")))
             .rounded_md()
-            .drag_over::<DraggedText>(|style, _, _, cx| {
+            .drag_over::<DraggedInboxItems>(|style, _, _, cx| {
                 style.bg(cx.theme().colors().drop_target_background)
             })
             .on_drop(cx.listener({
                 let target = key;
-                move |this, drag: &DraggedText, _, cx| {
-                    let drag_id: ItemId = drag.id.as_ref().into();
+                move |this, drag: &DraggedInboxItems, _, cx| {
                     this.store.update(cx, |store, cx| {
-                        let already_there = store.item(&drag_id).is_some_and(|item| {
-                            store.resolve_kind(item).map(|t| t.key.clone()) == target
-                        });
-                        if !already_there {
-                            store.set_kind(&drag_id, target.clone(), cx);
+                        for drag_id in &drag.ids {
+                            let already_there = store.item(drag_id).is_some_and(|item| {
+                                store.resolve_kind(item).map(|t| t.key.clone()) == target
+                            });
+                            if !already_there {
+                                store.set_kind(drag_id, target.clone(), cx);
+                            }
                         }
                     });
                 }
@@ -3199,7 +3441,7 @@ impl Panel for InboxPanel {
     fn icon(&self, _: &Window, cx: &App) -> Option<IconName> {
         InboxPanelSettings::get_global(cx)
             .button
-            .then_some(IconName::Envelope)
+            .then_some(IconName::InboxTray)
     }
 
     fn icon_tooltip(&self, _window: &Window, _: &App) -> Option<&'static str> {
@@ -3245,6 +3487,7 @@ impl Render for InboxPanel {
         v_flex()
             .key_context("InboxPanel")
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| this.clear_selection(cx)))
             .on_action(cx.listener(Self::capture))
             .on_action(cx.listener(Self::export_inbox))
             .on_action(cx.listener(Self::import_inbox))

@@ -13,7 +13,6 @@ path = "src/inbox_panel.rs"
 doctest = false
 
 [dependencies]
-agent_ui.workspace = true
 anyhow.workspace = true
 collections.workspace = true
 db.workspace = true
