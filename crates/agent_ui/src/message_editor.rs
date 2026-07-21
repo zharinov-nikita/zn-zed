@@ -14,9 +14,11 @@ use agent::ThreadStore;
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Result, anyhow};
 use base64::Engine as _;
+use collections::HashMap;
+use inbox_panel::InboxStoreEvent;
 use editor::{
     Addon, AnchorRangeExt, ContextMenuOptions, Editor, EditorElement, EditorEvent, EditorMode,
-    EditorStyle, Inlay, MultiBuffer, MultiBufferOffset, MultiBufferSnapshot, ToOffset,
+    EditorStyle, Inlay, MultiBuffer, MultiBufferOffset, MultiBufferSnapshot, ToOffset, ToPoint,
     actions::{Copy, Cut, Paste},
     code_context_menus::CodeContextMenu,
     display_map::{CreaseId, CreaseSnapshot},
@@ -102,6 +104,9 @@ impl SessionCapabilities {
                 PromptContextType::Diagnostics,
                 PromptContextType::Fetch,
                 PromptContextType::Skill,
+                // Task attachments carry the task's Markdown, so they need an
+                // agent that accepts embedded context, like the other kinds here.
+                PromptContextType::Inbox,
                 PromptContextType::BranchDiff,
             ]);
         }
@@ -207,6 +212,9 @@ pub struct MessageEditor {
     local_commands: SharedLocalCommands,
     agent_id: AgentId,
     thread_store: Option<Entity<ThreadStore>>,
+    /// One subscription per inbox this editor has task attachments from, so a
+    /// task deleted in the panel also leaves the draft. Keyed by project key.
+    inbox_subscriptions: HashMap<SharedString, Subscription>,
     _subscriptions: Vec<Subscription>,
     _parse_slash_command_task: Task<()>,
 }
@@ -559,6 +567,10 @@ impl MessageEditor {
                     && !editor.read(cx).read_only(cx)
                 {
                     cx.emit(MessageEditorEvent::Edited);
+                    // Task attachments can arrive through paths that don't go
+                    // via `insert_inbox_items` (the `@task` menu) — make sure
+                    // every attached inbox is watched for deletions.
+                    this.sync_inbox_watches(cx);
                     editor.update(cx, |editor, cx| {
                         let snapshot = editor.snapshot(window, cx);
                         this.mention_set
@@ -609,6 +621,7 @@ impl MessageEditor {
             local_commands,
             agent_id,
             thread_store,
+            inbox_subscriptions: HashMap::default(),
             _subscriptions: subscriptions,
             _parse_slash_command_task: Task::ready(()),
         }
@@ -939,6 +952,8 @@ impl MessageEditor {
                 cx,
             )
         });
+        // No attachments left — stop listening to their inboxes.
+        self.inbox_subscriptions.clear();
     }
 
     pub fn send(&mut self, cx: &mut Context<Self>) {
@@ -1256,6 +1271,43 @@ impl MessageEditor {
                     let http_client = workspace.read(cx).client().http_client();
 
                     for (anchor, content_len, mention_uri) in all_mentions {
+                        // A task mention renders as a block crease, which
+                        // replaces whole lines — so a pasted link must sit on
+                        // a line of its own, like every other insert path
+                        // guarantees. Re-anchor after the edit: the original
+                        // anchor is left-biased and would otherwise point
+                        // before the inserted newline.
+                        let anchor = if matches!(mention_uri, MentionUri::InboxItem { .. }) {
+                            self.editor.update(cx, |editor, cx| {
+                                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                                let start = anchor.to_offset(&snapshot);
+                                let end = MultiBufferOffset(start.0 + content_len);
+                                let needs_prefix = start.to_point(&snapshot).column > 0;
+                                let needs_suffix = snapshot
+                                    .chars_at(end)
+                                    .next()
+                                    .is_some_and(|next| next != '\n');
+                                let mut edits = Vec::new();
+                                if needs_prefix {
+                                    edits.push((start..start, "\n"));
+                                }
+                                if needs_suffix {
+                                    edits.push((end..end, "\n"));
+                                }
+                                if edits.is_empty() {
+                                    anchor
+                                } else {
+                                    editor.edit(edits, cx);
+                                    let snapshot = editor.buffer().read(cx).snapshot(cx);
+                                    snapshot.anchor_before(MultiBufferOffset(
+                                        start.0 + usize::from(needs_prefix),
+                                    ))
+                                }
+                            })
+                        } else {
+                            anchor
+                        };
+                        let snapshot = self.editor.read(cx).buffer().read(cx).snapshot(cx);
                         let Some((crease_id, tx, crease_entity)) = insert_crease_for_mention(
                             snapshot.anchor_to_buffer_anchor(anchor).unwrap().0,
                             content_len,
@@ -1577,6 +1629,185 @@ impl MessageEditor {
             .detach();
     }
 
+    /// Inserts inbox tasks as mention creases at the cursor — the drop target
+    /// for dragging rows out of the inbox panel, and the `@` menu's inbox
+    /// entries. Each crease keeps pointing at the live task: only its identity
+    /// is stored, the content is re-read when the message is sent.
+    pub fn insert_inbox_items(
+        &mut self,
+        project_key: &str,
+        ids: &[SharedString],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.watch_inbox(project_key, cx);
+        // A task can be attached to a message once: silently skip ids that
+        // already have a card in this editor.
+        let attached = self.mention_set.read(cx).attached_inbox_keys();
+        for id in ids {
+            if attached.contains(&(project_key.to_string(), id.to_string())) {
+                continue;
+            }
+            let (title, _) = crate::inbox_mentions::inbox_item_summary(project_key, id, cx);
+            let Some(title) = title else {
+                continue;
+            };
+            self.insert_inbox_item_crease(
+                MentionUri::InboxItem {
+                    project_key: project_key.to_string(),
+                    id: id.to_string(),
+                    name: title,
+                },
+                window,
+                cx,
+            );
+        }
+    }
+
+    /// Ensures every inbox that has a task attached in this editor is watched,
+    /// regardless of how the attachment got in (drag & drop, `@task`, message
+    /// restore).
+    fn sync_inbox_watches(&mut self, cx: &mut Context<Self>) {
+        // Runs on every edit — bail before allocating for the common case of
+        // an editor with no task attachments.
+        if self.mention_set.read(cx).is_empty() {
+            return;
+        }
+        let project_keys: Vec<String> = self
+            .mention_set
+            .read(cx)
+            .inbox_mentions()
+            .into_iter()
+            .map(|(_, project_key, _)| project_key)
+            .collect();
+        for project_key in project_keys {
+            self.watch_inbox(&project_key, cx);
+        }
+    }
+
+    /// Watches an inbox so its deleted tasks can be dropped from this editor.
+    /// One subscription per project key; a second attachment from the same
+    /// inbox reuses it.
+    fn watch_inbox(&mut self, project_key: &str, cx: &mut Context<Self>) {
+        if self.inbox_subscriptions.contains_key(project_key) {
+            return;
+        }
+        let Some(store) = crate::inbox_mentions::inbox_store_for_project(project_key, cx) else {
+            return;
+        };
+        let subscription = cx.subscribe(&store, |this, _, _: &InboxStoreEvent, cx| {
+            this.prune_deleted_inbox_mentions(cx);
+        });
+        self.inbox_subscriptions
+            .insert(project_key.to_string().into(), subscription);
+    }
+
+    /// Removes task attachments whose task no longer exists in its inbox,
+    /// along with the line their link sits on. Sent messages are history and
+    /// are left untouched — their editor is read-only, and the card there just
+    /// says the task is gone.
+    fn prune_deleted_inbox_mentions(&mut self, cx: &mut Context<Self>) {
+        if self.editor.read(cx).read_only(cx) {
+            return;
+        }
+
+        let attachments = self.mention_set.read(cx).inbox_mentions();
+        let deleted = attachments
+            .into_iter()
+            .filter(|(_, project_key, id)| {
+                matches!(
+                    crate::inbox_mentions::inbox_item_summary(project_key, id, cx).1,
+                    crate::inbox_mentions::InboxItemState::Missing
+                )
+            })
+            .map(|(crease_id, _, _)| crease_id)
+            .collect::<Vec<_>>();
+        if deleted.is_empty() {
+            return;
+        }
+
+        self.editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let crease_snapshot = editor.display_map.read(cx).crease_snapshot();
+            let mut edits = Vec::new();
+            for (crease_id, crease) in crease_snapshot.creases() {
+                if !deleted.contains(&crease_id) {
+                    continue;
+                }
+                let range = crease.range().to_offset(&snapshot);
+                // Swallow the newline the link was given when it was inserted,
+                // so removing a card doesn't leave a blank line behind.
+                let end = if snapshot
+                    .chars_at(range.end)
+                    .next()
+                    .is_some_and(|c| c == '\n')
+                {
+                    MultiBufferOffset(range.end.0 + 1)
+                } else {
+                    range.end
+                };
+                // A card attached mid-line got a newline *before* its link
+                // too; when the card is the last content, that newline has
+                // nothing left to separate — swallow it as well, or every
+                // mid-line attach/delete cycle leaves a blank line behind.
+                let start = if end.0 == snapshot.len().0
+                    && range.start.0 > 0
+                    && snapshot
+                        .reversed_chars_at(range.start)
+                        .next()
+                        .is_some_and(|c| c == '\n')
+                {
+                    MultiBufferOffset(range.start.0 - 1)
+                } else {
+                    range.start
+                };
+                edits.push((start..end, ""));
+            }
+            if !edits.is_empty() {
+                editor.edit(edits, cx);
+            }
+            editor.remove_creases(deleted.clone(), cx);
+        });
+
+        self.mention_set.update(cx, |mention_set, cx| {
+            for crease_id in deleted {
+                mention_set.remove_mention(&crease_id, cx);
+            }
+        });
+        // Drop subscriptions to inboxes that no longer have an attachment in
+        // this editor — otherwise every store edit keeps waking this editor
+        // for the rest of its life.
+        let live_keys: collections::HashSet<String> = self
+            .mention_set
+            .read(cx)
+            .inbox_mentions()
+            .into_iter()
+            .map(|(_, project_key, _)| project_key)
+            .collect();
+        self.inbox_subscriptions
+            .retain(|key, _| live_keys.contains(key.as_ref()));
+        cx.notify();
+    }
+
+    fn insert_inbox_item_crease(
+        &mut self,
+        mention_uri: MentionUri,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        insert_inbox_item_mention(
+            mention_uri,
+            &self.editor,
+            &self.mention_set,
+            &workspace,
+            window,
+            cx,
+        );
+    }
+
     pub(crate) fn insert_selections(
         &mut self,
         selection: AgentContextSelection,
@@ -1728,14 +1959,30 @@ impl MessageEditor {
         let path_style = workspace.read(cx).project().read(cx).path_style(cx);
         let mut text = String::new();
         let mut mentions = Vec::new();
+        let mut watched_inboxes = Vec::new();
+        // A task attachment renders as a block crease, which replaces whole
+        // lines — nothing may share a line with its link. The newline *after*
+        // a task link is deferred: it is only inserted when the next chunk
+        // doesn't already start on a fresh line, so back-to-back cards don't
+        // accumulate blank lines between them.
+        let mut pending_inbox_newline = false;
         let append_normalized = |text: &mut String, mut segment: String| {
             LineEnding::normalize(&mut segment);
             text.push_str(&segment);
         };
+        fn flush_pending(text: &mut String, pending: &mut bool, next: &str) {
+            if *pending {
+                if !next.starts_with('\n') && !next.starts_with("\r\n") {
+                    text.push('\n');
+                }
+                *pending = false;
+            }
+        }
 
         for chunk in message {
             match chunk {
                 acp::ContentBlock::Text(text_content) => {
+                    flush_pending(&mut text, &mut pending_inbox_newline, &text_content.text);
                     append_normalized(&mut text, text_content.text);
                 }
                 acp::ContentBlock::Resource(acp::EmbeddedResource {
@@ -1746,9 +1993,23 @@ impl MessageEditor {
                     else {
                         continue;
                     };
+                    flush_pending(&mut text, &mut pending_inbox_newline, "");
+                    // Tasks render as a block crease, which replaces whole
+                    // lines: keep the link on a line of its own so the card
+                    // doesn't swallow the rest of the message.
+                    let is_inbox_item = matches!(mention_uri, MentionUri::InboxItem { .. });
+                    if let MentionUri::InboxItem { project_key, .. } = &mention_uri {
+                        watched_inboxes.push(project_key.clone());
+                    }
+                    if is_inbox_item && !text.is_empty() && !text.ends_with('\n') {
+                        text.push('\n');
+                    }
                     let start = text.len();
                     append_normalized(&mut text, mention_uri.as_link().to_string());
                     let end = text.len();
+                    if is_inbox_item {
+                        pending_inbox_newline = true;
+                    }
                     mentions.push((
                         start..end,
                         mention_uri,
@@ -1762,6 +2023,7 @@ impl MessageEditor {
                     if let Some(mention_uri) =
                         MentionUri::parse(&resource.uri, path_style).log_err()
                     {
+                        flush_pending(&mut text, &mut pending_inbox_newline, "");
                         let start = text.len();
                         append_normalized(&mut text, mention_uri.as_link().to_string());
                         let end = text.len();
@@ -1788,6 +2050,7 @@ impl MessageEditor {
                         log::error!("failed to parse MIME type for image: {mime_type:?}");
                         continue;
                     };
+                    flush_pending(&mut text, &mut pending_inbox_newline, "");
                     let start = text.len();
                     append_normalized(&mut text, mention_uri.as_link().to_string());
                     let end = text.len();
@@ -1803,9 +2066,19 @@ impl MessageEditor {
                 _ => {}
             }
         }
+        // A message that ends in a task card still gets its trailing newline,
+        // keeping restored messages byte-identical to freshly inserted ones
+        // (`{link}\n`) — pruning and any card-per-line logic rely on it.
+        if pending_inbox_newline {
+            text.push('\n');
+        }
 
         if text.is_empty() && mentions.is_empty() {
             return;
+        }
+
+        for project_key in watched_inboxes {
+            self.watch_inbox(&project_key, cx);
         }
 
         let insertion_start = if append_to_existing {
@@ -2065,6 +2338,64 @@ impl Addon for MessageEditorAddon {
             key_context.add("use_modifier_to_send");
         }
     }
+}
+
+/// Inserts a task mention at the editor's cursor. Shared by the panel's drag &
+/// drop target and the `@task` menu, which live in different types but insert
+/// identically. A task renders as a block crease, and a block replaces whole
+/// lines — so the link is put on a line of its own, or the card would swallow
+/// the text around it.
+pub(crate) fn insert_inbox_item_mention(
+    mention_uri: MentionUri,
+    editor: &Entity<Editor>,
+    mention_set: &Entity<MentionSet>,
+    workspace: &Entity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let link_text = mention_uri.as_link().to_string();
+    let content_len = link_text.len();
+    let crease_text: SharedString = mention_uri.name().into();
+
+    let start_anchor = editor.update(cx, |editor, cx| {
+        // Open a fresh line for the link first, then anchor the mention.
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let cursor = editor.selections.newest_anchor().start;
+        if cursor.to_point(&snapshot).column > 0 {
+            editor.insert("\n", window, cx);
+        }
+
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let buffer_snapshot = snapshot.as_singleton()?;
+        let cursor = editor.selections.newest_anchor().start;
+        let text_anchor = snapshot
+            .anchor_to_buffer_anchor(cursor)?
+            .0
+            .bias_left(buffer_snapshot);
+
+        editor.insert(&format!("{link_text}\n"), window, cx);
+        Some(text_anchor)
+    });
+
+    let Some(start_anchor) = start_anchor else {
+        return;
+    };
+
+    mention_set
+        .update(cx, |mention_set, cx| {
+            mention_set.confirm_mention_completion(
+                crease_text,
+                start_anchor,
+                content_len,
+                mention_uri,
+                false,
+                editor.clone(),
+                workspace,
+                window,
+                cx,
+            )
+        })
+        .detach();
 }
 
 /// Walks the editor's creases in order, interleaving plain-text chunks from

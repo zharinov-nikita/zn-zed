@@ -497,6 +497,7 @@ dependencies = [
  "http_client",
  "idna",
  "image",
+ "inbox_panel",
  "indoc",
  "itertools 0.14.0",
  "jsonschema",
@@ -9057,7 +9058,6 @@ dependencies = [
 name = "inbox_panel"
 version = "0.1.0"
 dependencies = [
- "agent_ui",
  "anyhow",
  "collections",
  "db",

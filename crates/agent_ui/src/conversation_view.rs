@@ -3119,9 +3119,28 @@ impl ConversationView {
         }
     }
 
+    /// Inserts inbox tasks into the active message editor as mention creases
+    /// and focuses it.
+    pub(crate) fn insert_inbox_items(
+        &self,
+        project_key: SharedString,
+        ids: Vec<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(active_thread) = self.active_thread() {
+            active_thread.update(cx, |thread, cx| {
+                thread.message_editor.update(cx, |editor, cx| {
+                    editor.insert_inbox_items(&project_key, &ids, window, cx);
+                    editor.focus_handle(cx).focus(window, cx);
+                })
+            });
+        }
+    }
+
     /// Inserts plain `text` into the active message editor as a draft and
     /// focuses it. Unlike [`insert_selection`], this adds no context mention —
-    /// it is a raw text hand-off (used by the inbox panel).
+    /// it is a raw text hand-off.
     ///
     /// [`insert_selection`]: Self::insert_selection
     pub(crate) fn insert_prompt_text(&self, text: String, window: &mut Window, cx: &mut Context<Self>) {

@@ -39,6 +39,7 @@ use util::truncate_and_remove_front;
 use workspace::Workspace;
 
 use crate::AgentPanel;
+use crate::inbox_mentions::{InboxTask, open_inbox_tasks};
 use crate::mention_set::MentionSet;
 
 #[derive(Clone)]
@@ -161,6 +162,8 @@ pub(crate) enum PromptContextType {
     Fetch,
     Thread,
     Skill,
+    /// Tasks from this project's inbox panel.
+    Inbox,
     Diagnostics,
     BranchDiff,
 }
@@ -245,6 +248,7 @@ impl TryFrom<&str> for PromptContextType {
             "fetch" => Ok(Self::Fetch),
             "thread" => Ok(Self::Thread),
             "skill" => Ok(Self::Skill),
+            "task" => Ok(Self::Inbox),
             "diagnostics" => Ok(Self::Diagnostics),
             "diff" => Ok(Self::BranchDiff),
             _ => Err(format!("Invalid context picker mode: {}", value)),
@@ -260,6 +264,7 @@ impl PromptContextType {
             Self::Fetch => "fetch",
             Self::Thread => "thread",
             Self::Skill => "skill",
+            Self::Inbox => "task",
             Self::Diagnostics => "diagnostics",
             Self::BranchDiff => "branch diff",
         }
@@ -272,6 +277,7 @@ impl PromptContextType {
             Self::Fetch => "Fetch",
             Self::Thread => "Threads",
             Self::Skill => "Skills",
+            Self::Inbox => "Inbox Tasks",
             Self::Diagnostics => "Diagnostics",
             Self::BranchDiff => "Branch Diff",
         }
@@ -284,6 +290,7 @@ impl PromptContextType {
             Self::Fetch => IconName::ToolWeb,
             Self::Thread => IconName::Thread,
             Self::Skill => IconName::Sparkle,
+            Self::Inbox => IconName::InboxTray,
             Self::Diagnostics => IconName::Warning,
             Self::BranchDiff => IconName::GitBranch,
         }
@@ -297,6 +304,7 @@ pub(crate) enum Match {
     RecentThread(SessionMatch),
     Fetch(SharedString),
     Skill(AvailableSkill),
+    Inbox(InboxTask),
     Entry(EntryMatch),
     BranchDiff(BranchDiffMatch),
 }
@@ -315,6 +323,7 @@ impl Match {
             Match::RecentThread(_) => 1.,
             Match::Symbol(_) => 1.,
             Match::Skill(_) => 1.,
+            Match::Inbox(_) => 1.,
             Match::Fetch(_) => 1.,
             Match::BranchDiff(_) => 1.,
         }
@@ -629,6 +638,60 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
                 mention_set,
                 workspace,
             )),
+            group: None,
+        }
+    }
+
+    fn completion_for_inbox_task(
+        task: InboxTask,
+        source_range: Range<Anchor>,
+        _source: Arc<T>,
+        editor: WeakEntity<Editor>,
+        mention_set: WeakEntity<MentionSet>,
+        workspace: Entity<Workspace>,
+        cx: &mut App,
+    ) -> Completion {
+        let uri = MentionUri::InboxItem {
+            project_key: task.project_key.to_string(),
+            id: task.id.to_string(),
+            name: task.title.to_string(),
+        };
+        Completion {
+            replace_range: source_range,
+            // A task renders as a block crease, which needs its link on a line
+            // of its own — the shared insert helper handles that, so confirming
+            // only erases the typed `@…` query and defers to it.
+            new_text: String::new(),
+            label: CodeLabel::plain(task.title.to_string(), None),
+            documentation: None,
+            insert_text_mode: None,
+            source: project::CompletionSource::Custom,
+            match_start: None,
+            snippet_deduplication_key: None,
+            icon_path: Some(uri.icon_path(cx)),
+            icon_color: None,
+            confirm: Some(Arc::new(move |_, window, cx| {
+                let uri = uri.clone();
+                let editor = editor.clone();
+                let mention_set = mention_set.clone();
+                let workspace = workspace.clone();
+                window.defer(cx, move |window, cx| {
+                    let (Some(editor), Some(mention_set)) =
+                        (editor.upgrade(), mention_set.upgrade())
+                    else {
+                        return;
+                    };
+                    crate::message_editor::insert_inbox_item_mention(
+                        uri,
+                        &editor,
+                        &mention_set,
+                        &workspace,
+                        window,
+                        cx,
+                    );
+                });
+                false
+            })),
             group: None,
         }
     }
@@ -1146,6 +1209,22 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
                 })
             }
 
+            Some(PromptContextType::Inbox) => {
+                // A task can be attached once: tasks that already have a card
+                // in this editor are left out of the list entirely.
+                let attached = self.mention_set.read(cx).attached_inbox_keys();
+                let tasks = open_inbox_tasks(&workspace, cx)
+                    .into_iter()
+                    .filter(|task| {
+                        !attached.contains(&(task.project_key.to_string(), task.id.to_string()))
+                    })
+                    .collect();
+                let search_task = search_inbox_tasks(query, cancellation_flag, tasks, cx);
+                cx.background_spawn(async move {
+                    search_task.await.into_iter().map(Match::Inbox).collect()
+                })
+            }
+
             Some(PromptContextType::Diagnostics) => Task::ready(Vec::new()),
 
             Some(PromptContextType::BranchDiff) => Task::ready(Vec::new()),
@@ -1376,6 +1455,12 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
             && !self.source.available_skills(cx).is_empty()
         {
             entries.push(PromptContextEntry::Mode(PromptContextType::Skill));
+        }
+
+        if self.source.supports_context(PromptContextType::Inbox, cx)
+            && !open_inbox_tasks(workspace, cx).is_empty()
+        {
+            entries.push(PromptContextEntry::Mode(PromptContextType::Inbox));
         }
 
         if self.source.supports_context(PromptContextType::Fetch, cx) {
@@ -1824,6 +1909,15 @@ impl<T: PromptCompletionProviderDelegate> CompletionProvider for PromptCompletio
                                     }
                                     Match::Skill(skill) => Some(Self::completion_for_skill(
                                         skill,
+                                        source_range.clone(),
+                                        source.clone(),
+                                        editor.clone(),
+                                        mention_set.clone(),
+                                        workspace.clone(),
+                                        cx,
+                                    )),
+                                    Match::Inbox(task) => Some(Self::completion_for_inbox_task(
+                                        task,
                                         source_range.clone(),
                                         source.clone(),
                                         editor.clone(),
@@ -2492,15 +2586,47 @@ pub(crate) fn search_skills(
     skills: Vec<AvailableSkill>,
     cx: &mut App,
 ) -> Task<Vec<AvailableSkill>> {
-    if skills.is_empty() {
+    fuzzy_search_by(query, cancellation_flag, skills, |skill| &skill.name, cx)
+}
+
+/// Fuzzy-matches inbox tasks by title. With an empty query the whole list comes
+/// back in the panel's order, so `@task` alone shows the inbox as it looks in
+/// the dock.
+fn search_inbox_tasks(
+    query: String,
+    cancellation_flag: Arc<AtomicBool>,
+    tasks: Vec<InboxTask>,
+    cx: &mut App,
+) -> Task<Vec<InboxTask>> {
+    if query.is_empty() {
+        return Task::ready(tasks);
+    }
+    fuzzy_search_by(query, cancellation_flag, tasks, |task| &task.title, cx)
+}
+
+/// Shared fuzzy plumbing for the flat `@`-menu item lists (skills, inbox
+/// tasks): one place owns the match parameters, so tuning them can't drift
+/// between item kinds.
+fn fuzzy_search_by<T, F>(
+    query: String,
+    cancellation_flag: Arc<AtomicBool>,
+    items: Vec<T>,
+    field: F,
+    cx: &mut App,
+) -> Task<Vec<T>>
+where
+    T: Clone + Send + Sync + 'static,
+    F: Fn(&T) -> &str + Send + 'static,
+{
+    if items.is_empty() {
         return Task::ready(Vec::new());
     }
     let executor = cx.background_executor().clone();
     cx.background_spawn(async move {
-        let candidates = skills
+        let candidates = items
             .iter()
             .enumerate()
-            .map(|(id, skill)| StringMatchCandidate::new(id, &skill.name))
+            .map(|(id, item)| StringMatchCandidate::new(id, field(item)))
             .collect::<Vec<_>>();
         let matches = fuzzy::match_strings(
             &candidates,
@@ -2514,7 +2640,7 @@ pub(crate) fn search_skills(
         .await;
         matches
             .into_iter()
-            .map(|mat| skills[mat.candidate_id].clone())
+            .map(|string_match| items[string_match.candidate_id].clone())
             .collect()
     })
 }

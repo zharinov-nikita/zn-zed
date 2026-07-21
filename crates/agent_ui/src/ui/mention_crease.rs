@@ -202,6 +202,9 @@ fn open_mention_uri(
         MentionUri::Rule { name, .. } => {
             open_migrated_rule(workspace, &name, window, cx);
         }
+        MentionUri::InboxItem { id, .. } => {
+            crate::inbox_mentions::open_inbox_item(workspace, &id, window, cx);
+        }
         MentionUri::Fetch { url } => {
             cx.open_url(url.as_str());
         }

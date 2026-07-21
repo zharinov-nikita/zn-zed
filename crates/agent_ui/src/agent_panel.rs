@@ -94,6 +94,7 @@ use ui::{
     ContextMenu, ContextMenuEntry, GradientFade, IconButton, KeyBinding, PopoverMenu,
     PopoverMenuHandle, ProjectEmptyState, Tab, Tooltip, prelude::*, utils::WithRemSize,
 };
+use inbox_panel::DraggedInboxItems;
 use util::ResultExt as _;
 use workspace::{
     CollaboratorId, DraggedSelection, DraggedTab, DraggedText, MultiWorkspace, PathList,
@@ -6321,6 +6322,7 @@ impl AgentPanel {
             .drag_over::<DraggedTab>(|this, _, _, _| this.visible())
             .drag_over::<DraggedSelection>(|this, _, _, _| this.visible())
             .drag_over::<DraggedText>(|this, _, _, _| this.visible())
+            .drag_over::<DraggedInboxItems>(|this, _, _, _| this.visible())
             .when(is_local, |this| {
                 this.drag_over::<ExternalPaths>(|this, _, _, _| this.visible())
             })
@@ -6347,6 +6349,66 @@ impl AgentPanel {
             .on_drop(cx.listener(move |this, dragged: &DraggedText, window, cx| {
                 this.insert_prompt_text(dragged.text.to_string(), window, cx);
             }))
+            .on_drop(cx.listener(move |this, dragged: &DraggedInboxItems, window, cx| {
+                this.insert_inbox_items(dragged.project_key.clone(), dragged.ids.clone(), window, cx);
+            }))
+    }
+
+    /// Attaches inbox tasks to the active thread's draft as mention creases.
+    /// Deferred like [`Self::insert_prompt_text`], so the drop finishes before
+    /// the editor is mutated.
+    fn insert_inbox_items(
+        &self,
+        project_key: SharedString,
+        ids: Vec<inbox_panel::inbox_model::ItemId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // An unbound inbox (no project key yet) can't be resolved back to its
+        // store — say so instead of silently attaching nothing.
+        if project_key.is_empty() {
+            struct InboxNotBoundToast;
+            if let Some(workspace) = self.workspace.upgrade() {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.show_toast(
+                        workspace::Toast::new(
+                            workspace::notifications::NotificationId::unique::<InboxNotBoundToast>(),
+                            "These tasks' inbox isn't bound to a project yet — try again in a moment",
+                        )
+                        .autohide(),
+                        cx,
+                    );
+                });
+            }
+            return;
+        }
+        let ids = ids
+            .into_iter()
+            .map(|id| SharedString::from(id.to_string()))
+            .collect::<Vec<_>>();
+        cx.defer_in(window, move |panel, window, cx| {
+            let Some(conversation_view) = panel.active_conversation_view().cloned() else {
+                struct InsertInboxItemsToast;
+                if let Some(workspace) = panel.workspace.upgrade() {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.show_toast(
+                            workspace::Toast::new(
+                                workspace::notifications::NotificationId::unique::<
+                                    InsertInboxItemsToast,
+                                >(),
+                                "Open a chat thread to attach these tasks",
+                            )
+                            .autohide(),
+                            cx,
+                        );
+                    });
+                }
+                return;
+            };
+            conversation_view.update(cx, |conversation_view, cx| {
+                conversation_view.insert_inbox_items(project_key, ids, window, cx);
+            });
+        });
     }
 
     fn handle_external_paths_drop(

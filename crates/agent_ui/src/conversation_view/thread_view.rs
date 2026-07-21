@@ -12365,6 +12365,9 @@ pub(crate) fn open_link(
             MentionUri::Rule { name, .. } => {
                 crate::ui::open_migrated_rule(workspace, &name, window, cx);
             }
+            MentionUri::InboxItem { id, .. } => {
+                crate::inbox_mentions::open_inbox_item(workspace, &id, window, cx);
+            }
             MentionUri::Skill {
                 skill_file_path, ..
             } => {

@@ -7,13 +7,13 @@ use anyhow::{Context as _, Result, anyhow};
 use collections::{HashMap, HashSet};
 use editor::{
     Anchor, Editor, EditorSnapshot, FoldPlaceholder, ToOffset,
-    display_map::{Crease, CreaseId, CreaseMetadata, FoldId},
+    display_map::{BlockContext, BlockStyle, Crease, CreaseId, CreaseMetadata, FoldId},
     scroll::Autoscroll,
 };
 use futures::{AsyncReadExt as _, FutureExt as _, future::Shared};
 use gpui::{
     AppContext, ClipboardEntry, Context, Empty, Entity, EntityId, Image, ImageFormat, Img,
-    SharedString, Task, WeakEntity,
+    SharedString, Subscription, Task, WeakEntity,
 };
 use http_client::{AsyncBody, HttpClientWithUrl};
 use itertools::Either;
@@ -37,9 +37,17 @@ use ui::{Disclosure, Toggleable, prelude::*};
 use util::{ResultExt, debug_panic, rel_path::RelPath};
 use workspace::{Workspace, notifications::NotifyResultExt as _};
 
+use crate::inbox_mentions::{inbox_item_content, inbox_store_for_project};
+use inbox_panel::InboxStoreEvent;
 use crate::ui::MentionCrease;
 
 pub type MentionTask = Shared<Task<Result<Mention, String>>>;
+
+/// Height, in editor lines, of a task attachment card: a title line, its meta
+/// row and breathing room. Block creases can't size themselves to their
+/// contents, and the card fills the block completely — leftover space would
+/// render as dead whitespace that still hit-tests as the card.
+const INBOX_CARD_HEIGHT: u32 = 3;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Mention {
@@ -91,6 +99,14 @@ impl MentionSet {
                 {
                     cx.update(|cx| full_mention_for_directory(&project, abs_path, cx))
                         .await?
+                } else if let MentionUri::InboxItem {
+                    project_key, id, ..
+                } = &mention_uri
+                {
+                    // Re-read the task instead of using the copy resolved when
+                    // the mention was inserted: edits made in the inbox while
+                    // the draft was being written must reach the model.
+                    cx.update(|cx| inbox_item_mention(project_key, id, cx))?
                 } else {
                     task.await.map_err(|e| anyhow!("{e}"))?
                 };
@@ -149,6 +165,9 @@ impl MentionSet {
             MentionUri::Skill {
                 skill_file_path, ..
             } => self.confirm_mention_for_skill(skill_file_path, cx),
+            MentionUri::InboxItem {
+                project_key, id, ..
+            } => Task::ready(inbox_item_mention(&project_key, &id, cx)),
             MentionUri::Diagnostics {
                 include_errors,
                 include_warnings,
@@ -177,6 +196,35 @@ impl MentionSet {
         self.mentions.remove(crease_id);
         self.crease_entities.remove(crease_id);
         self.recompute_disambiguation(cx);
+    }
+
+    /// Every task attachment in this editor as `(crease, project key, item
+    /// id)`. Used to drop attachments whose task was deleted from its inbox.
+    pub fn inbox_mentions(&self) -> Vec<(CreaseId, String, String)> {
+        self.mentions
+            .iter()
+            .filter_map(|(crease_id, (uri, _))| match uri {
+                MentionUri::InboxItem {
+                    project_key, id, ..
+                } => Some((*crease_id, project_key.clone(), id.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The identity keys of every attached task. A task attaches to a message
+    /// at most once; the drag & drop and `@task` dedup paths both consult
+    /// this one set.
+    pub fn attached_inbox_keys(&self) -> HashSet<(String, String)> {
+        self.mentions
+            .values()
+            .filter_map(|(uri, _)| match uri {
+                MentionUri::InboxItem {
+                    project_key, id, ..
+                } => Some((project_key.clone(), id.clone())),
+                _ => None,
+            })
+            .collect()
     }
 
     pub fn creases(&self) -> HashSet<CreaseId> {
@@ -323,6 +371,9 @@ impl MentionSet {
             MentionUri::Skill {
                 skill_file_path, ..
             } => self.confirm_mention_for_skill(skill_file_path, cx),
+            MentionUri::InboxItem {
+                project_key, id, ..
+            } => Task::ready(inbox_item_mention(&project_key, &id, cx)),
             MentionUri::Diagnostics {
                 include_errors,
                 include_warnings,
@@ -1112,21 +1163,57 @@ pub(crate) fn insert_crease_for_mention(
             cx.weak_entity(),
             cx,
         );
-        let placeholder = FoldPlaceholder {
-            render,
-            merge_adjacent: false,
-            ..Default::default()
-        };
-
-        let crease = Crease::Inline {
-            range: start..end,
-            placeholder,
-            render_toggle: None,
-            render_trailer: None,
-            metadata: Some(CreaseMetadata {
-                label: crease_label,
-                icon_path: crease_icon,
-            }),
+        // Task attachments render as a full-width card instead of an inline
+        // chip, so they get a block crease. A block replaces whole lines
+        // (`BlockPlacement::Replace`), which is why every inbox mention is
+        // inserted on a line of its own — see `insert_inbox_item_crease` and
+        // `insert_message_blocks`. Its height is fixed in editor lines, so the
+        // card truncates rather than growing.
+        let crease = if matches!(mention_uri, Some(MentionUri::InboxItem { .. })) {
+            let card = crease_entity.clone();
+            Crease::Block {
+                range: start..end,
+                block_height: INBOX_CARD_HEIGHT,
+                block_style: BlockStyle::Flex,
+                // Constrain the card to the block's exact area. Width: end at
+                // the text's wrap edge, not the editor's — mirrors the
+                // `editor_width` formula in `EditorElement::prepaint`
+                // (`text_width - gutter margin - extended_right`); a bare
+                // element would stretch past where the text wraps. Height: the
+                // fixed block height is filled completely except for a small
+                // bottom gap separating back-to-back cards.
+                render_block: Arc::new(move |block_cx: &mut BlockContext| {
+                    let width = block_cx.max_width
+                        - block_cx.margins.gutter.margin
+                        - block_cx.margins.extended_right;
+                    div()
+                        .w(width)
+                        .h(block_cx.line_height * block_cx.height as f32)
+                        .pb_0p5()
+                        .child(card.clone())
+                        .into_any_element()
+                }),
+                block_priority: 0,
+                render_toggle: None,
+            }
+        } else {
+            // Only the inline chip consumes the fold placeholder — the block
+            // card renders the entity directly.
+            let placeholder = FoldPlaceholder {
+                render,
+                merge_adjacent: false,
+                ..Default::default()
+            };
+            Crease::Inline {
+                range: start..end,
+                placeholder,
+                render_toggle: None,
+                render_trailer: None,
+                metadata: Some(CreaseMetadata {
+                    label: crease_label,
+                    icon_path: crease_icon,
+                }),
+            }
         };
 
         let ids = editor.insert_creases(vec![crease.clone()], cx);
@@ -1195,6 +1282,16 @@ fn fold_toggle(
             .on_click(move |_e, window, cx| fold(!is_folded, window, cx))
             .into_any_element()
     }
+}
+
+/// Resolves an inbox task mention to the task's current Markdown. Cheap and
+/// synchronous — the inbox lives in memory — so it is re-run on every send
+/// rather than cached with the mention.
+fn inbox_item_mention(project_key: &str, id: &str, cx: &mut App) -> Result<Mention> {
+    Ok(Mention::Text {
+        content: inbox_item_content(project_key, id, cx)?,
+        tracked_buffers: Vec::new(),
+    })
 }
 
 fn full_mention_for_directory(
@@ -1329,6 +1426,19 @@ fn render_mention_fold_button(
             })
             .ok();
         });
+        // A task attachment tracks the live task: re-render whenever its inbox
+        // changes, so a renamed, processed or deleted task shows up on the chip
+        // while the draft is still being written.
+        // Subscribed, not observed: the store signals edits with events and
+        // does not notify its own entity, so `cx.observe` would never fire.
+        let inbox_subscription = match &mention_uri {
+            Some(MentionUri::InboxItem { project_key, .. }) => {
+                inbox_store_for_project(project_key, cx).map(|store| {
+                    cx.subscribe(&store, |_, _, _: &InboxStoreEvent, cx| cx.notify())
+                })
+            }
+            _ => None,
+        };
         LoadingContext {
             id: cx.entity_id(),
             label,
@@ -1340,6 +1450,7 @@ fn render_mention_fold_button(
             editor,
             loading: Some(loading),
             image: image_task.clone(),
+            _inbox_subscription: inbox_subscription,
         }
     });
     let loading_clone = loading.clone();
@@ -1359,6 +1470,9 @@ pub struct LoadingContext {
     editor: WeakEntity<Editor>,
     loading: Option<Task<()>>,
     image: Option<Shared<Task<Result<Arc<Image>, String>>>>,
+    /// Keeps task attachments in sync with their inbox; `None` for every other
+    /// mention kind.
+    _inbox_subscription: Option<Subscription>,
 }
 
 impl Render for LoadingContext {
@@ -1367,10 +1481,27 @@ impl Render for LoadingContext {
             .editor
             .update(cx, |editor, cx| editor.is_range_selected(&self.range, cx))
             .unwrap_or_default();
+        // A task attachment is a card, not a chip: title, state and meta row
+        // all come from the live task rather than from the label captured when
+        // the mention was inserted.
+        if let Some(MentionUri::InboxItem {
+            project_key, id, ..
+        }) = self.mention_uri.clone()
+        {
+            return crate::inbox_mentions::render_inbox_card(
+                &project_key,
+                &id,
+                &self.label,
+                is_in_text_selection,
+                self.workspace.clone(),
+                cx,
+            );
+        }
+        let label = self.label.clone();
 
         let id = ElementId::from(("loading_context", self.id));
 
-        MentionCrease::new(id, self.icon.clone(), self.label.clone())
+        MentionCrease::new(id, self.icon.clone(), label)
             .mention_uri(self.mention_uri.clone())
             .workspace(self.workspace.clone())
             .is_toggled(is_in_text_selection)
@@ -1398,6 +1529,7 @@ impl Render for LoadingContext {
                     .into()
                 })
             })
+            .into_any_element()
     }
 }
 
