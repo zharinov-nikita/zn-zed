@@ -74,6 +74,18 @@ pub enum MentionUri {
         source: String,
         skill_file_path: PathBuf,
     },
+    /// A task from the project's inbox panel. Only identity is stored — the
+    /// title is re-read from the inbox on render and the body on send — so the
+    /// mention keeps pointing at the live task instead of a stale copy.
+    InboxItem {
+        /// Project key of the owning inbox, as reported by
+        /// `inbox_panel::InboxStore::bound_project_key`.
+        project_key: String,
+        id: String,
+        /// Title at insertion time. Only a fallback for when the task can no
+        /// longer be resolved (other project, deleted item).
+        name: String,
+    },
 }
 
 impl MentionUri {
@@ -273,6 +285,18 @@ impl MentionUri {
                         source: source.context("missing skill source")?,
                         skill_file_path: skill_file_path.context("missing skill file path")?,
                     })
+                } else if path.starts_with("/agent/inbox-item") {
+                    // Three query parameters, so `single_query_param` (which
+                    // rejects any URL with more than one pair) can't be used
+                    // here — an inbox mention would silently fail to parse and
+                    // get dropped when a sent message is reopened for editing.
+                    validate_query_params(&url, &["project", "id", "name"])?;
+                    Ok(Self::InboxItem {
+                        project_key: query_param(&url, "project")
+                            .context("missing inbox project key")?,
+                        id: query_param(&url, "id").context("missing inbox item id")?,
+                        name: query_param(&url, "name").unwrap_or_default(),
+                    })
                 } else {
                     bail!("invalid zed url: {:?}", input);
                 }
@@ -328,7 +352,8 @@ impl MentionUri {
             | MentionUri::Fetch { .. }
             | MentionUri::TerminalSelection { .. }
             | MentionUri::GitDiff { .. }
-            | MentionUri::MergeConflict { .. } => None,
+            | MentionUri::MergeConflict { .. }
+            | MentionUri::InboxItem { .. } => None,
         }
     }
 
@@ -366,6 +391,7 @@ impl MentionUri {
             } => selection_name(path.as_deref(), line_range),
             MentionUri::Fetch { url } => url.to_string(),
             MentionUri::Skill { name, .. } => name.clone(),
+            MentionUri::InboxItem { name, .. } => name.clone(),
         }
     }
 
@@ -451,6 +477,8 @@ impl MentionUri {
             MentionUri::GitDiff { .. } => IconName::GitBranch.path().into(),
             MentionUri::MergeConflict { .. } => IconName::GitMergeConflict.path().into(),
             MentionUri::Skill { .. } => IconName::Sparkle.path().into(),
+            // The same icon the inbox panel itself uses in the dock.
+            MentionUri::InboxItem { .. } => IconName::InboxTray.path().into(),
         }
     }
 
@@ -580,6 +608,19 @@ impl MentionUri {
                     .append_pair("name", name)
                     .append_pair("source", source)
                     .append_pair("path", &skill_file_path.to_string_lossy());
+                url
+            }
+            MentionUri::InboxItem {
+                project_key,
+                id,
+                name,
+            } => {
+                let mut url = Url::parse("zed:///").unwrap();
+                url.set_path("/agent/inbox-item");
+                url.query_pairs_mut()
+                    .append_pair("project", project_key)
+                    .append_pair("id", id)
+                    .append_pair("name", name);
                 url
             }
         }
@@ -1384,6 +1425,22 @@ mod tests {
         let parsed = MentionUri::parse(&serialized, PathStyle::local()).unwrap();
 
         assert_eq!(parsed, skill_uri);
+    }
+
+    #[test]
+    fn test_parse_inbox_item_uri_round_trip() {
+        let inbox_uri = MentionUri::InboxItem {
+            project_key: "21954ba2dd7c66da".to_string(),
+            id: "2ypavu3bdyzht".to_string(),
+            // Titles are free-form user text: percent-encoding has to survive.
+            name: "Attach tasks to the chat (drag & drop)".to_string(),
+        };
+
+        let serialized = inbox_uri.to_uri().to_string();
+        let parsed = MentionUri::parse(&serialized, PathStyle::local()).unwrap();
+
+        assert_eq!(parsed, inbox_uri);
+        assert_eq!(parsed.name(), "Attach tasks to the chat (drag & drop)");
     }
 
     #[test]
