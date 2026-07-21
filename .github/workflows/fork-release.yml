@@ -18,20 +18,17 @@ concurrency:
 
 jobs:
   bundle-windows-x86_64:
-    # The self-hosted runner keeps target/ warm between runs, which turns a
-    # ~2.5h cold build into an incremental one and skips the ~2h queue wait for
-    # a hosted windows runner. Fall back to `windows-2022` by editing this line
-    # if the machine is offline.
-    runs-on: [self-hosted, windows, x64, zed-build]
+    # Hosted runner: the build is cold every time (~2.5h plus queue wait), but it
+    # doesn't tie up a local machine. Swap in `[self-hosted, windows, x64,
+    # zed-build]` to build on the personal runner, which keeps target/ warm —
+    # that also needs `clean: false` on the checkout below.
+    runs-on: windows-2022
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
         with:
-          # `git clean -ffdx` (the default) would wipe target/ on every run and
-          # defeat the whole point of a persistent runner.
-          clean: false
           # Full history + tags so the release-notes step can diff against the
-          # previous nightly tag. On the self-hosted runner this is incremental.
+          # previous nightly tag.
           fetch-depth: 0
 
       - name: Set release channel to nightly
