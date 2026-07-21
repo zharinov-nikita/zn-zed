@@ -171,6 +171,7 @@ pub enum IconName {
     Hash,
     HistoryRerun,
     Image,
+    InboxTray,
     Inception,
     Indicator,
     Info,
