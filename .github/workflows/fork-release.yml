@@ -14,7 +14,9 @@ permissions:
 
 concurrency:
   group: fork-release
-  cancel-in-progress: true
+  # A build runs for hours; cancelling it on the next push to main meant most
+  # runs died before producing a release. Let them queue instead.
+  cancel-in-progress: false
 
 jobs:
   bundle-windows-x86_64:

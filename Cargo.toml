@@ -1041,15 +1041,18 @@ time_format = { codegen-units = 1 }
 ui_input = { codegen-units = 1 }
 zed_actions = { codegen-units = 1 }
 
-# zn-zed fork: tuned for runtime speed over build time, since fork-release
-# now runs on a self-hosted machine where a long build costs nothing but
-# wall-clock. Two deviations from upstream, both trading build time for
-# performance: `lto = "fat"` instead of "thin", and no codegen-units override
-# for the zed crate itself.
+# zn-zed fork: tuned for build time over runtime speed. fork-release builds on
+# a hosted runner with a cold target/ every time, and `lto = "fat"` alone blew
+# past the 360-minute job timeout (run 29818563137). Dropping LTO and widening
+# codegen-units keeps a cold build around two hours. Line tables stay so
+# bundle-windows.ps1 can still archive the .pdb files.
 [profile.release]
-debug = "limited"
-lto = "fat"
-codegen-units = 1
+debug = "line-tables-only"
+lto = false
+codegen-units = 16
+
+[profile.release.package]
+zed = { codegen-units = 16 }
 
 [profile.release-fast]
 inherits = "release"
