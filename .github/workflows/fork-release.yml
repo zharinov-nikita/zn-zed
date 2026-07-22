@@ -19,7 +19,32 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # A syntax error in a pwsh step used to surface only after the two-hour
+  # Bundle step had already run (run 29911588045 died on a stray `;`). Parse
+  # the scripts up front so a typo costs 30 seconds instead of a build.
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse PowerShell scripts
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($file in Get-ChildItem script -Filter *.ps1) {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              $file.FullName, [ref]$null, [ref]$errors) | Out-Null
+            if ($errors) {
+              $failed = $true
+              Write-Host "::error file=script/$($file.Name)::$($errors[0].Message)"
+            }
+          }
+          if ($failed) { exit 1 }
+          Write-Host "All scripts parsed."
+
   bundle-windows-x86_64:
+    needs: preflight
     # Hosted runner: the build is cold every time (~2.5h plus queue wait), but it
     # doesn't tie up a local machine. Swap in `[self-hosted, windows, x64,
     # zed-build]` to build on the personal runner, which keeps target/ warm —
@@ -66,6 +91,24 @@ jobs:
         shell: pwsh
         run: Get-PSDrive -PSProvider FileSystem
 
+      # Version and release notes depend only on the checkout, so they run
+      # before the expensive step -- a failure here should cost seconds.
+      - name: Compute version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path crates/zed/Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Generate release notes
+        id: notes
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          script/fork-release-notes.ps1 -Sha "${{ github.sha }}" -OutFile target/release-notes.md
+          "file=target/release-notes.md" >> $env:GITHUB_OUTPUT
+
       - name: Bundle
         shell: pwsh
         run: script/bundle-windows.ps1 -Architecture x86_64
@@ -76,43 +119,18 @@ jobs:
           ZED_COMMIT_SHA: ${{ github.sha }}
           CARGO_INCREMENTAL: "0"
 
-      - name: Compute version
-        id: ver
-        shell: pwsh
-        run: |
-          $v = ((cargo metadata --no-deps --offline | ConvertFrom-Json).packages | Where-Object name -eq zed).version
-          "version=$v" >> $env:GITHUB_OUTPUT
-
-      - name: Generate release notes
-        id: notes
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $sha = "${{ github.sha }}"
-          $notesFile = "target/release-notes.md"
-
-          # The current release isn't created yet, so the latest existing one is
-          # the previous nightly. Its tag is `nightly-<version>-<40-hex-sha>`.
-          $prevTag = gh release list --limit 1 --json tagName -q '.[0].tagName' 2>$null
-          $prevSha = if ($prevTag) { ($prevTag -split '-')[-1] } else { $null }
-
-          $body = "Automated build of $sha"
-          if ($prevSha -and (git cat-file -e "$prevSha^{commit}" 2>$null; $LASTEXITCODE -eq 0)) {
-            # --first-parent keeps the log to commits that landed directly on
-            # main: your own feat/fix commits, plus each upstream merge collapsed
-            # to a single line instead of thousands of upstream commits.
-            $log = git log --first-parent --pretty=format:'- %s (%h)' "$prevSha..$sha"
-            if ($log) {
-              $range = "$($prevSha.Substring(0,7))..$($sha.Substring(0,7))"
-              $body = "### Changes since previous nightly ($range)`n`n" + ($log -join "`n")
-            } else {
-              $body = "No changes since previous nightly ($($prevSha.Substring(0,7)))."
-            }
-          }
-
-          Set-Content -Path $notesFile -Value $body -NoNewline
-          "file=$notesFile" >> $env:GITHUB_OUTPUT
+      # Keeps the installer reachable even if publishing fails, so a broken
+      # release step never costs the whole build again.
+      - name: Upload installer artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zed-windows-x86_64
+          path: |
+            target/Zed-x86_64.exe
+            target/zed-remote-server-windows-x86_64.zip
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Publish release
         shell: pwsh
