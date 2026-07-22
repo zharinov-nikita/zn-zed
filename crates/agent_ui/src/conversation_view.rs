@@ -628,6 +628,52 @@ impl ConversationView {
         })
     }
 
+    /// Whether "Reload Agent" is offered for this conversation.
+    ///
+    /// Only external ACP agents are reloadable: the native agent already
+    /// watches its skills directory and republishes available commands, so
+    /// restarting it would buy nothing. The agent also has to be able to
+    /// bring the thread back (`load_session` or `resume_session`), otherwise
+    /// a reload would silently drop the conversation. Finally, no thread of
+    /// this connection may be generating — killing the process mid-stream
+    /// would truncate a reply.
+    pub fn can_reload_agent(&self, cx: &App) -> bool {
+        if matches!(self.connection_key, Agent::NativeAgent) {
+            return false;
+        }
+
+        self.as_connected().is_some_and(|connected| {
+            connected.auth_state.is_ok()
+                && (connected.connection.supports_load_session()
+                    || connected.connection.supports_resume_session())
+                && connected
+                    .threads
+                    .values()
+                    .all(|view| view.read(cx).thread.read(cx).status() != ThreadStatus::Generating)
+        })
+    }
+
+    /// Kills the agent process, starts a fresh one and brings the active
+    /// thread back through `load_session`/`resume_session`.
+    ///
+    /// Used to pick up skills, plugins and config that the agent only reads
+    /// at process start. `restart_connection` drops the store's entry and
+    /// spawns a replacement; the old process dies once the last `Rc` on its
+    /// connection goes away, which happens inside `reset` when the new
+    /// server state replaces the old one.
+    pub fn reload_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_reload_agent(cx) {
+            return;
+        }
+
+        let agent = self.agent.clone();
+        let connection_key = self.connection_key.clone();
+        self.connection_store.update(cx, |store, cx| {
+            store.restart_connection(connection_key, agent, cx);
+        });
+        self.reset(window, cx);
+    }
+
     pub fn active_thread(&self) -> Option<&Entity<ThreadView>> {
         match &self.server_state {
             ServerState::Connected(connected) => connected.active_view(),
@@ -3143,7 +3189,12 @@ impl ConversationView {
     /// it is a raw text hand-off.
     ///
     /// [`insert_selection`]: Self::insert_selection
-    pub(crate) fn insert_prompt_text(&self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn insert_prompt_text(
+        &self,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(active_thread) = self.active_thread() {
             active_thread.update(cx, |thread, cx| {
                 let editor = thread.active_editor(cx);

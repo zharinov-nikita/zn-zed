@@ -85,6 +85,7 @@ use project::{Project, ProjectPath, Worktree};
 use settings::TerminalDockPosition;
 use settings::{NotifyWhenAgentWaiting, Settings, update_settings_file};
 
+use inbox_panel::DraggedInboxItems;
 use search::{BufferSearchBar, buffer_search::Deploy as DeployBufferSearch};
 use terminal::{Event as TerminalEvent, terminal_settings::TerminalSettings};
 use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
@@ -94,11 +95,11 @@ use ui::{
     ContextMenu, ContextMenuEntry, GradientFade, IconButton, KeyBinding, PopoverMenu,
     PopoverMenuHandle, ProjectEmptyState, Tab, Tooltip, prelude::*, utils::WithRemSize,
 };
-use inbox_panel::DraggedInboxItems;
 use util::ResultExt as _;
 use workspace::{
     CollaboratorId, DraggedSelection, DraggedTab, DraggedText, MultiWorkspace, PathList,
-    SerializedPathList, ToggleWorkspaceSidebar, ToggleZoom, ToolbarItemView, Workspace, WorkspaceId,
+    SerializedPathList, ToggleWorkspaceSidebar, ToggleZoom, ToolbarItemView, Workspace,
+    WorkspaceId,
     dock::{DockPosition, Panel, PanelEvent},
     item::{ItemEvent, ItemHandle},
 };
@@ -5611,6 +5612,9 @@ impl AgentPanel {
         let supports_logout = self
             .active_conversation_view()
             .is_some_and(|conversation_view| conversation_view.read(cx).supports_logout());
+        let can_reload_agent = self
+            .active_conversation_view()
+            .is_some_and(|conversation_view| conversation_view.read(cx).can_reload_agent(cx));
 
         let project_agents_md_path = project_agents_md_path(&self.project, true, cx);
 
@@ -5767,8 +5771,21 @@ impl AgentPanel {
                             .separator()
                             .action("Toggle Threads Sidebar", Box::new(ToggleWorkspaceSidebar));
 
-                        if has_auth_methods || supports_logout {
+                        if has_auth_methods || supports_logout || can_reload_agent {
                             menu = menu.separator()
+                        }
+                        if can_reload_agent
+                            && let Some(conversation_view) = conversation_view.as_ref()
+                        {
+                            // Restarts the agent process so it re-reads skills,
+                            // plugins and config it only loads at startup. The
+                            // thread comes back through load/resume_session.
+                            let conversation_view = conversation_view.clone();
+                            menu = menu.entry("Reload Agent", None, move |window, cx| {
+                                conversation_view.update(cx, |conversation_view, cx| {
+                                    conversation_view.reload_agent(window, cx);
+                                });
+                            })
                         }
                         if has_auth_methods {
                             menu = menu.action("Reauthenticate", Box::new(ReauthenticateAgent))
@@ -6349,9 +6366,16 @@ impl AgentPanel {
             .on_drop(cx.listener(move |this, dragged: &DraggedText, window, cx| {
                 this.insert_prompt_text(dragged.text.to_string(), window, cx);
             }))
-            .on_drop(cx.listener(move |this, dragged: &DraggedInboxItems, window, cx| {
-                this.insert_inbox_items(dragged.project_key.clone(), dragged.ids.clone(), window, cx);
-            }))
+            .on_drop(
+                cx.listener(move |this, dragged: &DraggedInboxItems, window, cx| {
+                    this.insert_inbox_items(
+                        dragged.project_key.clone(),
+                        dragged.ids.clone(),
+                        window,
+                        cx,
+                    );
+                }),
+            )
     }
 
     /// Attaches inbox tasks to the active thread's draft as mention creases.
@@ -6927,9 +6951,12 @@ mod tests {
     use settings::{SettingsStore, WorkingDirectory};
     use std::any::Any;
 
+    use agent_servers::AgentServerDelegate;
     use serde_json::json;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering::SeqCst;
     use std::time::Instant;
 
     #[test]
@@ -6975,6 +7002,47 @@ mod tests {
             terminal_program_to_report(&mut last_observed_program, Some("codex".to_string())),
             Some("codex".to_string())
         );
+    }
+
+    /// Wraps another server and counts how often it was asked to connect,
+    /// so a test can tell an actual agent restart from a thread that merely
+    /// re-attached to the connection it already had.
+    struct ConnectCountingServer<S> {
+        inner: S,
+        connects: Arc<AtomicUsize>,
+    }
+
+    impl<S: AgentServer> ConnectCountingServer<S> {
+        fn new(inner: S) -> Self {
+            Self {
+                inner,
+                connects: Arc::default(),
+            }
+        }
+    }
+
+    impl<S: AgentServer + 'static> AgentServer for ConnectCountingServer<S> {
+        fn logo(&self) -> ui::IconName {
+            self.inner.logo()
+        }
+
+        fn agent_id(&self) -> AgentId {
+            self.inner.agent_id()
+        }
+
+        fn connect(
+            &self,
+            delegate: AgentServerDelegate,
+            project: Entity<Project>,
+            cx: &mut App,
+        ) -> Task<Result<Rc<dyn AgentConnection>>> {
+            self.connects.fetch_add(1, SeqCst);
+            self.inner.connect(delegate, project, cx)
+        }
+
+        fn into_any(self: Rc<Self>) -> Rc<dyn std::any::Any> {
+            self
+        }
     }
 
     #[derive(Clone, Default)]
@@ -10882,6 +10950,185 @@ mod tests {
             assert!(
                 !connected.has_thread_error(cx),
                 "reopening an already-visible session should keep the thread usable"
+            );
+        });
+    }
+
+    /// Reloading an external agent restarts its process and brings the
+    /// active thread back through `load_session`, so the conversation
+    /// survives picking up newly added skills.
+    #[gpui::test]
+    async fn test_reload_agent_restarts_connection_and_restores_thread(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.run_until_parked();
+
+        // The reload re-resolves the server from the conversation itself, so
+        // the stub has to be the thread's own server rather than an entry
+        // planted in the connection store.
+        let server = Rc::new(ConnectCountingServer::new(StubAgentServer::new(
+            SessionTrackingConnection::new(),
+        )));
+        let connects = server.connects.clone();
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.open_external_thread_with_server(server, window, cx);
+        });
+        cx.run_until_parked();
+        send_message(&panel, &mut cx);
+
+        let session_id = active_session_id(&panel, &cx);
+        assert_eq!(
+            connects.load(SeqCst),
+            1,
+            "the thread should have established exactly one connection so far"
+        );
+
+        panel.read_with(&cx, |panel, cx| {
+            assert!(
+                panel
+                    .active_conversation_view()
+                    .unwrap()
+                    .read(cx)
+                    .can_reload_agent(cx),
+                "an idle external agent that supports load_session should be reloadable"
+            );
+        });
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel
+                .active_conversation_view()
+                .unwrap()
+                .update(cx, |view, cx| view.reload_agent(window, cx));
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            active_session_id(&panel, &cx),
+            session_id,
+            "reloading should restore the same session, not start a new one"
+        );
+        assert_eq!(
+            connects.load(SeqCst),
+            2,
+            "reloading should tear the agent down and connect to a fresh one"
+        );
+
+        panel.read_with(&cx, |panel, cx| {
+            let connected = panel
+                .active_conversation_view()
+                .unwrap()
+                .read(cx)
+                .as_connected()
+                .expect("thread should be connected again after reloading");
+            assert!(
+                !connected.has_thread_error(cx),
+                "reloading should leave the thread usable"
+            );
+        });
+
+        // The restored thread still talks to a live session.
+        send_message(&panel, &mut cx);
+        panel.read_with(&cx, |panel, cx| {
+            assert!(
+                !panel
+                    .active_conversation_view()
+                    .unwrap()
+                    .read(cx)
+                    .as_connected()
+                    .unwrap()
+                    .has_thread_error(cx),
+                "sending after a reload should not hit \"Session not found\""
+            );
+        });
+    }
+
+    /// The native agent watches its skills directory itself, so there is
+    /// nothing to reload — the menu entry must stay hidden for it.
+    #[gpui::test]
+    async fn test_reload_agent_unavailable_for_native_agent(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.run_until_parked();
+
+        panel.update(&mut cx, |panel, cx| {
+            panel.connection_store.update(cx, |store, cx| {
+                store.restart_connection(
+                    Agent::NativeAgent,
+                    Rc::new(StubAgentServer::new(SessionTrackingConnection::new())),
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.external_thread(
+                Some(Agent::NativeAgent),
+                None,
+                None,
+                None,
+                None,
+                true,
+                AgentThreadSource::AgentPanel,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        send_message(&panel, &mut cx);
+
+        panel.read_with(&cx, |panel, cx| {
+            assert!(
+                !panel
+                    .active_conversation_view()
+                    .unwrap()
+                    .read(cx)
+                    .can_reload_agent(cx),
+                "the native agent should not offer a reload"
+            );
+        });
+    }
+
+    /// Without load_session or resume, a reload would silently drop the
+    /// conversation, so it is not offered.
+    #[gpui::test]
+    async fn test_reload_agent_unavailable_without_session_restore(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.run_until_parked();
+
+        panel.update(&mut cx, |panel, cx| {
+            panel.connection_store.update(cx, |store, cx| {
+                store.restart_connection(
+                    Agent::Stub,
+                    Rc::new(StubAgentServer::default_response()),
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.external_thread(
+                Some(Agent::Stub),
+                None,
+                None,
+                None,
+                None,
+                true,
+                AgentThreadSource::AgentPanel,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        send_message(&panel, &mut cx);
+
+        panel.read_with(&cx, |panel, cx| {
+            assert!(
+                !panel
+                    .active_conversation_view()
+                    .unwrap()
+                    .read(cx)
+                    .can_reload_agent(cx),
+                "an agent that can neither load nor resume sessions should not offer a reload"
             );
         });
     }
