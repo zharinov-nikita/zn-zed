@@ -47,6 +47,9 @@ use crate::{
 const LAST_BLOCK_PLACEHOLDER: &str = "Type, or «/» for a block";
 /// Placeholder of any other empty block.
 const EMPTY_BLOCK_PLACEHOLDER: &str = "Empty line";
+/// Font size of a code block, one notch below the body text; shared by the
+/// read render and the live editor so a block doesn't resize on click.
+const CODE_FONT_SIZE_PX: f32 = 13.;
 
 pub enum InboxDetailEvent {
     /// The view wants to be closed (back button, Escape, or its item is gone).
@@ -989,17 +992,22 @@ impl InboxDetailView {
             font_family: Some(theme_settings.ui_font.family.clone()),
             font_fallbacks: theme_settings.ui_font.fallbacks.clone(),
             font_features: Some(theme_settings.ui_font.features.clone()),
+            // The body reads below the title: UI text size (14px at the
+            // default scale), like the item rows in the list and the issue
+            // overlay. Without it the block text would inherit `rems(1)`,
+            // i.e. `ui_font_size`, and render *larger* than the title.
+            font_size: Some(TextSize::Default.rems(cx).into()),
             color: Some(colors.text),
             ..Default::default()
         });
         let refinement = match block.block_type {
             BlockType::H1 => TextStyleRefinement {
-                font_size: Some(rems(1.35).into()),
+                font_size: Some(rems_from_px(16.).into()),
                 font_weight: Some(FontWeight::BOLD),
                 ..Default::default()
             },
             BlockType::H2 => TextStyleRefinement {
-                font_size: Some(rems(1.1).into()),
+                font_size: Some(rems_from_px(15.).into()),
                 font_weight: Some(FontWeight::BOLD),
                 ..Default::default()
             },
@@ -1020,7 +1028,7 @@ impl InboxDetailView {
                 font_family: Some(theme_settings.buffer_font.family.clone()),
                 font_fallbacks: theme_settings.buffer_font.fallbacks.clone(),
                 font_features: Some(theme_settings.buffer_font.features.clone()),
-                font_size: Some(rems(0.875).into()),
+                font_size: Some(rems_from_px(CODE_FONT_SIZE_PX).into()),
                 ..Default::default()
             },
             _ => TextStyleRefinement::default(),
@@ -1413,7 +1421,11 @@ impl InboxDetailView {
     }
 
     fn render_code_block(&self, block: &Block, cx: &App) -> AnyElement {
-        let mut container = Self::code_container(cx).font_buffer(cx).text_sm();
+        // Same size as the `Code` branch of `block_text_style`, or the text
+        // would resize when the block enters edit mode.
+        let mut container = Self::code_container(cx)
+            .font_buffer(cx)
+            .text_size(rems_from_px(CODE_FONT_SIZE_PX));
         for line in block.text.split('\n') {
             let line = if line.is_empty() {
                 SharedString::from("\u{00a0}")
