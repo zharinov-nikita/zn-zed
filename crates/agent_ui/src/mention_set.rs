@@ -38,8 +38,8 @@ use util::{ResultExt, debug_panic, rel_path::RelPath};
 use workspace::{Workspace, notifications::NotifyResultExt as _};
 
 use crate::inbox_mentions::{inbox_item_content, inbox_store_for_project};
-use inbox_panel::InboxStoreEvent;
 use crate::ui::MentionCrease;
+use inbox_panel::InboxStoreEvent;
 
 pub type MentionTask = Shared<Task<Result<Mention, String>>>;
 
@@ -1433,9 +1433,8 @@ fn render_mention_fold_button(
         // does not notify its own entity, so `cx.observe` would never fire.
         let inbox_subscription = match &mention_uri {
             Some(MentionUri::InboxItem { project_key, .. }) => {
-                inbox_store_for_project(project_key, cx).map(|store| {
-                    cx.subscribe(&store, |_, _, _: &InboxStoreEvent, cx| cx.notify())
-                })
+                inbox_store_for_project(project_key, cx)
+                    .map(|store| cx.subscribe(&store, |_, _, _: &InboxStoreEvent, cx| cx.notify()))
             }
             _ => None,
         };

@@ -15,7 +15,6 @@ use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Result, anyhow};
 use base64::Engine as _;
 use collections::HashMap;
-use inbox_panel::InboxStoreEvent;
 use editor::{
     Addon, AnchorRangeExt, ContextMenuOptions, Editor, EditorElement, EditorEvent, EditorMode,
     EditorStyle, Inlay, MultiBuffer, MultiBufferOffset, MultiBufferSnapshot, ToOffset, ToPoint,
@@ -30,6 +29,7 @@ use gpui::{
     Focusable, Image, ImageFormat, KeyContext, SharedString, Subscription, Task, TaskExt,
     TextStyle, WeakEntity,
 };
+use inbox_panel::InboxStoreEvent;
 use language::{Buffer, language_settings::InlayHintKind};
 use parking_lot::RwLock;
 use project::AgentId;

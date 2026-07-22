@@ -59,10 +59,7 @@ pub fn inbox_item_summary(
     };
     // The same collapsed display string the panel's rows show — markdown links
     // in the title render as their label there too.
-    (
-        Some(inbox_panel::parse_title_links(&item.text).0),
-        state,
-    )
+    (Some(inbox_panel::parse_title_links(&item.text).0), state)
 }
 
 /// One open task of this window's inbox, as offered by the `@` menu.
@@ -195,9 +192,11 @@ pub fn render_inbox_card(
         );
 
     if let (Some(store), Some(item)) = (&store, &item) {
-        card = card.child(div().pl(px(16.)).child(inbox_panel::item_meta_row(
-            store, item, cx,
-        )));
+        card = card.child(
+            div()
+                .pl(px(16.))
+                .child(inbox_panel::item_meta_row(store, item, cx)),
+        );
     }
 
     card.into_any_element()
