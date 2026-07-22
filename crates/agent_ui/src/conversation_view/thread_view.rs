@@ -42,8 +42,8 @@ use language_model::{
 use notifications::status_toast::StatusToast;
 use settings::{update_settings_file, update_settings_file_with_completion};
 use ui::{
-    ButtonLike, CalloutBorderPosition, Checkbox, SpinnerLabel, SpinnerVariant, SplitButton,
-    SplitButtonStyle, Tab, ToggleState,
+    ButtonLike, CalloutBorderPosition, Checkbox, ProgressBar, SpinnerLabel, SpinnerVariant,
+    SplitButton, SplitButtonStyle, Tab, ToggleState,
 };
 use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME};
 
@@ -945,6 +945,12 @@ impl ThreadView {
                     },
                 ));
             }
+        }
+
+        if crate::claude_usage::is_claude_code_agent(&agent_id)
+            && let Some(usage_store) = crate::claude_usage::ClaudeUsageStore::try_global(cx)
+        {
+            subscriptions.push(cx.observe(&usage_store, |_, _, cx| cx.notify()));
         }
 
         subscriptions.push(cx.observe(&message_editor, |this, editor, cx| {
@@ -4364,7 +4370,7 @@ impl ThreadView {
                                 h_flex()
                                     .flex_wrap()
                                     .gap_1()
-                                    .children(self.render_token_usage(cx))
+                                    .children(self.render_usage_group(cx))
                                     .children(self.profile_selector.clone())
                                     .map(|this| match self.config_options_view.clone() {
                                         Some(config_view) => this.child(config_view),
@@ -4602,22 +4608,272 @@ impl ThreadView {
             .is_some_and(|model| model.supports_split_token_display())
     }
 
+    /// Latest Claude Code subscription limits, when this thread runs on Claude
+    /// Code and we have credentials for the usage endpoint.
+    fn claude_usage_data(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<(
+        Entity<crate::claude_usage::ClaudeUsageStore>,
+        crate::claude_usage::ClaudeUsage,
+        crate::claude_usage::FetchState,
+        Option<Instant>,
+    )> {
+        if !crate::claude_usage::is_claude_code_agent(&self.agent_id) {
+            return None;
+        }
+
+        let store = crate::claude_usage::ClaudeUsageStore::try_global(cx)?;
+        let (usage, state, fetched_at, credentials_missing) = store.update(cx, |store, cx| {
+            store.poll(cx);
+            (
+                store.usage().cloned(),
+                store.state().clone(),
+                store.fetched_at(),
+                store.credentials_missing(),
+            )
+        });
+
+        if credentials_missing {
+            return None;
+        }
+
+        Some((store, usage?, state, fetched_at))
+    }
+
+    /// Context tokens and, for Claude Code threads, the subscription limits
+    /// (5h window, weekly quotas) as one clickable group in the footer.
+    fn render_usage_group(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use crate::claude_usage::{
+            FetchState, UsageSeverity, format_time_since, format_time_until,
+        };
+
+        let token_usage = self
+            .render_token_usage(cx)
+            .map(IntoElement::into_any_element);
+
+        let Some(usage_data) = self.claude_usage_data(cx) else {
+            return token_usage;
+        };
+        let (store, usage, state, fetched_at) = usage_data;
+
+        let severity_color = |severity: UsageSeverity| match severity {
+            UsageSeverity::Normal => Color::Muted,
+            UsageSeverity::Warning => Color::Warning,
+            UsageSeverity::Critical => Color::Error,
+        };
+
+        let mut rows = Vec::new();
+        if let Some(session) = usage.session.as_ref() {
+            rows.push(("Session (5h)".into(), session.clone()));
+        }
+        if let Some(weekly) = usage.weekly.as_ref() {
+            rows.push((SharedString::from("Weekly"), weekly.clone()));
+        }
+        for scoped in &usage.scoped {
+            rows.push((
+                SharedString::from(format!("Weekly · {}", scoped.label)),
+                scoped.window.clone(),
+            ));
+        }
+
+        let popover_rows = rows
+            .iter()
+            .map(|(label, window)| ClaudeUsageRow {
+                label: label.clone(),
+                percent: window.percent,
+                percent_label: format!("{}%", window.percent.round() as i32).into(),
+                color: severity_color(window.severity),
+                detail: window.resets_at.map(|resets_at| {
+                    SharedString::from(format!("resets in {}", format_time_until(resets_at)))
+                }),
+            })
+            .collect::<Vec<_>>();
+
+        // Context window as the first row of the same popover, so one click
+        // shows everything that is filling up.
+        let thread = self.thread.read(cx);
+        let context_row = thread.token_usage().map(|usage| {
+            let percent = context_used_ratio(usage) * 100.0;
+            ClaudeUsageRow {
+                label: "Context".into(),
+                percent,
+                percent_label: format!("{}%", percent.round() as i32).into(),
+                color: if percent >= CONTEXT_WARNING_RATIO * 100.0 {
+                    Color::Warning
+                } else {
+                    Color::Muted
+                },
+                detail: Some(
+                    format!(
+                        "{} / {}",
+                        crate::humanize_token_count(usage.used_tokens),
+                        crate::humanize_token_count(usage.max_tokens)
+                    )
+                    .into(),
+                ),
+            }
+        });
+        let cost_label = thread
+            .cost()
+            .map(|cost| SharedString::from(format_session_cost(cost)));
+
+        let extra_usage_label = usage.extra_usage.as_ref().map(|extra| {
+            let currency = extra.currency.as_deref().unwrap_or("USD");
+            SharedString::from(match (extra.used_credits, extra.monthly_limit) {
+                (Some(used), Some(limit)) => format!("{used:.2} / {limit:.2} {currency}"),
+                (Some(used), None) => format!("{used:.2} {currency} used"),
+                _ => extra
+                    .percent
+                    .map(|percent| format!("{}%", percent.round() as i32))
+                    .unwrap_or_else(|| "enabled".to_string()),
+            })
+        });
+
+        let status_label = match &state {
+            FetchState::Fetching => Some(SharedString::from("Updating…")),
+            FetchState::RateLimited { .. } => {
+                Some(SharedString::from("Rate limited, retrying later"))
+            }
+            FetchState::Unauthorized => {
+                Some(SharedString::from("Sign in with `claude` to refresh"))
+            }
+            FetchState::Error(message) => Some(message.clone()),
+            FetchState::Idle => fetched_at
+                .map(|at| SharedString::from(format!("Updated {}", format_time_since(at)))),
+        };
+
+        // The trigger stays transparent so the hover highlight never washes the
+        // rings out.
+        let ring = |id: &'static str,
+                    label: &'static str,
+                    name: &'static str,
+                    window: &crate::claude_usage::UsageWindow| {
+            let percent = window.percent.round() as i32;
+            let tooltip = SharedString::from(match window.resets_at {
+                Some(resets_at) => format!(
+                    "{name} · {percent}% used, resets in {}",
+                    format_time_until(resets_at)
+                ),
+                None => format!("{name} · {percent}% used"),
+            });
+
+            h_flex()
+                .id(id)
+                .gap_0p5()
+                .child(
+                    Label::new(label)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    CircularProgress::new(window.percent, 100.0, USAGE_RING_SIZE, cx)
+                        .stroke_width(USAGE_RING_STROKE_WIDTH)
+                        .progress_color(severity_color(window.severity).color(cx)),
+                )
+                .tooltip(move |_window, cx| Tooltip::simple(tooltip.clone(), cx))
+        };
+
+        let trigger = ButtonLike::new("usage-group")
+            .style(ButtonStyle::Transparent)
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .children(token_usage)
+                    .children(
+                        usage
+                            .session
+                            .as_ref()
+                            .map(|window| ring("claude-usage-session", "5h", "Session", window)),
+                    )
+                    .children(
+                        usage
+                            .weekly
+                            .as_ref()
+                            .map(|window| ring("claude-usage-weekly", "7d", "Weekly", window)),
+                    ),
+            );
+
+        Some(
+            PopoverMenu::new("usage-popover")
+                .trigger(trigger)
+                .anchor(gpui::Anchor::BottomRight)
+                .menu({
+                    let store = store.clone();
+                    move |window, cx| {
+                        let rows = popover_rows.clone();
+                        let context_row = context_row.clone();
+                        let cost_label = cost_label.clone();
+                        let extra_usage_label = extra_usage_label.clone();
+                        let status_label = status_label.clone();
+                        let store = store.clone();
+
+                        Some(ContextMenu::build(
+                            window,
+                            cx,
+                            move |mut menu, _window, _cx| {
+                                if let Some(context_row) = context_row.clone() {
+                                    menu = menu.header("Context");
+                                    menu = menu.custom_row(move |_window, cx| {
+                                        render_usage_row(context_row.clone(), 0, cx)
+                                    });
+
+                                    if let Some(cost_label) = cost_label.clone() {
+                                        menu = menu.custom_row(move |_window, _cx| {
+                                            render_usage_detail_row("Cost", cost_label.clone())
+                                        });
+                                    }
+                                }
+
+                                menu = menu.header("Claude Code Limits");
+
+                                for (index, row) in rows.clone().into_iter().enumerate() {
+                                    menu = menu.custom_row(move |_window, cx| {
+                                        render_usage_row(row.clone(), index + 1, cx)
+                                    });
+                                }
+
+                                if let Some(extra_usage_label) = extra_usage_label.clone() {
+                                    menu = menu.custom_row(move |_window, _cx| {
+                                        render_usage_detail_row(
+                                            "Extra usage",
+                                            extra_usage_label.clone(),
+                                        )
+                                    });
+                                }
+
+                                menu = menu.separator();
+
+                                if let Some(status_label) = status_label.clone() {
+                                    menu = menu.custom_row(move |_window, _cx| {
+                                        Label::new(status_label.clone())
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted)
+                                            .into_any_element()
+                                    });
+                                }
+
+                                let store = store.clone();
+                                menu.entry("Refresh", None, move |_window, cx| {
+                                    store.update(cx, |store, cx| store.refresh(cx));
+                                })
+                            },
+                        ))
+                    }
+                })
+                .into_any_element(),
+        )
+    }
+
     fn render_token_usage(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let thread = self.thread.read(cx);
         let usage = thread.token_usage()?;
         let show_split = self.supports_split_token_display(cx);
 
-        let cost_label = thread.cost().map(|cost| {
-            let precision = if cost.amount > 0.0 && cost.amount < 0.01 {
-                4
-            } else {
-                2
-            };
-            format!("{:.prec$} {}", cost.amount, cost.currency, prec = precision)
-        });
+        let cost_label = thread.cost().map(format_session_cost);
 
         let progress_color = |ratio: f32| -> Hsla {
-            if ratio >= 0.85 {
+            if ratio >= CONTEXT_WARNING_RATIO {
                 cx.theme().status().warning
             } else {
                 cx.theme().colors().text_muted
@@ -4629,14 +4885,10 @@ impl ThreadView {
         let input_tokens_label = crate::humanize_token_count(usage.input_tokens);
         let output_tokens_label = crate::humanize_token_count(usage.output_tokens);
 
-        let progress_ratio = if usage.max_tokens > 0 {
-            usage.used_tokens as f32 / usage.max_tokens as f32
-        } else {
-            0.0
-        };
+        let progress_ratio = context_used_ratio(usage);
 
-        let ring_size = px(16.0);
-        let stroke_width = px(2.);
+        let ring_size = USAGE_RING_SIZE;
+        let stroke_width = USAGE_RING_STROKE_WIDTH;
 
         let percentage = format!("{}%", (progress_ratio * 100.0).round() as u32);
 
@@ -5627,6 +5879,89 @@ impl ThreadView {
                 this.toggle_following(window, cx);
             }))
     }
+}
+
+/// Geometry shared by the context ring and the Claude Code limit rings, so
+/// they line up when they sit next to each other in the footer.
+const USAGE_RING_SIZE: Pixels = px(16.);
+const USAGE_RING_STROKE_WIDTH: Pixels = px(2.);
+/// Context fill at which the ring and its percentage turn amber.
+const CONTEXT_WARNING_RATIO: f32 = 0.85;
+
+/// A zero maximum means no model is selected yet, so nothing is "used".
+fn context_used_ratio(usage: &acp_thread::TokenUsage) -> f32 {
+    if usage.max_tokens > 0 {
+        usage.used_tokens as f32 / usage.max_tokens as f32
+    } else {
+        0.0
+    }
+}
+
+/// Sub-cent amounts keep four decimals, or every cheap thread would read
+/// `0.00`.
+fn format_session_cost(cost: &acp_thread::SessionCost) -> String {
+    let precision = if cost.amount > 0.0 && cost.amount < 0.01 {
+        4
+    } else {
+        2
+    };
+    format!("{:.prec$} {}", cost.amount, cost.currency, prec = precision)
+}
+
+/// One line with a progress bar in the usage popover — a context window or a
+/// Claude Code subscription limit.
+#[derive(Clone)]
+struct ClaudeUsageRow {
+    label: SharedString,
+    percent: f32,
+    percent_label: SharedString,
+    color: Color,
+    /// Secondary text next to the percentage: reset time, or tokens used.
+    detail: Option<SharedString>,
+}
+
+/// A label, its percentage and a progress bar — one row of the usage popover.
+fn render_usage_row(row: ClaudeUsageRow, index: usize, cx: &App) -> AnyElement {
+    v_flex()
+        .w_64()
+        .gap_1()
+        .child(
+            h_flex()
+                .justify_between()
+                .gap_2()
+                .child(Label::new(row.label).size(LabelSize::Small))
+                .child(
+                    h_flex()
+                        .gap_1p5()
+                        .children(row.detail.map(|detail| {
+                            Label::new(detail)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                        }))
+                        .child(
+                            Label::new(row.percent_label)
+                                .size(LabelSize::Small)
+                                .color(row.color),
+                        ),
+                ),
+        )
+        .child(
+            ProgressBar::new(("usage-bar", index), row.percent, 100.0, cx)
+                .bg_color(cx.theme().colors().element_background)
+                .fg_color(row.color.color(cx)),
+        )
+        .into_any_element()
+}
+
+/// A plain label/value line in the usage popover, without a progress bar.
+fn render_usage_detail_row(label: &'static str, value: SharedString) -> AnyElement {
+    h_flex()
+        .w_64()
+        .justify_between()
+        .gap_2()
+        .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+        .child(Label::new(value).size(LabelSize::Small))
+        .into_any_element()
 }
 
 struct TokenUsageTooltip {
